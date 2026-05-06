@@ -40,6 +40,7 @@ class CSPTask:
         self,
         dataset_name: str = "mp20",
         lattice_parameterization: str = "eps",
+        lattice_representation: str = "kldm",
     ) -> None:
         """Configure the CSP task.
 

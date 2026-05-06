@@ -4,6 +4,7 @@ sampler_config: ../../samplers/euler_maruyama.yaml
 dataset:
   task: csp
   name: mp20
+  lattice_representation: kldm # alternatives: kldm, mattergen. mattergen requires model.lattice_parameterization=eps, so x0 configs should stay on kldm.
   root: null
   batch_size: 256
   num_workers: 1
@@ -25,7 +26,8 @@ time_sampler:
 
 model:
   eps: 1.0e-6
-  lattice_parameterization: x0
+  lattice_parameterization: x0 # alternatives: eps, x0. mattergen representation/diffusion is not valid with x0.
+  lattice_diffusion_type: VP # alternatives: VP. mattergenVP is eps-only and requires dataset.lattice_representation=mattergen.
   wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: true
@@ -65,7 +67,7 @@ logging:
 
 validation:
   every_n_epochs: 100
-  ema_val: false
+  ema_val: true # Facit-style behavior in kldmPlus: validation loss stays on the online model; sampling metrics (valid, match_rate, rmse) use EMA when available.
   subset_size: 1024
   subset_seed: 123
   sampling_max_graphs: 1024

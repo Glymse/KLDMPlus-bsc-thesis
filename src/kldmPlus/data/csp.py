@@ -7,8 +7,11 @@ from torch.utils.data import DataLoader
 from .dataset import Carbon24, MP20, MPTS52, Perov5, resolve_data_root
 from .transform import (
     ContinuousIntervalLattice,
+    KLDMContinuousIntervalLattice,
+    MatterGenContinuousIntervalLattice,
     FullyConnectedGraph,
     ensure_lattice_standardization_cache,
+    ensure_mattergen_lattice_cache,
 )
 
 
@@ -19,6 +22,44 @@ DATASET_REGISTRY = {
     "perov5": Perov5,
     "carbon24": Carbon24,
 }
+
+
+def validate_lattice_configuration(
+    *,
+    lattice_representation: str,
+    lattice_parameterization: str,
+    lattice_diffusion_type: str,
+) -> None:
+    """Validate that the dataset and lattice diffusion agree on representation.
+
+    We intentionally allow representation-only ablations like:
+
+        representation = "mattergen"
+        diffusion_type = "VP"
+
+    because that isolates the representation from the diffusion process.
+
+    The one dangerous case is the reverse mismatch:
+
+        representation = "kldm"
+        diffusion_type = "mattergenVP"
+
+    In that setup the model would try to run MatterGen-style lattice diffusion
+    on KLDM log-length/tan-angle features, which silently invalidates the
+    experiment. We fail fast here so the runner never starts in that state.
+    """
+    if lattice_representation == "mattergen" and lattice_parameterization != "eps":
+        raise ValueError("MatterGen lattice representation is only supported for eps parameterization.")
+
+    if lattice_diffusion_type == "mattergenVP" and lattice_parameterization != "eps":
+        raise ValueError("mattergenVP is only supported for eps lattice parameterization.")
+
+    if lattice_diffusion_type == "mattergenVP" and lattice_representation != "mattergen":
+        raise ValueError(
+            "mattergenVP requires dataset.lattice_representation='mattergen'. "
+            "Otherwise the runner would diffuse KLDM log-length/tan-angle features "
+            "with a MatterGen lattice diffusion."
+        )
 
 
 class CSPTask:
@@ -40,6 +81,7 @@ class CSPTask:
         self,
         dataset_name: str = "mp20",
         lattice_parameterization: str = "eps",
+        lattice_representation: str = "kldm",
     ) -> None:
         """Configure the CSP task.
 
@@ -63,9 +105,18 @@ class CSPTask:
 
         if lattice_parameterization not in {"eps", "x0"}:
             raise ValueError("lattice_parameterization must be 'eps' or 'x0'")
+        if lattice_representation not in {"kldm", "mattergen"}:
+            raise ValueError("lattice_representation must be 'kldm' or 'mattergen'")
+        # Keep the task-level validation consistent with the runner-level safety checks.
+        validate_lattice_configuration(
+            lattice_representation=lattice_representation,
+            lattice_parameterization=lattice_parameterization,
+            lattice_diffusion_type="VP",
+        )
 
         self.dataset_name = dataset_name
         self.lattice_parameterization = lattice_parameterization
+        self.lattice_representation = lattice_representation
 
     @property
     def dataset_cls(self):
@@ -94,6 +145,8 @@ class CSPTask:
                 data/<dataset_name>/train_lattice_stats.json
         """
         root = resolve_data_root(root)
+        if self.lattice_representation == "mattergen":
+            return root / self.dataset_cls.dataset_name / "train_mattergen_lattice_stats.json"
         return root / self.dataset_cls.dataset_name / "train_lattice_stats.json"
 
     def make_lattice_transform(
@@ -125,7 +178,7 @@ class CSPTask:
         root = resolve_data_root(root)
         cache_file = None
 
-        if self.standardize_lattice:
+        if self.standardize_lattice or self.lattice_representation == "mattergen":
             # Ensure processed train data exists so that cell.npy can be read.
             self.dataset_cls(
                 root=root,
@@ -136,12 +189,24 @@ class CSPTask:
 
             cache_file = self.lattice_stats_path(root)
 
-            ensure_lattice_standardization_cache(
+            if self.lattice_representation == "mattergen":
+                ensure_mattergen_lattice_cache(
+                    cache_file=cache_file,
+                    processed_dir=root / self.dataset_cls.dataset_name / "processed" / "train",
+                )
+            else:
+                ensure_lattice_standardization_cache(
+                    cache_file=cache_file,
+                    processed_dir=root / self.dataset_cls.dataset_name / "processed" / "train",
+                )
+
+        if self.lattice_representation == "mattergen":
+            return MatterGenContinuousIntervalLattice(
+                standardize=False,
                 cache_file=cache_file,
-                processed_dir=root / self.dataset_cls.dataset_name / "processed" / "train",
             )
 
-        return ContinuousIntervalLattice(
+        return KLDMContinuousIntervalLattice(
             standardize=self.standardize_lattice,
             cache_file=cache_file,
         )

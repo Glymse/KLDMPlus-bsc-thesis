@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import requests
-from mattergen.common.data.chemgraph import ChemGraph
-from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
-from mattergen.common.data.transform import Transform
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch
 from tqdm.auto import tqdm
+
+try:
+    from mattergen.common.data.chemgraph import ChemGraph
+    from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
+    from mattergen.common.data.transform import Transform
+except ImportError:  # pragma: no cover
+    ChemGraph = Any
+    CrystalDataset = Any
+    CrystalDatasetBuilder = Any
+    DatasetTransform = Any
+
+    class Transform:  # type: ignore[override]
+        pass
 
 
 
@@ -105,6 +116,16 @@ class CrystalDatasetWrapper(Dataset):
                 raise RuntimeError(
                     f"Raw split not found at {self.raw_csv}. Pass download=True to fetch it first."
                 )
+            # Code segment inspired from mattergen
+            # (mattergen/common/data/dataset.py:528-556,
+            #  mattergen/common/data/dataset.py:354-360).
+            #
+            # Important preprocessing note:
+            # CrystalDatasetBuilder.from_csv(...) already parses CIFs, converts
+            # them to primitive structures, and applies `get_reduced_structure()`
+            # before writing the processed cache. We intentionally rely on that
+            # upstream full-structure reduction here instead of trying to reduce
+            # only the lattice matrix later in a transform.
             builder = CrystalDatasetBuilder.from_csv(
                 csv_path=str(self.raw_csv),
                 cache_path=str(self.processed_split_folder),

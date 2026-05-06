@@ -6,7 +6,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from kldm.data.transform import ContinuousIntervalLattice, DEFAULT_ATOMIC_VOCAB
+from kldmPlus.data.transform import (
+    ContinuousIntervalLattice,
+    DEFAULT_ATOMIC_VOCAB,
+    KLDMContinuousIntervalLattice,
+)
 
 try:
     from pymatgen.analysis.structure_matcher import StructureMatcher
@@ -37,7 +41,7 @@ def _require_pymatgen() -> None:
 
 # Builds the lattice inverse transform used by the decoding helpers.
 def _lattice_transform(transform: ContinuousIntervalLattice | None) -> ContinuousIntervalLattice:
-    return transform or ContinuousIntervalLattice(standardize=False)
+    return transform or KLDMContinuousIntervalLattice(standardize=False)
 
 
 # Converts an input value to a tensor and promotes vectors to shape [1, d].
@@ -89,6 +93,35 @@ def decode_lattice(
     return lengths.squeeze(0), torch.rad2deg(angles.squeeze(0))
 
 
+def decode_lattice_matrix(
+    l: TensorLike,
+    n_atoms: int,
+    lattice_transform: ContinuousIntervalLattice | None = None,
+) -> torch.Tensor:
+    transform = _lattice_transform(lattice_transform)
+    l_tensor = _row_tensor(l)
+    if hasattr(transform, "invert_to_matrix"):
+        matrix = transform.invert_to_matrix(l=l_tensor, num_atoms=n_atoms)
+        return matrix.squeeze(0)
+
+    lengths, angles_deg = decode_lattice(
+        l=l_tensor,
+        n_atoms=n_atoms,
+        lattice_transform=transform,
+    )
+    return torch.as_tensor(
+        Lattice.from_parameters(
+            a=float(lengths[0]),
+            b=float(lengths[1]),
+            c=float(lengths[2]),
+            alpha=float(angles_deg[0]),
+            beta=float(angles_deg[1]),
+            gamma=float(angles_deg[2]),
+        ).matrix,
+        dtype=torch.get_default_dtype(),
+    )
+
+
 # Reconstructs one periodic structure from sampled coordinates, lattice, and atom types.
 def build_structure_from_sample(
     f: TensorLike,
@@ -107,25 +140,38 @@ def build_structure_from_sample(
         raise ValueError("Fractional coordinates contain non-finite values.")
 
     _, species = decode_atom_types(a=a, species_vocab=species_vocab)
-    lengths, angles_deg = decode_lattice(
-        l=l,
-        n_atoms=int(frac.shape[0]),
-        lattice_transform=lattice_transform,
-    )
-    if not torch.isfinite(lengths).all() or not torch.isfinite(angles_deg).all():
-        raise ValueError("Decoded lattice contains non-finite values.")
-    if not (lengths > 0.0).all():
-        raise ValueError("Decoded lattice contains non-positive lengths.")
+    transform = _lattice_transform(lattice_transform)
 
-    return Structure(
-        lattice=Lattice.from_parameters(
+    if hasattr(transform, "invert_to_matrix"):
+        matrix = decode_lattice_matrix(
+            l=l,
+            n_atoms=int(frac.shape[0]),
+            lattice_transform=transform,
+        )
+        if not torch.isfinite(matrix).all():
+            raise ValueError("Decoded lattice matrix contains non-finite values.")
+        lattice = Lattice(matrix.detach().cpu().numpy())
+    else:
+        lengths, angles_deg = decode_lattice(
+            l=l,
+            n_atoms=int(frac.shape[0]),
+            lattice_transform=transform,
+        )
+        if not torch.isfinite(lengths).all() or not torch.isfinite(angles_deg).all():
+            raise ValueError("Decoded lattice contains non-finite values.")
+        if not (lengths > 0.0).all():
+            raise ValueError("Decoded lattice contains non-positive lengths.")
+        lattice = Lattice.from_parameters(
             a=float(lengths[0]),
             b=float(lengths[1]),
             c=float(lengths[2]),
             alpha=float(angles_deg[0]),
             beta=float(angles_deg[1]),
             gamma=float(angles_deg[2]),
-        ),
+        )
+
+    return Structure(
+        lattice=lattice,
         species=species,
         coords=(frac % 1.0).detach().cpu().tolist(),
         coords_are_cartesian=False,

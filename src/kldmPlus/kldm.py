@@ -16,7 +16,11 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.data import Data, Batch
 
-from kldmPlus.diffusionModels.continuous import ContinuousVPDiffusion
+from kldmPlus.diffusionModels.continuous import (
+    ContinuousDiffusion,
+    ContinuousMattergenVPDiffusion,
+    ContinuousVPDiffusion,
+)
 from kldmPlus.diffusionModels.tdm import TrivialisedDiffusion as TDM
 from kldmPlus.scoreNetwork.scoreNetwork import CSPVNet
 from kldmPlus.utils.device import get_default_device
@@ -42,6 +46,10 @@ class ModelKLDM(nn.Module):
         tdm_sigma_norm_mc_samples: int = 20000,
         tdm_centered_sigma_norm_correction: bool = False,
         lattice_parameterization: str = "eps",
+        lattice_diffusion_type: str = "VP",
+        lattice_representation: str = "kldm",
+        mattergen_lattice_c: float | None = None,
+        mattergen_lattice_nu: float | None = None,
         *,
         score_network_kwargs: dict[str, Any],
     ) -> None:
@@ -64,12 +72,50 @@ class ModelKLDM(nn.Module):
             sigma_norm_mc_samples=tdm_sigma_norm_mc_samples,
             centered_sigma_norm_correction=tdm_centered_sigma_norm_correction,
         )
-        self.diffusion_l = ContinuousVPDiffusion(
+        self.diffusion_l = self._build_lattice_diffusion(
+            lattice_diffusion_type=lattice_diffusion_type,
             eps=eps,
-            parameterization=lattice_parameterization,
+            lattice_parameterization=lattice_parameterization,
+            mattergen_lattice_c=mattergen_lattice_c,
+            mattergen_lattice_nu=mattergen_lattice_nu,
         )
         self.eps = eps
         self.lattice_parameterization = lattice_parameterization
+        self.lattice_diffusion_type = lattice_diffusion_type
+        self.lattice_representation = lattice_representation
+
+    @staticmethod
+    def _build_lattice_diffusion(
+        *,
+        lattice_diffusion_type: str,
+        eps: float,
+        lattice_parameterization: str,
+        mattergen_lattice_c: float | None,
+        mattergen_lattice_nu: float | None,
+    ) -> ContinuousDiffusion:
+        if lattice_diffusion_type == "VP":
+            diffusion_cls = ContinuousVPDiffusion
+            diffusion_kwargs: dict[str, Any] = {}
+        elif lattice_diffusion_type == "mattergenVP":
+            diffusion_cls = ContinuousMattergenVPDiffusion
+            if mattergen_lattice_c is None or mattergen_lattice_nu is None:
+                raise ValueError(
+                    "mattergenVP requires mattergen_lattice_c and mattergen_lattice_nu.",
+                )
+            diffusion_kwargs = {
+                "c": float(mattergen_lattice_c),
+                "nu": float(mattergen_lattice_nu),
+            }
+        else:
+            raise ValueError(
+                "lattice_diffusion_type must be 'VP' or 'mattergenVP'.",
+            )
+
+        return diffusion_cls(
+            eps=eps,
+            parameterization=lattice_parameterization,
+            **diffusion_kwargs,
+        )
 
     # ============================================================================
     # ALGORITHM 1
@@ -90,11 +136,13 @@ class ModelKLDM(nn.Module):
         l_t, eps_l = self.diffusion_l.forward_sample(
             t=times.lattice,
             x0=batch.l,
+            num_atoms=batch.num_atoms,
         )
         target_l = self.diffusion_l.training_target(
             t=times.lattice,
             x0=batch.l,
             noise=eps_l,
+            num_atoms=batch.num_atoms,
         )
 
         f_t, v_t, epsilon_v, epsilon_r, r_t = self.tdm.sample_noisy_state(
@@ -128,6 +176,26 @@ class ModelKLDM(nn.Module):
         """
         loss = F.mse_loss(pred, target, reduction="none")
         return loss.reshape(loss.shape[0], -1).mean(dim=1)
+
+    def mattergen_lattice_mse_6d_per_sample(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Weighted 6D MSE that matches averaging over the full symmetric 3x3 cell.
+        """
+        # Code segment inspired from mattergen
+        # (mattergen/diffusion/training/field_loss.py:118-152,
+        #  mattergen/common/loss.py:35-40).
+        #
+        # Official MatterGen computes denoising loss on the full `cell` tensor and
+        # then averages over all matrix entries. In the KLDM port we store only the
+        # six unique entries of the symmetric matrix, so off-diagonal terms need a
+        # factor of 2 to match the full 3x3 averaging.
+        weights = pred.new_tensor([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+        loss = (pred - target).square() * weights
+        return loss.sum(dim=-1) / 9.0
 
     # ============================================================================
     # ALGORITHM 2
@@ -174,7 +242,10 @@ class ModelKLDM(nn.Module):
         out_l = preds["l"]
 
         loss_v_node = self.mse_loss_per_sample(out_v, target_v)
-        loss_l_graph = self.mse_loss_per_sample(out_l, target_l)
+        if self.lattice_representation == "mattergen":
+            loss_l_graph = self.mattergen_lattice_mse_6d_per_sample(out_l, target_l)
+        else:
+            loss_l_graph = self.mse_loss_per_sample(out_l, target_l)
         num_graphs = int(batch.num_graphs)
 
         loss_v_sum = torch.zeros(num_graphs, device=device, dtype=loss_v_node.dtype)
@@ -271,6 +342,7 @@ class ModelKLDM(nn.Module):
                     x_t=state["l_t"],
                     pred=preds_curr["l"],
                     dt=times.dt,
+                    num_atoms=state["batch"].num_atoms,
                 )
 
         if state["restore_training"]:
@@ -375,6 +447,7 @@ class ModelKLDM(nn.Module):
                     x_t=state["l_t"],
                     pred=preds_next["l"],
                     dt=times.dt,
+                    num_atoms=state["batch"].num_atoms,
                 )
 
         if state["restore_training"]:
@@ -401,7 +474,10 @@ class ModelKLDM(nn.Module):
         # and l_T ~ N(0, I).
         f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         v_t = self.tdm.sample_velocity_noise(f_t, index=node_index)
-        l_t = torch.randn_like(batch.l)
+        l_t = self.diffusion_l.sample_prior(
+            x_like=batch.l,
+            num_atoms=batch.num_atoms,
+        )
         a_t = batch.atomic_numbers
 
         score_network = self.score_network

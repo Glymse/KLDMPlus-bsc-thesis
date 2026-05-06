@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from mattergen.common.data.chemgraph import ChemGraph
-from mattergen.common.data.transform import Transform
 from torch_geometric.utils import dense_to_sparse
+
+try:
+    from mattergen.common.data.chemgraph import ChemGraph
+    from mattergen.common.data.transform import Transform
+except ImportError:  # pragma: no cover
+    ChemGraph = Any
+
+    class Transform:  # type: ignore[override]
+        pass
 
 
 # Atomic vocabulary used when atom types are represented by indices.
@@ -122,6 +131,76 @@ def lattice_feature_components(
     angle_features = torch.tan(angles - torch.pi / 2.0)
     return log_lengths, angle_features
 
+def mattergen_symmetric_cell(cell: torch.Tensor) -> torch.Tensor:
+    """Return the MatterGen-style rotation-fixed symmetric cell.
+
+    Adapted from:
+        src/mattergen/mattergen-main/mattergen/common/utils/data_utils.py
+        ::compute_lattice_polar_decomposition
+
+    KLDM-specific note:
+    we keep the official MatterGen polar/SVD construction, but expose it as a
+    small helper that accepts either one 3x3 matrix or a batch of them. The
+    returned matrix is the symmetric lattice equivalent up to rotation.
+    """
+    # Code segment inspired from mattergen
+    # (mattergen/common/utils/data_utils.py:373-386).
+    w, singular_values, v_transpose = torch.linalg.svd(cell)
+    s_square = torch.diag_embed(singular_values)
+    v = v_transpose.transpose(-1, -2)
+    u = w @ v_transpose
+    p = v @ s_square @ v_transpose
+    p_prime = u @ p @ u.transpose(-1, -2)
+    return p_prime
+
+
+def symmetric_matrix_to_vector(matrix: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        [
+            matrix[..., 0, 0],
+            matrix[..., 1, 1],
+            matrix[..., 2, 2],
+            matrix[..., 0, 1],
+            matrix[..., 0, 2],
+            matrix[..., 1, 2],
+        ],
+        dim=-1,
+    )
+
+
+def vector_to_symmetric_matrix(vector: torch.Tensor) -> torch.Tensor:
+    matrix = torch.zeros(*vector.shape[:-1], 3, 3, device=vector.device, dtype=vector.dtype)
+    matrix[..., 0, 0] = vector[..., 0]
+    matrix[..., 1, 1] = vector[..., 1]
+    matrix[..., 2, 2] = vector[..., 2]
+    matrix[..., 0, 1] = matrix[..., 1, 0] = vector[..., 3]
+    matrix[..., 0, 2] = matrix[..., 2, 0] = vector[..., 4]
+    matrix[..., 1, 2] = matrix[..., 2, 1] = vector[..., 5]
+    return matrix
+
+
+def mattergen_lattice_feature_vector(cell: torch.Tensor) -> torch.Tensor:
+    # Code segment inspired from mattergen
+    # (mattergen/common/data/transform.py:22-23,
+    #  mattergen/common/utils/data_utils.py:373-386).
+    # KLDM-specific adapter:
+    # official MatterGen diffuses a symmetric 3x3 matrix, while the KLDM port
+    # stores the six unique entries as a 6D vector.
+    return symmetric_matrix_to_vector(mattergen_symmetric_cell(cell))
+
+
+def lattice_spd_stats(l6: torch.Tensor) -> dict[str, float]:
+    """Summarize whether symmetric 6D lattice vectors decode to valid SPD cells."""
+    matrices = vector_to_symmetric_matrix(l6)
+    eigvals = torch.linalg.eigvalsh(matrices)
+    min_per_graph = eigvals.min(dim=-1).values
+    determinants = torch.det(matrices)
+    return {
+        "min_eig": float(min_per_graph.min().item()),
+        "frac_non_spd": float((min_per_graph <= 0).to(torch.float32).mean().item()),
+        "frac_small_det": float((determinants.abs() < 0.1).to(torch.float32).mean().item()),
+    }
+
 
 def _has_x0_lattice_stats(payload: dict) -> bool:
     return (
@@ -129,6 +208,17 @@ def _has_x0_lattice_stats(payload: dict) -> bool:
         and isinstance(payload.get("lengths_loc_scale"), dict)
         and isinstance(payload.get("angles_loc_scale"), list)
         and len(payload["angles_loc_scale"]) == 2
+    )
+
+
+def _has_mattergen_lattice_stats(payload: dict) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("representation") == "mattergen"
+        and "average_density" in payload
+        and "c" in payload
+        and "limit_var_scaling_constant" in payload
+        and "nu" in payload
     )
 
 
@@ -167,6 +257,35 @@ def _restore_x0_stats(
         torch.tensor(angle_spread, dtype=torch.get_default_dtype()),
     )
     return lengths_loc_scale, angles_loc_scale
+
+
+def _pack_mattergen_stats(
+    *,
+    average_density: float,
+    c: float,
+    limit_var_scaling_constant: float,
+    nu: float,
+    eps: float,
+) -> dict[str, object]:
+    return {
+        "representation": "mattergen",
+        "average_density": float(max(average_density, eps)),
+        "c": float(max(c, eps)),
+        "limit_var_scaling_constant": float(max(limit_var_scaling_constant, eps)),
+        "nu": float(max(nu, eps)),
+        "vec6_order": ["00", "11", "22", "01", "02", "12"],
+        # KLDM-specific cache note:
+        # the public MatterGen repo does not expose this exact JSON cache format.
+        # We keep a tiny cache here so the KLDM runner can inject c/nu into the
+        # lattice diffusion config without recomputing train-set statistics.
+        "note": (
+            "MatterGen-style lattice prior statistics for the KLDM port. "
+            "Official MatterGen stores limit_density and "
+            "limit_var_scaling_constant in config rather than a JSON cache. "
+            "Here we cache average_density, plus the KLDM adapter values "
+            "c = 1 / average_density and nu = limit_var_scaling_constant^(3/2)."
+        ),
+    }
 
 
 def ensure_lattice_standardization_cache(
@@ -211,6 +330,90 @@ def ensure_lattice_standardization_cache(
     return cache_path
 
 
+def ensure_mattergen_lattice_cache(
+    *,
+    cache_file: str | Path,
+    processed_dir: str | Path,
+    eps: float = 1e-8,
+) -> Path:
+    """Create train-set statistics for the MatterGen-style lattice prior.
+
+    Official MatterGen uses a lattice prior with
+
+        mu(n)    = (n / average_density)^(1/3)
+        Var(n)   = n^(2/3) * limit_var_scaling_constant
+
+    as implemented in
+        src/mattergen/mattergen-main/mattergen/common/diffusion/corruption.py
+        ::LatticeVPSDE.get_limit_mean
+        ::LatticeVPSDE.get_limit_var
+
+    The KLDM port keeps the existing `mu(n), sigma(n)` interface, so we cache
+
+        c  = 1 / average_density
+        nu = limit_var_scaling_constant^(3/2)
+
+    which makes
+
+        mu(n)    = (n c)^(1/3)
+        sigma(n) = (n nu)^(1/3)
+
+    exactly match the official MatterGen limit mean and variance.
+    """
+    cache_path = Path(cache_file)
+    if cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as handle:
+                existing_payload = json.load(handle)
+            if _has_mattergen_lattice_stats(existing_payload):
+                return cache_path
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+
+    cell_path = Path(processed_dir) / "cell.npy"
+    num_atoms_path = Path(processed_dir) / "num_atoms.npy"
+    cells = np.load(cell_path, allow_pickle=True)
+    num_atoms: Any = np.load(num_atoms_path, allow_pickle=True)
+
+    densities: list[torch.Tensor] = []
+    for cell, n_atoms in zip(cells, num_atoms):
+        cell = torch.as_tensor(cell, dtype=torch.get_default_dtype())
+        if cell.ndim == 3 and cell.shape[0] == 1:
+            cell = cell.squeeze(0)
+
+        # Code segment inspired from mattergen
+        # (mattergen/common/data/transform.py:22-23,
+        #  mattergen/common/utils/data_utils.py:373-386).
+        sym_cell = mattergen_symmetric_cell(cell)
+        volume = torch.det(sym_cell).abs().clamp_min(eps)
+        densities.append(torch.as_tensor(float(int(n_atoms)), dtype=volume.dtype) / volume)
+
+    # Code segment inspired from mattergen
+    # (mattergen/conf/data_module/mp_20.yaml:19,
+    #  mattergen/common/diffusion/corruption.py:48-65,
+    #  mattergen/common/diffusion/corruption.py:110-152).
+    average_density = torch.stack(densities).mean().clamp_min(eps)
+    c = average_density.reciprocal()
+    limit_var_scaling_constant = torch.as_tensor(0.25, dtype=torch.get_default_dtype()).clamp_min(eps)
+    nu = limit_var_scaling_constant.pow(1.5)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            _pack_mattergen_stats(
+                average_density=float(average_density.item()),
+                c=float(c.item()),
+                limit_var_scaling_constant=float(limit_var_scaling_constant.item()),
+                nu=float(nu.item()),
+                eps=eps,
+            ),
+            handle,
+            indent=2,
+        )
+
+    return cache_path
+
+
 class FullyConnectedGraph(Transform):
     """
     Add fully connected directed edges to a crystal graph.
@@ -242,9 +445,37 @@ class FullyConnectedGraph(Transform):
         return sample.replace(**{self.key: edge_index})
 
 
-class ContinuousIntervalLattice(Transform):
+class ContinuousIntervalLattice(Transform, ABC):
+    """Base class for lattice representations used by the CSP pipeline."""
+
+    def __init__(
+        self,
+        out_key: str = "l",
+        standardize: bool = False,
+        cache_file: str | Path | None = None,
+        eps: float = 1e-8,
+    ) -> None:
+        self.out_key = out_key
+        self.standardize = standardize
+        self.cache_file = Path(cache_file) if cache_file is not None else None
+        self.eps = eps
+
+    @abstractmethod
+    def __call__(self, sample: ChemGraph) -> ChemGraph:
+        raise NotImplementedError
+
+    @abstractmethod
+    def invert_to_lengths_angles(
+        self,
+        l: torch.Tensor,
+        num_atoms: torch.Tensor | int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+
+class KLDMContinuousIntervalLattice(ContinuousIntervalLattice):
     """
-    Encode/decode lattice parameters for Euclidean diffusion.
+    Encode/decode the original KLDM lattice parameterization.
 
     Forward transform:
         cell matrix -> 6D lattice vector
@@ -254,14 +485,6 @@ class ContinuousIntervalLattice(Transform):
 
     Inverse transform:
         l -> unstandardize -> lengths and angles
-
-    Input ChemGraph:
-        Must contain:
-            sample.cell, shape usually (1, 3, 3)
-
-    Output ChemGraph:
-        Adds:
-            sample.l, shape (1, 6)
     """
 
     def __init__(
@@ -271,16 +494,13 @@ class ContinuousIntervalLattice(Transform):
         cache_file: str | Path | None = None,
         eps: float = 1e-8,
     ) -> None:
-        """
-        Initialize the lattice transform.
-
-        Output:
-            Transform object with optional standardization statistics loaded.
-        """
-        self.out_key = out_key
-        self.standardize = standardize
-        self.cache_file = Path(cache_file) if cache_file is not None else None
-        self.eps = eps
+        super().__init__(
+            out_key=out_key,
+            standardize=standardize,
+            cache_file=cache_file,
+            eps=eps,
+        )
+        self.representation = "kldm"
 
         self.loc: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
@@ -469,3 +689,85 @@ class ContinuousIntervalLattice(Transform):
         angles = torch.atan(angle_features) + torch.pi / 2.0
 
         return lengths, angles
+
+
+class MatterGenContinuousIntervalLattice(ContinuousIntervalLattice):
+    """Encode/decode the MatterGen-style symmetric lattice representation."""
+
+    def __init__(
+        self,
+        out_key: str = "l",
+        standardize: bool = False,
+        cache_file: str | Path | None = None,
+        eps: float = 1e-8,
+    ) -> None:
+        if standardize:
+            raise ValueError("MatterGen lattice representation only supports eps parameterization.")
+        super().__init__(
+            out_key=out_key,
+            standardize=standardize,
+            cache_file=cache_file,
+            eps=eps,
+        )
+        self.representation = "mattergen"
+        self.average_density: float | None = None
+        self.c: float | None = None
+        self.limit_var_scaling_constant: float | None = None
+        self.nu: float | None = None
+        if self.cache_file is not None and self.cache_file.exists():
+            with self.cache_file.open("r", encoding="utf-8") as handle:
+                stats = json.load(handle)
+            if _has_mattergen_lattice_stats(stats):
+                self.average_density = float(stats["average_density"])
+                self.c = float(stats["c"])
+                self.limit_var_scaling_constant = float(stats["limit_var_scaling_constant"])
+                self.nu = float(stats["nu"])
+
+    def __call__(self, sample: ChemGraph) -> ChemGraph:
+        cell = sample.cell.squeeze(0)
+        # KLDM-specific preprocessing note:
+        # official MatterGen applies Niggli reduction before the polar/SVD step,
+        # but it does so on the full structure during dataset preprocessing, not
+        # on the cell matrix in isolation. Applying Niggli here would be wrong
+        # unless fractional coordinates were transformed with the same basis
+        # change. We therefore rely on the processed MatterGen-style caches
+        # already containing primitive + Niggli-reduced cells upstream.
+        # Code segment inspired from mattergen
+        # (mattergen/common/data/transform.py:22-23,
+        #  mattergen/common/utils/data_utils.py:373-386).
+        # MatterGen-style symmetric lattice representation used by the KLDM port.
+        features = mattergen_lattice_feature_vector(cell)
+        return sample.replace(**{self.out_key: features.view(1, 6)})
+
+    def stats(self) -> tuple[float, float]:
+        if self.c is None or self.nu is None:
+            raise ValueError("MatterGen lattice stats are unavailable.")
+        return self.c, self.nu
+
+    def invert_to_matrix(
+        self,
+        l: torch.Tensor,
+        num_atoms: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        del num_atoms
+        flat_features = l.reshape(-1, 6)
+        matrices = vector_to_symmetric_matrix(flat_features)
+        return matrices.reshape(*l.shape[:-1], 3, 3)
+
+    def invert_to_lengths_angles(
+        self,
+        l: torch.Tensor,
+        num_atoms: torch.Tensor | int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cells = self.invert_to_matrix(l, num_atoms=num_atoms).reshape(-1, 3, 3)
+
+        lengths = []
+        angles = []
+        for cell in cells:
+            cell_lengths, cell_angles = cell_lengths_and_angles(cell)
+            lengths.append(cell_lengths)
+            angles.append(cell_angles)
+
+        lengths_tensor = torch.stack(lengths, dim=0).reshape(*l.shape[:-1], 3)
+        angles_tensor = torch.stack(angles, dim=0).reshape(*l.shape[:-1], 3)
+        return lengths_tensor, angles_tensor

@@ -14,7 +14,7 @@ manual_test/
 
 src/torsional
 src/TDM
-
+src/mattergen
 
 # other local dev info
 .vscode/

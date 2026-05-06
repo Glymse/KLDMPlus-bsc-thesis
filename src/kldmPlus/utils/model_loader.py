@@ -19,6 +19,7 @@ def _section(config: dict[str, Any], name: str) -> dict[str, Any]:
 
 def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
     cfg = _section(config, "model")
+    dataset_cfg = _section(config, "dataset")
     score_network = _section(cfg, "score_network")
     if not score_network:
         raise ValueError("Config must explicitly define model.score_network.")
@@ -40,6 +41,10 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         tdm_sigma_norm_mc_samples=int(cfg.get("tdm_sigma_norm_mc_samples", 20000)),
         tdm_centered_sigma_norm_correction=bool(cfg.get("tdm_centered_sigma_norm_correction", False)),
         lattice_parameterization=str(cfg.get("lattice_parameterization", "eps")),
+        lattice_diffusion_type=str(cfg.get("lattice_diffusion_type", "VP")),
+        lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
+        mattergen_lattice_c=cfg.get("mattergen_lattice_c"),
+        mattergen_lattice_nu=cfg.get("mattergen_lattice_nu"),
         score_network_kwargs=score_network,
     ).to(device)
 

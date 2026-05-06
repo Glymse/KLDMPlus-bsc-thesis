@@ -86,6 +86,7 @@ class SamplingRunner:
         self.device = get_default_device()
         self.checkpoint_path = self._checkpoint_path(self.sampling_cfg["checkpoint_path"])
         self.loader, self.lattice_transform = self._build_loader()
+        self._inject_mattergen_lattice_stats()
         self.model = build_model(config=self.config, device=self.device)
         load_checkpoint(
             checkpoint_path=self.checkpoint_path,
@@ -114,12 +115,21 @@ class SamplingRunner:
     # Builds the fixed test-set loader used by both sample mode and @1/@20 evaluation mode.
     def _build_loader(self) -> tuple[DataLoader, Any]:
         from kldmPlus.data import CSPTask, resolve_data_root
+        from kldmPlus.data.csp import validate_lattice_configuration
 
         dataset_cfg = dict(self.config["dataset"])
         model_cfg = dict(self.config["model"])
+        # Sampling must use the same representation/diffusion pairing as
+        # training, or the lattice branch becomes physically meaningless.
+        validate_lattice_configuration(
+            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
+            lattice_parameterization=str(model_cfg["lattice_parameterization"]),
+            lattice_diffusion_type=str(model_cfg.get("lattice_diffusion_type", "VP")),
+        )
         task = CSPTask(
             dataset_name=str(dataset_cfg["name"]),
             lattice_parameterization=str(model_cfg["lattice_parameterization"]),
+            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
         )
 
         requested_split = str(self.eval_cfg.get("split", TEST_SPLIT))
@@ -144,6 +154,16 @@ class SamplingRunner:
             collate_fn=dataset_full.collate_fn,
         )
         return loader, task.make_lattice_transform(root=root, download=True)
+
+    def _inject_mattergen_lattice_stats(self) -> None:
+        if getattr(self.lattice_transform, "representation", None) != "mattergen":
+            return
+        if not hasattr(self.lattice_transform, "stats"):
+            return
+        c, nu = self.lattice_transform.stats()
+        self.config.setdefault("model", {})
+        self.config["model"]["mattergen_lattice_c"] = float(c)
+        self.config["model"]["mattergen_lattice_nu"] = float(nu)
 
     # Samples one batch with either EM or PC, depending on the config.
     def _sample_batch(self, batch):

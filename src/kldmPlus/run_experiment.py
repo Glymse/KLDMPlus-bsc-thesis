@@ -197,6 +197,7 @@ class ExperimentRunner:
         self.device = get_default_device()
         self.time_sampler = self.build_time_sampler()
         self.train_loader, self.val_loader, self.lattice_transform = self.create_loaders()
+        self._inject_mattergen_lattice_stats()
 
         self.model, self.optimizer, self.ema = build_training_components(
             config=self.config,
@@ -253,13 +254,22 @@ class ExperimentRunner:
 
     def create_loaders(self) -> tuple[DataLoader, DataLoader, Any]:
         from kldmPlus.data import CSPTask, resolve_data_root
+        from kldmPlus.data.csp import validate_lattice_configuration
 
         dataset_cfg = dict(self.config["dataset"])
         model_cfg = dict(self.config["model"])
+        # Guard against silent representation/diffusion mismatches before the
+        # runner creates datasets or starts training.
+        validate_lattice_configuration(
+            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
+            lattice_parameterization=str(model_cfg["lattice_parameterization"]),
+            lattice_diffusion_type=str(model_cfg.get("lattice_diffusion_type", "VP")),
+        )
 
         task = CSPTask(
             dataset_name=str(dataset_cfg["name"]),
             lattice_parameterization=str(model_cfg["lattice_parameterization"]),
+            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
         )
 
         root = resolve_data_root(dataset_cfg["root"])
@@ -302,6 +312,16 @@ class ExperimentRunner:
         )
 
         return train_loader, val_loader, task.make_lattice_transform(root=root, download=True)
+
+    def _inject_mattergen_lattice_stats(self) -> None:
+        if getattr(self.lattice_transform, "representation", None) != "mattergen":
+            return
+        if not hasattr(self.lattice_transform, "stats"):
+            return
+        c, nu = self.lattice_transform.stats()
+        self.config.setdefault("model", {})
+        self.config["model"]["mattergen_lattice_c"] = float(c)
+        self.config["model"]["mattergen_lattice_nu"] = float(nu)
 
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
@@ -515,20 +535,24 @@ class ExperimentRunner:
                     )
 
     def validate_epoch(self, epoch: int) -> None:
-        # Validation can optionally swap in EMA weights, depending on the config.
+        # Match facitKLDM semantics:
+        #   - validation loss stays on the current/online model
+        #   - validation sampling metrics (valid, match_rate, rmse) may use EMA
+        # This keeps loss curves comparable to training while reporting
+        # generation metrics from the smoother EMA model.
         ema_val = bool(self.validation_cfg["ema_val"])
         use_ema = ema_val and self.ema is not None and self.ema.num_updates > 0
-        context = (
+        model_label = "EMA model for sampling metrics" if use_ema else "current model"
+
+        print(f"epoch={epoch:04d} entering validation with {model_label}", flush=True)
+
+        val_loss_metrics = self.evaluate_loss()
+        sample_context = (
             self.ema.average_parameters(self.model)
             if use_ema and self.ema is not None
             else nullcontext()
         )
-        model_label = "EMA model" if use_ema else "current model"
-
-        print(f"epoch={epoch:04d} entering validation with {model_label}", flush=True)
-
-        with context:
-            val_loss_metrics = self.evaluate_loss()
+        with sample_context:
             val_sample_metrics = self.run_sampling_evaluation()
 
         merged_metrics = {
