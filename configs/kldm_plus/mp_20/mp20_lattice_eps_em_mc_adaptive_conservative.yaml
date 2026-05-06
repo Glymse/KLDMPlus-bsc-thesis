@@ -1,4 +1,4 @@
-experiment_name: plus_mp20_lattice_eps_em_mc_adaptive
+experiment_name: plus_mp20_lattice_eps_em_mc_adaptive_conservative
 sampler_config: ../../samplers/euler_maruyama.yaml
 
 dataset:
@@ -11,18 +11,18 @@ dataset:
 
 time_sampler:
   type: loss_second_moment
-  n_bins: 48
-  history_per_bin: 32
-  alpha: 0.8
-  adaptive_power: 1.0
-  min_prob: 0.002
-  max_prob: 0.12
-  velocity_weight: 0.95
-  lattice_weight: 0.05
+  n_bins: 64
+  history_per_bin: 50
+  alpha: 0.1
+  adaptive_power: 0.5
+  min_prob: 0.006
+  max_prob: 0.03
+  velocity_weight: 0.9
+  lattice_weight: 0.1
   use_importance_weights: true
-  clip_importance_weights: false
-  weight_clip_min: 0.5
-  weight_clip_max: 2.0
+  clip_importance_weights: true
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
 
 model:
   eps: 1.0e-6
@@ -66,7 +66,7 @@ logging:
   train_every_epochs: 1
   wandb_checkpoints: true
   wandb_project: plus_mp20_lattice_eps_em_ablation
-  wandb_run_name: mc_adaptive
+  wandb_run_name: mc_adaptive_conservative
 
 validation:
   every_n_epochs: 100

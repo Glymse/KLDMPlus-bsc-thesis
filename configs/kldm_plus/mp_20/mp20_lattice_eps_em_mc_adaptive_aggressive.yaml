@@ -1,4 +1,4 @@
-experiment_name: plus_mp20_lattice_eps_em_mc_adaptive
+experiment_name: plus_mp20_lattice_eps_em_mc_adaptive_aggressive
 sampler_config: ../../samplers/euler_maruyama.yaml
 
 dataset:
@@ -66,7 +66,7 @@ logging:
   train_every_epochs: 1
   wandb_checkpoints: true
   wandb_project: plus_mp20_lattice_eps_em_ablation
-  wandb_run_name: mc_adaptive
+  wandb_run_name: mc_adaptive_aggressive
 
 validation:
   every_n_epochs: 100

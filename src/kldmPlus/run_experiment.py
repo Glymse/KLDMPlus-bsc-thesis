@@ -236,6 +236,7 @@ class ExperimentRunner:
                 lower_bound=TIME_LOWER_BOUND,
                 history_per_bin=int(cfg.get("history_per_bin", 10)),
                 alpha=float(cfg.get("alpha", 0.5)),
+                adaptive_power=float(cfg.get("adaptive_power", 0.5)),
                 min_prob=float(cfg.get("min_prob", 0.002)),
                 max_prob=float(cfg.get("max_prob", 0.10)),
                 velocity_weight=float(cfg.get("velocity_weight", 0.7)),

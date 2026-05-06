@@ -81,6 +81,7 @@ class LossSecondMomentTimeSampler:
         lower_bound: float = 1e-3,
         history_per_bin: int = 10,
         alpha: float = 0.5,
+        adaptive_power: float = 0.5,
         min_prob: float = 0.002,
         max_prob: float = 0.10,
         velocity_weight: float = 0.7,
@@ -96,6 +97,9 @@ class LossSecondMomentTimeSampler:
         self.lower_bound = float(lower_bound)
         self.history_per_bin = int(history_per_bin)
         self.alpha = float(alpha)
+        self.adaptive_power = float(adaptive_power)
+        if self.adaptive_power <= 0.0:
+            raise ValueError("adaptive_power must be > 0")
         self.min_prob = float(min_prob)
         self.max_prob = float(max_prob)
         self.velocity_weight = float(velocity_weight)
@@ -151,7 +155,7 @@ class LossSecondMomentTimeSampler:
             return torch.full((self.n_bins,), 1.0 / self.n_bins, device=device, dtype=dtype)
 
         moments = self._second_moments(device=device, dtype=dtype)
-        adaptive = torch.sqrt(moments.clamp_min(1e-12))
+        adaptive = moments.clamp_min(1e-12).pow(self.adaptive_power)
         adaptive = adaptive / adaptive.sum().clamp_min(1e-12)
 
         uniform = torch.full_like(adaptive, 1.0 / self.n_bins)
