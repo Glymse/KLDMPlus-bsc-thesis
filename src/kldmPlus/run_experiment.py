@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import tempfile
 from typing import Any, Mapping
+from urllib.parse import unquote, urlparse
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,6 +35,7 @@ except ImportError as exc:  # pragma: no cover
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CHECKPOINTS_ROOT = WORKSPACE_ROOT / "artifacts" / "HPC" / "checkpoints" / "experiments"
+WANDB_ARTIFACTS_ROOT = WORKSPACE_ROOT / "artifacts" / "HPC" / "wandb_artifacts"
 TIME_LOWER_BOUND = 1e-3
 STOP_REQUESTED = False
 TRAIN_SPLIT = "train"
@@ -116,6 +118,88 @@ def should_stop(run) -> bool:
 def build_run_name() -> str:
     now = datetime.now()
     return f"trial_{now.strftime('%Y%m%d')}"
+
+
+def _parse_wandb_artifact_url(reference: str) -> tuple[str, str, str, str, str, str] | None:
+    parsed = urlparse(reference)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.netloc not in {"wandb.ai", "www.wandb.ai"}:
+        return None
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 8:
+        return None
+    if parts[2] != "artifacts" or parts[6] != "files":
+        return None
+
+    entity = parts[0]
+    project = parts[1]
+    artifact_type = parts[3]
+    artifact_name = parts[4]
+    artifact_version = parts[5]
+    file_path = "/".join(parts[7:])
+    if not file_path:
+        return None
+    return entity, project, artifact_type, artifact_name, artifact_version, file_path
+
+
+def resolve_checkpoint_reference(reference: str | Path, *, config_path: Path) -> Path:
+    reference_str = str(reference)
+    artifact_ref = _parse_wandb_artifact_url(reference_str)
+    if artifact_ref is not None:
+        entity, project, artifact_type, artifact_name, artifact_version, file_path = artifact_ref
+        artifact_spec = f"{entity}/{project}/{artifact_name}:{artifact_version}"
+        download_root = (
+            WANDB_ARTIFACTS_ROOT
+            / entity
+            / project
+            / artifact_type
+            / artifact_name
+            / artifact_version
+        )
+        expected_path = download_root / file_path
+        if expected_path.exists():
+            return expected_path.resolve()
+
+        artifact = wandb.Api().artifact(artifact_spec, type=artifact_type)
+        artifact_dir = Path(artifact.download(root=str(download_root)))
+        checkpoint_path = artifact_dir / file_path
+        if checkpoint_path.exists():
+            print(
+                f"checkpoint_downloaded=wandb artifact={artifact_spec} file={checkpoint_path}",
+                flush=True,
+            )
+            return checkpoint_path.resolve()
+
+        matches = sorted(artifact_dir.rglob(Path(file_path).name))
+        if len(matches) == 1:
+            chosen = matches[0].resolve()
+            print(
+                f"checkpoint_downloaded=wandb artifact={artifact_spec} file={chosen}",
+                flush=True,
+            )
+            return chosen
+
+        raise FileNotFoundError(
+            "Downloaded WandB artifact but could not locate the requested checkpoint file: "
+            f"artifact={artifact_spec} requested_file={file_path} download_dir={artifact_dir}"
+        )
+
+    candidate = Path(reference_str).expanduser()
+    if not candidate.is_absolute():
+        candidate = (config_path.parent / candidate).expanduser()
+    candidate = candidate.resolve()
+    if candidate.exists():
+        return candidate
+
+    if candidate.parent.exists():
+        options = sorted(candidate.parent.glob("*.pt"))
+        if options:
+            chosen = options[-1].resolve()
+            print(f"checkpoint_missing={candidate} fallback_latest={chosen}", flush=True)
+            return chosen
+    return candidate
 
 
 def format_metric(value: float | int | None, fmt: str) -> str:
@@ -215,7 +299,10 @@ class ExperimentRunner:
         resume_from = self.checkpoint_cfg["resume_from"]
         if resume_from:
             checkpoint = load_checkpoint(
-                checkpoint_path=(self.config_path.parent / str(resume_from)).expanduser().resolve(),
+                checkpoint_path=resolve_checkpoint_reference(
+                    resume_from,
+                    config_path=self.config_path,
+                ),
                 model=self.model,
                 optimizer=self.optimizer,
                 ema=self.ema,

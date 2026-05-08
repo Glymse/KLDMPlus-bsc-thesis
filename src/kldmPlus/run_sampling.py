@@ -14,7 +14,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from kldmPlus.run_experiment import format_metric, load_experiment_config, make_fixed_subset
+from kldmPlus.run_experiment import (
+    format_metric,
+    load_experiment_config,
+    make_fixed_subset,
+    resolve_checkpoint_reference,
+)
 from kldmPlus.sample_evaluation import prepare_visualization_pair
 from kldmPlus.utils.device import get_default_device
 
@@ -97,20 +102,7 @@ class SamplingRunner:
 
     # Resolves the checkpoint path from the config file location and falls back to the latest file.
     def _checkpoint_path(self, checkpoint_path: str | Path) -> Path:
-        candidate = Path(checkpoint_path).expanduser()
-        if not candidate.is_absolute():
-            candidate = (self.config_path.parent / candidate).expanduser()
-        candidate = candidate.resolve()
-        if candidate.exists():
-            return candidate
-
-        if candidate.parent.exists():
-            options = sorted(candidate.parent.glob("*.pt"))
-            if options:
-                chosen = options[-1].resolve()
-                print(f"checkpoint_missing={candidate} fallback_latest={chosen}", flush=True)
-                return chosen
-        return candidate
+        return resolve_checkpoint_reference(checkpoint_path, config_path=self.config_path)
 
     # Builds the fixed test-set loader used by both sample mode and @1/@20 evaluation mode.
     def _build_loader(self) -> tuple[DataLoader, Any]:
