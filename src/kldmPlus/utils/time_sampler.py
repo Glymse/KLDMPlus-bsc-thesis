@@ -361,7 +361,9 @@ class GraphTimeBetaPolicy(nn.Module):
         self.min_concentration = float(min_concentration)
 
         nn.init.zeros_(self.output.weight)
-        nn.init.constant_(self.output.bias, 1.0)
+        # Match the reference adaptive implementation: the final actor layer is
+        # zero-initialized with a 0.5 bias before the softplus transform.
+        nn.init.constant_(self.output.bias, 0.5)
 
     def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self.backbone(features)
@@ -396,10 +398,12 @@ class AdaptiveReinforceTimeSampler:
         reward_candidate_times: int = 7,
         reward_active_times: int = 5,
         reward_history_size: int = 64,
+        use_baseline: bool = False,
         reward_baseline_momentum: float = 0.95,
         reward_velocity_weight: float = 1.0,
         reward_lattice_weight: float = 1.0,
         reward_normalization_eps: float = 1e-6,
+        entropy_in_reward: bool = True,
         use_importance_weights: bool = True,
         clip_importance_weights: bool = True,
         weight_clip_min: float = 0.25,
@@ -419,10 +423,12 @@ class AdaptiveReinforceTimeSampler:
         self.policy_update_every = int(policy_update_every)
         self.policy_warmup_steps = int(policy_warmup_steps)
         self.reward_history_size = int(reward_history_size)
+        self.use_baseline = bool(use_baseline)
         self.reward_baseline_momentum = float(reward_baseline_momentum)
         self.reward_velocity_weight = float(reward_velocity_weight)
         self.reward_lattice_weight = float(reward_lattice_weight)
         self.reward_normalization_eps = float(reward_normalization_eps)
+        self.entropy_in_reward = bool(entropy_in_reward)
         self.use_importance_weights = bool(use_importance_weights)
         self.clip_importance_weights = bool(clip_importance_weights)
         self.weight_clip_min = float(weight_clip_min)
@@ -468,6 +474,10 @@ class AdaptiveReinforceTimeSampler:
         self.last_entropy = 0.0
         self.last_alpha_mean = 0.0
         self.last_beta_mean = 0.0
+        self.last_sampled_t_mean = 0.0
+        self.last_sampled_t_std = 0.0
+        self.last_sampled_t_min = 0.0
+        self.last_sampled_t_max = 0.0
         self.last_reward_velocity_mean = 0.0
         self.last_reward_lattice_mean = 0.0
         self.selected_probe_indices = torch.arange(self.reward_active_times, dtype=torch.long)
@@ -547,15 +557,10 @@ class AdaptiveReinforceTimeSampler:
         return self.num_model_steps >= self.policy_warmup_steps
 
     def _default_probe_indices(self) -> torch.Tensor:
-        if self.reward_active_times >= self.reward_probe_times.numel():
-            return torch.arange(self.reward_probe_times.numel(), dtype=torch.long)
-        lin = torch.linspace(
-            0,
-            self.reward_probe_times.numel() - 1,
-            self.reward_active_times,
-            dtype=torch.float64,
+        return torch.arange(
+            min(self.reward_active_times, self.reward_probe_times.numel()),
+            dtype=torch.long,
         )
-        return torch.round(lin).long().unique(sorted=True)
 
     def _append_probe_history(self, delta_vector: torch.Tensor) -> None:
         self._probe_history.append(delta_vector.detach().to(device="cpu", dtype=torch.float64))
@@ -654,6 +659,10 @@ class AdaptiveReinforceTimeSampler:
                 dtype=dtype,
                 generator=generator,
             )
+            self.last_sampled_t_mean = float(t.detach().mean().item())
+            self.last_sampled_t_std = float(t.detach().std(unbiased=False).item())
+            self.last_sampled_t_min = float(t.detach().min().item())
+            self.last_sampled_t_max = float(t.detach().max().item())
             return TimeSamplerOutput(
                 t=t,
                 bins=torch.zeros(num_graphs, device=device, dtype=torch.long),
@@ -681,6 +690,10 @@ class AdaptiveReinforceTimeSampler:
 
         self.last_alpha_mean = float(alpha.detach().mean().item())
         self.last_beta_mean = float(beta.detach().mean().item())
+        self.last_sampled_t_mean = float(t.detach().mean().item())
+        self.last_sampled_t_std = float(t.detach().std(unbiased=False).item())
+        self.last_sampled_t_min = float(t.detach().min().item())
+        self.last_sampled_t_max = float(t.detach().max().item())
 
         return TimeSamplerOutput(
             t=t[:, None].detach(),
@@ -779,22 +792,31 @@ class AdaptiveReinforceTimeSampler:
         reward_mean = float(rewards.mean().item())
         reward_std = float(rewards.std(unbiased=False).item())
 
-        if not self.reward_baseline_initialized:
-            self.reward_baseline = reward_mean
-            self.reward_baseline_initialized = True
+        reward_signal = rewards
+        if self.use_baseline:
+            if not self.reward_baseline_initialized:
+                self.reward_baseline = reward_mean
+                self.reward_baseline_initialized = True
+            else:
+                self.reward_baseline = (
+                    self.reward_baseline_momentum * self.reward_baseline
+                    + (1.0 - self.reward_baseline_momentum) * reward_mean
+                )
+            reward_signal = rewards - self.reward_baseline
         else:
-            self.reward_baseline = (
-                self.reward_baseline_momentum * self.reward_baseline
-                + (1.0 - self.reward_baseline_momentum) * reward_mean
-            )
-
-        advantages = rewards - self.reward_baseline
+            self.reward_baseline = 0.0
+            self.reward_baseline_initialized = False
 
         # Inspired by adaptive paper:
         # the policy is updated with a REINFORCE loss based on before/after
-        # improvement over probe times, plus entropy to avoid early collapse.
-        policy_loss = -(advantages.detach() * sampled_time.log_probs).mean()
-        policy_loss = policy_loss - self.entropy_coef * sampled_time.entropies.mean()
+        # improvement over probe times. The reference implementation folds the
+        # entropy term into the reward; we keep that as the default mode here.
+        if self.entropy_in_reward:
+            reinforce_reward = reward_signal.detach() + self.entropy_coef * sampled_time.entropies
+            policy_loss = -(sampled_time.log_probs * reinforce_reward).mean()
+        else:
+            policy_loss = -(reward_signal.detach() * sampled_time.log_probs).mean()
+            policy_loss = policy_loss - self.entropy_coef * sampled_time.entropies.mean()
 
         self.policy_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()
@@ -861,6 +883,10 @@ class AdaptiveReinforceTimeSampler:
             "time_sampler/policy_entropy": float(self.last_entropy),
             "time_sampler/policy_alpha_mean": float(self.last_alpha_mean),
             "time_sampler/policy_beta_mean": float(self.last_beta_mean),
+            "time_sampler/sampled_t_mean": float(self.last_sampled_t_mean),
+            "time_sampler/sampled_t_std": float(self.last_sampled_t_std),
+            "time_sampler/sampled_t_min": float(self.last_sampled_t_min),
+            "time_sampler/sampled_t_max": float(self.last_sampled_t_max),
             "time_sampler/policy_baseline": float(self.reward_baseline),
             "time_sampler/reward_velocity_mean": float(self.last_reward_velocity_mean),
             "time_sampler/reward_lattice_mean": float(self.last_reward_lattice_mean),
