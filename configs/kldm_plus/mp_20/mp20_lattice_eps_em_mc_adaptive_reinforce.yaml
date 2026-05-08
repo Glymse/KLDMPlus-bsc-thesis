@@ -15,15 +15,18 @@ time_sampler:
   policy_hidden_dim: 128
   policy_hidden_depth: 2
   min_concentration: 0.25
-  policy_lr: 1.0e-4
-  entropy_coef: 1.0e-3
-  policy_update_every: 25
-  policy_warmup_steps: 100
+  policy_lr: 2.0e-5
+  entropy_coef: 1.0e-2
+  policy_update_every: 100
+  policy_warmup_steps: 5000 # very conservative start; for this MP20 setup this is roughly epoch 180-200 before the policy becomes active
   reward_candidate_times: 7
-  reward_active_times: 3
+  reward_active_times: 5
   reward_history_size: 64
   reward_baseline_momentum: 0.95
-  feature_selection_min_history: 4
+  reward_velocity_weight: 1.0
+  reward_lattice_weight: 1.0
+  reward_normalization_eps: 1.0e-6
+  feature_selection_min_history: 32
   use_importance_weights: true
   clip_importance_weights: true
   weight_clip_min: 0.25

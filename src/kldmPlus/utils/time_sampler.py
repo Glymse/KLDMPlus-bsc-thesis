@@ -389,20 +389,23 @@ class AdaptiveReinforceTimeSampler:
         policy_hidden_dim: int = 128,
         policy_hidden_depth: int = 2,
         min_concentration: float = 0.25,
-        policy_lr: float = 1e-4,
-        entropy_coef: float = 1e-3,
-        policy_update_every: int = 25,
-        policy_warmup_steps: int = 100,
+        policy_lr: float = 2e-5,
+        entropy_coef: float = 1e-2,
+        policy_update_every: int = 100,
+        policy_warmup_steps: int = 5000,
         reward_candidate_times: int = 7,
-        reward_active_times: int = 3,
+        reward_active_times: int = 5,
         reward_history_size: int = 64,
         reward_baseline_momentum: float = 0.95,
+        reward_velocity_weight: float = 1.0,
+        reward_lattice_weight: float = 1.0,
+        reward_normalization_eps: float = 1e-6,
         use_importance_weights: bool = True,
         clip_importance_weights: bool = True,
         weight_clip_min: float = 0.25,
         weight_clip_max: float = 4.0,
         gradient_clip_norm: float = 1.0,
-        feature_selection_min_history: int = 4,
+        feature_selection_min_history: int = 32,
         seed: int = 2002,
         device: torch.device | str = "cpu",
         reward_probe_times: list[float] | tuple[float, ...] | None = None,
@@ -417,6 +420,9 @@ class AdaptiveReinforceTimeSampler:
         self.policy_warmup_steps = int(policy_warmup_steps)
         self.reward_history_size = int(reward_history_size)
         self.reward_baseline_momentum = float(reward_baseline_momentum)
+        self.reward_velocity_weight = float(reward_velocity_weight)
+        self.reward_lattice_weight = float(reward_lattice_weight)
+        self.reward_normalization_eps = float(reward_normalization_eps)
         self.use_importance_weights = bool(use_importance_weights)
         self.clip_importance_weights = bool(clip_importance_weights)
         self.weight_clip_min = float(weight_clip_min)
@@ -462,6 +468,8 @@ class AdaptiveReinforceTimeSampler:
         self.last_entropy = 0.0
         self.last_alpha_mean = 0.0
         self.last_beta_mean = 0.0
+        self.last_reward_velocity_mean = 0.0
+        self.last_reward_lattice_mean = 0.0
         self.selected_probe_indices = torch.arange(self.reward_active_times, dtype=torch.long)
         self._probe_history: list[torch.Tensor] = []
         self._pending_policy_update = False
@@ -585,7 +593,8 @@ class AdaptiveReinforceTimeSampler:
         candidate_times = self._candidate_times(device=batch.pos.device, dtype=batch.pos.dtype)
         generator = self._generator_for(batch.pos.device)
         prepared_batches = []
-        before_losses = []
+        before_velocity_losses = []
+        before_lattice_losses = []
 
         with torch.no_grad():
             for tau in candidate_times.tolist():
@@ -622,11 +631,13 @@ class AdaptiveReinforceTimeSampler:
                 )
                 _loss, probe_metrics = model.loss_from_prepared(prepared)
                 prepared_batches.append(prepared)
-                before_losses.append(probe_metrics["loss_graph"])
+                before_velocity_losses.append(probe_metrics["loss_v_graph"])
+                before_lattice_losses.append(probe_metrics["loss_l_graph"])
 
         return {
             "prepared": prepared_batches,
-            "before_losses": torch.stack(before_losses, dim=1),
+            "before_velocity_losses": torch.stack(before_velocity_losses, dim=1),
+            "before_lattice_losses": torch.stack(before_lattice_losses, dim=1),
         }
 
     def sample(self, batch: Batch | Data) -> TimeSamplerOutput:
@@ -716,21 +727,55 @@ class AdaptiveReinforceTimeSampler:
         assert self.policy_optimizer is not None
 
         prepared_batches = self._probe_cache["prepared"]
-        before_losses = self._probe_cache["before_losses"]
-        after_losses = []
+        before_velocity_losses = self._probe_cache["before_velocity_losses"]
+        before_lattice_losses = self._probe_cache["before_lattice_losses"]
+        after_velocity_losses = []
+        after_lattice_losses = []
 
         with torch.no_grad():
             for prepared in prepared_batches:
                 _loss, probe_metrics = model.loss_from_prepared(prepared)
-                after_losses.append(probe_metrics["loss_graph"])
-        after_losses_t = torch.stack(after_losses, dim=1)
-        delta = before_losses - after_losses_t
+                after_velocity_losses.append(probe_metrics["loss_v_graph"])
+                after_lattice_losses.append(probe_metrics["loss_l_graph"])
 
-        batch_mean_delta = delta.mean(dim=0)
+        after_velocity_losses_t = torch.stack(after_velocity_losses, dim=1)
+        after_lattice_losses_t = torch.stack(after_lattice_losses, dim=1)
+
+        velocity_delta = before_velocity_losses - after_velocity_losses_t
+        lattice_delta = before_lattice_losses - after_lattice_losses_t
+
+        velocity_norm = before_velocity_losses.mean(dim=1, keepdim=True).clamp_min(
+            self.reward_normalization_eps
+        )
+        lattice_norm = before_lattice_losses.mean(dim=1, keepdim=True).clamp_min(
+            self.reward_normalization_eps
+        )
+        combined_delta = (
+            self.reward_velocity_weight * (velocity_delta / velocity_norm)
+            + self.reward_lattice_weight * (lattice_delta / lattice_norm)
+        )
+
+        batch_mean_delta = combined_delta.mean(dim=0)
         self._append_probe_history(batch_mean_delta)
 
-        selected_delta = delta[:, self.selected_probe_indices.to(device=delta.device)]
-        rewards = selected_delta.mean(dim=1)
+        selected_probe_indices = self.selected_probe_indices.to(device=combined_delta.device)
+        selected_velocity_delta = velocity_delta[:, selected_probe_indices]
+        selected_lattice_delta = lattice_delta[:, selected_probe_indices]
+        selected_velocity_norm = before_velocity_losses[:, selected_probe_indices].mean(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(self.reward_normalization_eps)
+        selected_lattice_norm = before_lattice_losses[:, selected_probe_indices].mean(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(self.reward_normalization_eps)
+        normalized_velocity_reward = selected_velocity_delta / selected_velocity_norm
+        normalized_lattice_reward = selected_lattice_delta / selected_lattice_norm
+        selected_combined_delta = (
+            self.reward_velocity_weight * normalized_velocity_reward
+            + self.reward_lattice_weight * normalized_lattice_reward
+        )
+        rewards = selected_combined_delta.mean(dim=1)
         reward_mean = float(rewards.mean().item())
         reward_std = float(rewards.std(unbiased=False).item())
 
@@ -761,6 +806,8 @@ class AdaptiveReinforceTimeSampler:
         self.last_reward_std = reward_std
         self.last_policy_loss = float(policy_loss.detach().item())
         self.last_entropy = float(sampled_time.entropies.detach().mean().item())
+        self.last_reward_velocity_mean = float(normalized_velocity_reward.mean().item())
+        self.last_reward_lattice_mean = float(normalized_lattice_reward.mean().item())
         self._probe_cache = None
 
     def state_dict(self) -> dict[str, Any]:
@@ -815,6 +862,8 @@ class AdaptiveReinforceTimeSampler:
             "time_sampler/policy_alpha_mean": float(self.last_alpha_mean),
             "time_sampler/policy_beta_mean": float(self.last_beta_mean),
             "time_sampler/policy_baseline": float(self.reward_baseline),
+            "time_sampler/reward_velocity_mean": float(self.last_reward_velocity_mean),
+            "time_sampler/reward_lattice_mean": float(self.last_reward_lattice_mean),
             "time_sampler/policy_active": float(self._policy_active()),
             "time_sampler/policy_selected_t_min": float(selected_times.min().item()),
             "time_sampler/policy_selected_t_max": float(selected_times.max().item()),
