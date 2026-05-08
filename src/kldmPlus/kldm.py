@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,31 @@ from kldmPlus.diffusionModels.tdm import TrivialisedDiffusion as TDM
 from kldmPlus.scoreNetwork.scoreNetwork import CSPVNet
 from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import BatchTimes, iter_sampling_times, make_times, sampling_grid
+
+
+@dataclass
+class PreparedTrainingBatch:
+    """
+    Fixed noisy training bundle for one KLDM++ loss evaluation.
+
+    Inspired by the adaptive paper:
+    the REINFORCE reward must compare before/after model losses on the same
+    corruption, so the sampler needs a reusable container for noisy states and
+    targets.
+    """
+
+    times: BatchTimes
+    v_t: torch.Tensor
+    f_t: torch.Tensor
+    l_t: torch.Tensor
+    target_v: torch.Tensor
+    target_l: torch.Tensor
+    atomic_numbers: torch.Tensor
+    node_index: torch.Tensor
+    edge_node_index: torch.Tensor
+    num_graphs: int
+    lattice_representation: str
+
 
 class ModelKLDM(nn.Module):
     """
@@ -201,58 +227,109 @@ class ModelKLDM(nn.Module):
     # ALGORITHM 2
     # ============================================================================
 
-    def algorithm2_loss(
+    def prepare_training_batch(
         self,
         batch: Data | Batch,
         t: torch.Tensor,
-        time_weight: torch.Tensor | None = None,
-        debug: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        *,
+        lattice_noise: torch.Tensor | None = None,
+        velocity_noise: torch.Tensor | None = None,
+        position_noise: torch.Tensor | None = None,
+    ) -> PreparedTrainingBatch:
         """
-        Algorithm 2 in KLDM:
-        network prediction + denoising score matching loss.
+        Build one fixed noisy training example bundle for Algorithm 2.
+
+        Inspired by the adaptive paper:
+        the sampler reward compares before/after improvement at probe times,
+        which only makes sense when both evaluations reuse the same corruption.
         """
         device = next(self.parameters()).device
         batch = batch.to(device)
         index = batch.batch
-        # Create time with shape [num_materials, 1], plus the matching
-        # lattice-level and atom/node-level views used by the two branches.
         times = make_times(batch, t)
 
-        # Algorithm 1
-        noisy, targets = self.algorithm1_training_targets(batch=batch, times=times)
-
-        v_t, f_t, l_t = noisy
-        target_v, target_l = targets
-        a_t = batch.atomic_numbers
-
-        # Network prediction, KLDM Alg. 2
-        preds = self.score_network(
-            t=times.graph,
-            pos=f_t,
-            v=v_t,
-            h=a_t,
-            l=l_t,
-            node_index=index,
-            edge_node_index=batch.edge_node_index,
+        l_t, eps_l = self.diffusion_l.forward_sample(
+            t=times.lattice,
+            x0=batch.l,
+            noise=lattice_noise,
+            num_atoms=batch.num_atoms,
+        )
+        target_l = self.diffusion_l.training_target(
+            t=times.lattice,
+            x0=batch.l,
+            noise=eps_l,
+            num_atoms=batch.num_atoms,
         )
 
-        ########HERE WE CALCULATE SIMPLIFIED SCORE
+        f_t, v_t, _epsilon_v, _epsilon_r, r_t = self.tdm.sample_noisy_state(
+            t=times.nodes,
+            f0=batch.pos,
+            index=index,
+            epsilon_v=velocity_noise,
+            epsilon_r=position_noise,
+        )
+        target_v = self.tdm.build_simplified_training_velocity_score(
+            t=times.nodes,
+            r_t=r_t,
+            v_t=v_t,
+            index=index,
+        )
+
+        return PreparedTrainingBatch(
+            times=times,
+            v_t=v_t,
+            f_t=f_t,
+            l_t=l_t,
+            target_v=target_v,
+            target_l=target_l,
+            atomic_numbers=batch.atomic_numbers,
+            node_index=index,
+            edge_node_index=batch.edge_node_index,
+            num_graphs=int(batch.num_graphs),
+            lattice_representation=self.lattice_representation,
+        )
+
+    def loss_from_prepared(
+        self,
+        prepared: PreparedTrainingBatch,
+        *,
+        time_weight: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Evaluate the KLDM++ denoising loss from a fixed noisy bundle.
+
+        This is the loss-only half of Algorithm 2 and pairs with
+        `prepare_training_batch(...)` so adaptive samplers can reuse exact
+        probe corruptions across before/after reward measurements.
+        """
+        preds = self.score_network(
+            t=prepared.times.graph,
+            pos=prepared.f_t,
+            v=prepared.v_t,
+            h=prepared.atomic_numbers,
+            l=prepared.l_t,
+            node_index=prepared.node_index,
+            edge_node_index=prepared.edge_node_index,
+        )
+
         out_v = preds["v"]
         out_l = preds["l"]
 
-        loss_v_node = self.mse_loss_per_sample(out_v, target_v)
-        if self.lattice_representation == "mattergen":
-            loss_l_graph = self.mattergen_lattice_mse_6d_per_sample(out_l, target_l)
+        loss_v_node = self.mse_loss_per_sample(out_v, prepared.target_v)
+        if prepared.lattice_representation == "mattergen":
+            loss_l_graph = self.mattergen_lattice_mse_6d_per_sample(out_l, prepared.target_l)
         else:
-            loss_l_graph = self.mse_loss_per_sample(out_l, target_l)
-        num_graphs = int(batch.num_graphs)
+            loss_l_graph = self.mse_loss_per_sample(out_l, prepared.target_l)
 
-        loss_v_sum = torch.zeros(num_graphs, device=device, dtype=loss_v_node.dtype)
-        loss_v_sum = loss_v_sum.index_add(0, index, loss_v_node)
+        loss_v_sum = torch.zeros(
+            prepared.num_graphs,
+            device=loss_v_node.device,
+            dtype=loss_v_node.dtype,
+        )
+        loss_v_sum = loss_v_sum.index_add(0, prepared.node_index, loss_v_node)
 
-        counts = torch.bincount(index, minlength=num_graphs).to(
-            device=device,
+        counts = torch.bincount(prepared.node_index, minlength=prepared.num_graphs).to(
+            device=loss_v_node.device,
             dtype=loss_v_node.dtype,
         ).clamp_min(1.0)
 
@@ -260,7 +337,7 @@ class ModelKLDM(nn.Module):
         loss_graph = loss_v_graph + loss_l_graph
 
         if time_weight is not None:
-            weight = time_weight.reshape(-1).to(device=device, dtype=loss_graph.dtype)
+            weight = time_weight.reshape(-1).to(device=loss_graph.device, dtype=loss_graph.dtype)
             total_loss = (weight * loss_graph).mean()
         else:
             total_loss = loss_graph.mean()
@@ -273,8 +350,22 @@ class ModelKLDM(nn.Module):
             "loss_v_graph": loss_v_graph.detach(),
             "loss_l_graph": loss_l_graph.detach(),
         }
-
         return total_loss, metrics
+
+    def algorithm2_loss(
+        self,
+        batch: Data | Batch,
+        t: torch.Tensor,
+        time_weight: torch.Tensor | None = None,
+        debug: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Algorithm 2 in KLDM:
+        network prediction + denoising score matching loss.
+        """
+        del debug
+        prepared = self.prepare_training_batch(batch=batch, t=t)
+        return self.loss_from_prepared(prepared, time_weight=time_weight)
 
 
 

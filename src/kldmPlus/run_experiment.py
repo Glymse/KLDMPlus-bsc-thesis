@@ -21,6 +21,7 @@ import yaml
 from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import sample_times
 from kldmPlus.utils.time_sampler import (
+    AdaptiveReinforceTimeSampler,
     KLDMUniformTimeSampler,
     LossSecondMomentTimeSampler,
 )
@@ -133,6 +134,7 @@ def save_named_checkpoint(
     model,
     optimizer: torch.optim.Optimizer,
     ema,
+    time_sampler,
     config: dict[str, Any],
     experiment_name: str,
     epoch: int,
@@ -151,6 +153,7 @@ def save_named_checkpoint(
         model=model,
         optimizer=optimizer,
         ema=ema,
+        time_sampler=time_sampler,
         output_path=output_path,
         config=config,
         epoch=epoch,
@@ -220,6 +223,7 @@ class ExperimentRunner:
                 prefer_ema_weights=False,
             )
             self.start_epoch = int(checkpoint["epoch"])
+            self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
 
     def build_time_sampler(self):
         cfg = dict(self.config.get("time_sampler", {}))
@@ -248,6 +252,31 @@ class ExperimentRunner:
                 weight_clip_max=float(cfg.get("weight_clip_max", 2.0)),
                 seed=TRAIN_SEED,
                 device=self.device,
+            )
+
+        if sampler_type == "adaptive_reinforce":
+            return AdaptiveReinforceTimeSampler(
+                lower_bound=TIME_LOWER_BOUND,
+                policy_hidden_dim=int(cfg.get("policy_hidden_dim", 128)),
+                policy_hidden_depth=int(cfg.get("policy_hidden_depth", 2)),
+                min_concentration=float(cfg.get("min_concentration", 0.25)),
+                policy_lr=float(cfg.get("policy_lr", 1e-4)),
+                entropy_coef=float(cfg.get("entropy_coef", 1e-3)),
+                policy_update_every=int(cfg.get("policy_update_every", 25)),
+                policy_warmup_steps=int(cfg.get("policy_warmup_steps", 100)),
+                reward_candidate_times=int(cfg.get("reward_candidate_times", 7)),
+                reward_active_times=int(cfg.get("reward_active_times", 3)),
+                reward_history_size=int(cfg.get("reward_history_size", 64)),
+                reward_baseline_momentum=float(cfg.get("reward_baseline_momentum", 0.95)),
+                use_importance_weights=bool(cfg.get("use_importance_weights", True)),
+                clip_importance_weights=bool(cfg.get("clip_importance_weights", True)),
+                weight_clip_min=float(cfg.get("weight_clip_min", 0.25)),
+                weight_clip_max=float(cfg.get("weight_clip_max", 4.0)),
+                gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
+                feature_selection_min_history=int(cfg.get("feature_selection_min_history", 4)),
+                seed=TRAIN_SEED,
+                device=self.device,
+                reward_probe_times=cfg.get("reward_probe_times"),
             )
 
         raise ValueError(f"Unknown time_sampler.type={sampler_type!r}")
@@ -334,6 +363,7 @@ class ExperimentRunner:
                 break
 
             batch = batch.to(self.device)
+            self.time_sampler.before_model_update(batch=batch, model=self.model)
 
             sampled_time = self.time_sampler.sample(batch)
 
@@ -346,13 +376,12 @@ class ExperimentRunner:
             )
             loss.backward()
             self.optimizer.step()
-
-            if isinstance(self.time_sampler, LossSecondMomentTimeSampler):
-                self.time_sampler.update(
-                    bins=sampled_time.bins,
-                    loss_v_graph=metrics["loss_v_graph"],
-                    loss_l_graph=metrics["loss_l_graph"],
-                )
+            self.time_sampler.after_model_update(
+                batch=batch,
+                model=self.model,
+                sampled_time=sampled_time,
+                metrics=metrics,
+            )
 
             if self.ema is not None:
                 self.ema.update(self.model, current_epoch=epoch)
@@ -476,6 +505,7 @@ class ExperimentRunner:
             model=self.model,
             optimizer=self.optimizer,
             ema=self.ema,
+            time_sampler=self.time_sampler,
             config=self.config,
             experiment_name=self.experiment_name,
             epoch=epoch,
@@ -505,6 +535,7 @@ class ExperimentRunner:
                 model=self.model,
                 optimizer=self.optimizer,
                 ema=self.ema,
+                time_sampler=self.time_sampler,
                 output_path=path,
                 config=self.config,
                 epoch=epoch,

@@ -1,0 +1,93 @@
+experiment_name: plus_mp20_lattice_eps_em_mc_adaptive_reinforce
+sampler_config: ../../samplers/euler_maruyama.yaml
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: kldm # alternatives: kldm, mattergen. Use mattergen together with model.lattice_parameterization=eps; pair mattergen diffusion with model.lattice_diffusion_type=mattergenVP.
+  root: null
+  batch_size: 256
+  num_workers: 1
+  pin_memory: true
+
+time_sampler:
+  type: adaptive_reinforce
+  policy_hidden_dim: 128
+  policy_hidden_depth: 2
+  min_concentration: 0.25
+  policy_lr: 1.0e-4
+  entropy_coef: 1.0e-3
+  policy_update_every: 25
+  policy_warmup_steps: 100
+  reward_candidate_times: 7
+  reward_active_times: 3
+  reward_history_size: 64
+  reward_baseline_momentum: 0.95
+  feature_selection_min_history: 4
+  use_importance_weights: true
+  clip_importance_weights: true
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+  gradient_clip_norm: 1.0
+
+model:
+  eps: 1.0e-6
+  lattice_parameterization: eps # alternatives: eps, x0. mattergen representation/diffusion currently only supports eps.
+  lattice_diffusion_type: VP # alternatives: VP, mattergenVP. mattergenVP requires dataset.lattice_representation=mattergen.
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: true
+  tdm_velocity_scale: 0.15915494309189535
+  tdm_sigma_norm_estimator: mc
+  tdm_sigma_norm_density_K: 40
+  tdm_sigma_norm_grid_points: 8193
+  tdm_sigma_norm_mc_samples: 20000
+  tdm_centered_sigma_norm_correction: false
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+optimizer:
+  lr: 1.0e-3
+  weight_decay: 1.0e-12
+  amsgrad: true
+  foreach: true
+
+ema:
+  enabled: true
+  type: fixed
+  decay: 0.999
+  start_epoch: 500
+
+logging:
+  train_every_epochs: 1
+  wandb_checkpoints: true
+  wandb_project: plus_mp20_lattice_eps_em_ablation
+  wandb_run_name: mc_adaptive_reinforce
+
+validation:
+  every_n_epochs: 100
+  ema_val: true # Facit-style behavior in kldmPlus: validation loss stays on the online model; sampling metrics (valid, match_rate, rmse) use EMA when available.
+  subset_size: 1024
+  subset_seed: 123
+  sampling_max_graphs: 1024
+
+checkpoint:
+  resume_from: null
+  wandb_resume_id: null
+
+sampling_eval:
+  split: test
+  batch_size: 128
+  num_targets: 1024
+  subset_seed: 123
+  samples_per_target: 20

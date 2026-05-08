@@ -201,6 +201,8 @@ class TrivialisedDiffusion(nn.Module):
         t: torch.Tensor,
         f0: torch.Tensor,
         index: torch.Tensor,
+        epsilon_v: torch.Tensor | None = None,
+        epsilon_r: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample one forward noisy state `(f_t, v_t)`.
@@ -232,7 +234,8 @@ class TrivialisedDiffusion(nn.Module):
         #
         # We center epsilon_v per graph
 
-        epsilon_v = torch.randn_like(f0)
+        if epsilon_v is None:
+            epsilon_v = torch.randn_like(f0)
         epsilon_v = scatter_center(epsilon_v, index=index)
         epsilon_v_scaled = self.vel_scale * epsilon_v
 
@@ -261,7 +264,8 @@ class TrivialisedDiffusion(nn.Module):
 
         sigma_r = self.match_dims(self.wrapped_gaussian_sigma_r_t(t), f0)
 
-        epsilon_r = torch.randn_like(f0)
+        if epsilon_r is None:
+            epsilon_r = torch.randn_like(f0)
         epsilon_r = scatter_center(epsilon_r, index=index)
         r_t = self.wrap_displacements(mu_r + sigma_r * epsilon_r)
 
