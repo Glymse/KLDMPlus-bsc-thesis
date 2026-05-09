@@ -31,6 +31,7 @@ class CSPReconstructionResult:
     predicted_structure: Any
     target_structure: Any
     formula: str | None = None
+    num_atoms: int | None = None
 
 
 # Stops structure evaluation early if pymatgen is unavailable.
@@ -239,6 +240,7 @@ def evaluate_csp_reconstruction(
     ltol: float = 0.3,
 ) -> CSPReconstructionResult:
     transform = _lattice_transform(lattice_transform)
+    num_atoms = int(_row_tensor(target_f).shape[0])
 
     try:
         predicted = build_structure_from_sample(
@@ -249,7 +251,7 @@ def evaluate_csp_reconstruction(
             lattice_transform=transform,
         )
     except Exception:
-        return CSPReconstructionResult(False, False, None, None, None, None)
+        return CSPReconstructionResult(False, False, None, None, None, None, num_atoms)
 
     try:
         target = build_structure_from_sample(
@@ -261,7 +263,7 @@ def evaluate_csp_reconstruction(
         )
     except Exception:
         return CSPReconstructionResult(
-            False, False, None, predicted, None, predicted.composition.formula
+            False, False, None, predicted, None, predicted.composition.formula, num_atoms
         )
 
     is_valid = validity_structure(predicted)
@@ -286,6 +288,7 @@ def evaluate_csp_reconstruction(
         predicted_structure=predicted,
         target_structure=target,
         formula=predicted.composition.formula,
+        num_atoms=num_atoms,
     )
 
 
@@ -306,3 +309,18 @@ def aggregate_csp_reconstruction_metrics(
         "match_rate": float(sum(match) / len(match)),
         "rmse": None if not rmse else float(sum(rmse) / len(rmse)),
     }
+
+
+def aggregate_csp_reconstruction_metrics_by_size(
+    results: list[CSPReconstructionResult],
+) -> dict[int, dict[str, Any]]:
+    grouped: dict[int, list[CSPReconstructionResult]] = {}
+    for result in results:
+        if result.num_atoms is None:
+            continue
+        grouped.setdefault(int(result.num_atoms), []).append(result)
+
+    summary_by_size: dict[int, dict[str, Any]] = {}
+    for num_atoms in sorted(grouped):
+        summary_by_size[num_atoms] = aggregate_csp_reconstruction_metrics(grouped[num_atoms])
+    return summary_by_size

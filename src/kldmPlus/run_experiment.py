@@ -282,8 +282,8 @@ class ExperimentRunner:
         # Runtime objects: device, data, model, optimizer, EMA
         # -------------------------------------------------
         self.device = get_default_device()
-        self.time_sampler = self.build_time_sampler()
         self.train_loader, self.val_loader, self.lattice_transform = self.create_loaders()
+        self.time_sampler = self.build_time_sampler()
         self._inject_mattergen_lattice_stats()
 
         self.model, self.optimizer, self.ema = build_training_components(
@@ -342,6 +342,13 @@ class ExperimentRunner:
             )
 
         if sampler_type == "adaptive_reinforce":
+            policy_warmup_steps = int(cfg.get("policy_warmup_steps", 5000))
+            policy_warmup_epochs = cfg.get("policy_warmup_epochs")
+            if policy_warmup_epochs is not None:
+                batches_per_epoch = len(self.train_loader)
+                policy_warmup_steps = int(policy_warmup_epochs) * batches_per_epoch
+                self.config.setdefault("time_sampler", {})
+                self.config["time_sampler"]["policy_warmup_steps_resolved"] = policy_warmup_steps
             return AdaptiveReinforceTimeSampler(
                 lower_bound=TIME_LOWER_BOUND,
                 policy_hidden_dim=int(cfg.get("policy_hidden_dim", 128)),
@@ -350,7 +357,7 @@ class ExperimentRunner:
                 policy_lr=float(cfg.get("policy_lr", 2e-5)),
                 entropy_coef=float(cfg.get("entropy_coef", 1e-2)),
                 policy_update_every=int(cfg.get("policy_update_every", 100)),
-                policy_warmup_steps=int(cfg.get("policy_warmup_steps", 5000)),
+                policy_warmup_steps=policy_warmup_steps,
                 reward_candidate_times=int(cfg.get("reward_candidate_times", 7)),
                 reward_active_times=int(cfg.get("reward_active_times", 5)),
                 reward_history_size=int(cfg.get("reward_history_size", 64)),
@@ -358,6 +365,8 @@ class ExperimentRunner:
                 reward_baseline_momentum=float(cfg.get("reward_baseline_momentum", 0.95)),
                 reward_velocity_weight=float(cfg.get("reward_velocity_weight", 1.0)),
                 reward_lattice_weight=float(cfg.get("reward_lattice_weight", 1.0)),
+                reward_size_weight_power=float(cfg.get("reward_size_weight_power", 0.0)),
+                reward_size_weight_max=float(cfg.get("reward_size_weight_max", 2.0)),
                 reward_normalization_eps=float(cfg.get("reward_normalization_eps", 1e-6)),
                 entropy_in_reward=bool(cfg.get("entropy_in_reward", True)),
                 use_importance_weights=bool(cfg.get("use_importance_weights", True)),
@@ -521,9 +530,10 @@ class ExperimentRunner:
             "loss_weighted": (total_loss_v / total_graphs) + (total_loss_l / total_graphs),
         }
 
-    def run_sampling_evaluation(self) -> dict[str, float | int | None]:
+    def run_sampling_evaluation(self) -> dict[str, Any]:
         from kldmPlus.sample_evaluation.sample_evaluation import (
             aggregate_csp_reconstruction_metrics,
+            aggregate_csp_reconstruction_metrics_by_size,
             evaluate_csp_reconstruction,
         )
 
@@ -577,11 +587,13 @@ class ExperimentRunner:
                 break
 
         summary = aggregate_csp_reconstruction_metrics(results)
+        summary_by_size = aggregate_csp_reconstruction_metrics_by_size(results)
         return {
             "valid": summary.get("valid"),
             "match_rate": summary.get("match_rate"),
             "rmse": summary.get("rmse"),
             "num_samples": summary.get("num_samples"),
+            "by_size": summary_by_size,
         }
 
     def save_checkpoint(
@@ -686,18 +698,23 @@ class ExperimentRunner:
             "match_rate": val_sample_metrics["match_rate"],
             "rmse": val_sample_metrics["rmse"],
         }
-        wandb.log(
-            {
-                "epoch": epoch,
-                "val/loss_v": merged_metrics["loss_v"],
-                "val/loss_l": merged_metrics["loss_l"],
-                "val/loss_weighted": merged_metrics["loss_weighted"],
-                "val/valid": merged_metrics["valid"],
-                "val/match_rate": merged_metrics["match_rate"],
-                "val/rmse": merged_metrics["rmse"],
-            },
-            step=epoch,
-        )
+        log_data = {
+            "epoch": epoch,
+            "val/loss_v": merged_metrics["loss_v"],
+            "val/loss_l": merged_metrics["loss_l"],
+            "val/loss_weighted": merged_metrics["loss_weighted"],
+            "val/valid": merged_metrics["valid"],
+            "val/match_rate": merged_metrics["match_rate"],
+            "val/rmse": merged_metrics["rmse"],
+        }
+        size_metrics = val_sample_metrics.get("by_size") or {}
+        for num_atoms, metrics in sorted(size_metrics.items()):
+            prefix = f"val/by_size/num_atoms_{num_atoms}"
+            log_data[f"{prefix}/num_samples"] = metrics.get("num_samples")
+            log_data[f"{prefix}/valid"] = metrics.get("valid")
+            log_data[f"{prefix}/match_rate"] = metrics.get("match_rate")
+            log_data[f"{prefix}/rmse"] = metrics.get("rmse")
+        wandb.log(log_data, step=epoch)
 
         self.save_validation_checkpoint_to_wandb(epoch, merged_metrics)
 
@@ -709,6 +726,20 @@ class ExperimentRunner:
             f"rmse={format_metric(merged_metrics['rmse'], '.6f')}",
             flush=True,
         )
+        if size_metrics:
+            size_fragments = []
+            for num_atoms, metrics in sorted(size_metrics.items()):
+                size_fragments.append(
+                    f"atoms={num_atoms}"
+                    f"(n={metrics.get('num_samples', 0)},"
+                    f"valid={format_metric(metrics.get('valid'), '.4f')},"
+                    f"match_rate={format_metric(metrics.get('match_rate'), '.4f')},"
+                    f"rmse={format_metric(metrics.get('rmse'), '.6f')})"
+                )
+            print(
+                f"validation_by_size_epoch={epoch:04d} " + " ".join(size_fragments),
+                flush=True,
+            )
         if bool(self.logging_cfg["wandb_checkpoints"]):
             print(f"checkpoint_uploaded=wandb epoch={epoch}", flush=True)
 

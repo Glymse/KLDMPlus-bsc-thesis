@@ -18,17 +18,19 @@ time_sampler:
   policy_lr: 1.0e-5
   entropy_coef: 1.0e-2
   policy_update_every: 500
-  policy_warmup_steps: 50000 # counted in optimizer steps, not epochs; intentionally long for a conservative 9000-epoch run
+  policy_warmup_epochs: 550 # enable the policy near the train-loss plateau observed around epochs 500-600
   reward_candidate_times: 9
-  reward_active_times: 3
-  reward_history_size: 16
-  use_baseline: false
-  reward_baseline_momentum: 0.95
-  reward_velocity_weight: 1.0
-  reward_lattice_weight: 1.0
+  reward_active_times: 5
+  reward_history_size: 64
+  use_baseline: true
+  reward_baseline_momentum: 0.99
+  reward_velocity_weight: 0.7
+  reward_lattice_weight: 0.3
+  reward_size_weight_power: 0.5
+  reward_size_weight_max: 1.5
   reward_normalization_eps: 1.0e-6
   entropy_in_reward: true
-  feature_selection_min_history: 8
+  feature_selection_min_history: 32
   use_importance_weights: false
   clip_importance_weights: false
   weight_clip_min: 0.25

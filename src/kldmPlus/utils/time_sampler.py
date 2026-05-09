@@ -402,6 +402,8 @@ class AdaptiveReinforceTimeSampler:
         reward_baseline_momentum: float = 0.95,
         reward_velocity_weight: float = 1.0,
         reward_lattice_weight: float = 1.0,
+        reward_size_weight_power: float = 0.0,
+        reward_size_weight_max: float = 2.0,
         reward_normalization_eps: float = 1e-6,
         entropy_in_reward: bool = True,
         use_importance_weights: bool = True,
@@ -427,6 +429,8 @@ class AdaptiveReinforceTimeSampler:
         self.reward_baseline_momentum = float(reward_baseline_momentum)
         self.reward_velocity_weight = float(reward_velocity_weight)
         self.reward_lattice_weight = float(reward_lattice_weight)
+        self.reward_size_weight_power = float(reward_size_weight_power)
+        self.reward_size_weight_max = float(reward_size_weight_max)
         self.reward_normalization_eps = float(reward_normalization_eps)
         self.entropy_in_reward = bool(entropy_in_reward)
         self.use_importance_weights = bool(use_importance_weights)
@@ -480,6 +484,7 @@ class AdaptiveReinforceTimeSampler:
         self.last_sampled_t_max = 0.0
         self.last_reward_velocity_mean = 0.0
         self.last_reward_lattice_mean = 0.0
+        self.last_reward_size_weight_mean = 1.0
         self.selected_probe_indices = torch.arange(self.reward_active_times, dtype=torch.long)
         self._probe_history: list[torch.Tensor] = []
         self._pending_policy_update = False
@@ -566,6 +571,25 @@ class AdaptiveReinforceTimeSampler:
         self._probe_history.append(delta_vector.detach().to(device="cpu", dtype=torch.float64))
         if len(self._probe_history) > self.reward_history_size:
             self._probe_history = self._probe_history[-self.reward_history_size :]
+
+    def _graph_size_weights(
+        self,
+        *,
+        batch: Batch | Data,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.reward_size_weight_power <= 0.0:
+            return torch.ones(int(batch.num_graphs), device=device, dtype=dtype)
+
+        num_atoms = torch.bincount(batch.batch, minlength=int(batch.num_graphs)).to(
+            device=device,
+            dtype=dtype,
+        ).clamp_min(1.0)
+        mean_num_atoms = num_atoms.mean().clamp_min(torch.as_tensor(1.0, device=device, dtype=dtype))
+        size_weights = (num_atoms / mean_num_atoms).pow(self.reward_size_weight_power)
+        size_weights = size_weights.clamp(max=self.reward_size_weight_max)
+        return size_weights / size_weights.mean().clamp_min(torch.as_tensor(1e-12, device=device, dtype=dtype))
 
     def _select_probe_indices(self) -> torch.Tensor:
         if self.reward_active_times >= self.reward_probe_times.numel():
@@ -789,6 +813,12 @@ class AdaptiveReinforceTimeSampler:
             + self.reward_lattice_weight * normalized_lattice_reward
         )
         rewards = selected_combined_delta.mean(dim=1)
+        size_weights = self._graph_size_weights(
+            batch=batch,
+            device=rewards.device,
+            dtype=rewards.dtype,
+        )
+        rewards = rewards * size_weights
         reward_mean = float(rewards.mean().item())
         reward_std = float(rewards.std(unbiased=False).item())
 
@@ -830,6 +860,7 @@ class AdaptiveReinforceTimeSampler:
         self.last_entropy = float(sampled_time.entropies.detach().mean().item())
         self.last_reward_velocity_mean = float(normalized_velocity_reward.mean().item())
         self.last_reward_lattice_mean = float(normalized_lattice_reward.mean().item())
+        self.last_reward_size_weight_mean = float(size_weights.mean().item())
         self._probe_cache = None
 
     def state_dict(self) -> dict[str, Any]:
@@ -890,6 +921,7 @@ class AdaptiveReinforceTimeSampler:
             "time_sampler/policy_baseline": float(self.reward_baseline),
             "time_sampler/reward_velocity_mean": float(self.last_reward_velocity_mean),
             "time_sampler/reward_lattice_mean": float(self.last_reward_lattice_mean),
+            "time_sampler/reward_size_weight_mean": float(self.last_reward_size_weight_mean),
             "time_sampler/policy_active": float(self._policy_active()),
             "time_sampler/policy_selected_t_min": float(selected_times.min().item()),
             "time_sampler/policy_selected_t_max": float(selected_times.max().item()),
