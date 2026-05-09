@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from datetime import datetime
+import json
 import random
 import signal
 from pathlib import Path
@@ -15,6 +16,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, Subset
 import yaml
@@ -302,7 +304,16 @@ class ExperimentRunner:
         self.start_epoch = 0
         self.run = None
         self._last_validation_artifact = None
-        self.validation_ablation_runs: dict[int, Any] = {}
+        self._warned_missing_wandb_image = False
+        self.validation_ablation_history: dict[str, list[float]] = {
+            "epoch": [],
+            "rmse_mean": [],
+            "rmse_std": [],
+            "match_rate_mean": [],
+            "match_rate_std": [],
+            "valid_mean": [],
+            "valid_std": [],
+        }
 
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
@@ -542,7 +553,6 @@ class ExperimentRunner:
     def run_sampling_evaluation(self) -> dict[str, Any]:
         from kldmPlus.sample_evaluation.sample_evaluation import (
             aggregate_csp_reconstruction_metrics,
-            aggregate_csp_reconstruction_metrics_by_size,
             evaluate_csp_reconstruction,
         )
 
@@ -617,7 +627,6 @@ class ExperimentRunner:
                 "match_rate": summary.get("match_rate"),
                 "rmse": summary.get("rmse"),
                 "num_samples": summary.get("num_samples"),
-                "by_size": aggregate_csp_reconstruction_metrics_by_size(results),
             }
 
         if not bool(self.validation_cfg.get("ablation", False)):
@@ -652,46 +661,13 @@ class ExperimentRunner:
             ]
             if not values:
                 return None, None
-            return float(np.mean(values)), float(np.std(values))
+            if len(values) == 1:
+                return float(np.mean(values)), 0.0
+            return float(np.mean(values)), float(np.std(values, ddof=1))
 
         valid_mean, valid_std = aggregate_scalar("valid")
         match_rate_mean, match_rate_std = aggregate_scalar("match_rate")
         rmse_mean, rmse_std = aggregate_scalar("rmse")
-
-        all_sizes = sorted(
-            {
-                int(num_atoms)
-                for summary in pass_summaries
-                for num_atoms in summary.get("by_size", {})
-            }
-        )
-        by_size_summary = {}
-        for num_atoms in all_sizes:
-            valid_values = []
-            match_values = []
-            rmse_values = []
-            num_samples_values = []
-            for summary in pass_summaries:
-                metrics = summary.get("by_size", {}).get(num_atoms)
-                if metrics is None:
-                    continue
-                num_samples_values.append(int(metrics.get("num_samples", 0)))
-                if metrics.get("valid") is not None:
-                    valid_values.append(float(metrics["valid"]))
-                if metrics.get("match_rate") is not None:
-                    match_values.append(float(metrics["match_rate"]))
-                if metrics.get("rmse") is not None:
-                    rmse_values.append(float(metrics["rmse"]))
-
-            by_size_summary[num_atoms] = {
-                "num_samples": int(round(float(np.mean(num_samples_values)))) if num_samples_values else 0,
-                "valid_mean": None if not valid_values else float(np.mean(valid_values)),
-                "valid_std": None if not valid_values else float(np.std(valid_values)),
-                "match_rate_mean": None if not match_values else float(np.mean(match_values)),
-                "match_rate_std": None if not match_values else float(np.std(match_values)),
-                "rmse_mean": None if not rmse_values else float(np.mean(rmse_values)),
-                "rmse_std": None if not rmse_values else float(np.std(rmse_values)),
-            }
 
         return {
             "valid": valid_mean,
@@ -701,7 +677,6 @@ class ExperimentRunner:
             "rmse": rmse_mean,
             "rmse_std": rmse_std,
             "num_samples": pass_summaries[0].get("num_samples") if pass_summaries else 0,
-            "by_size": by_size_summary,
             "ablation_num_seeds": num_seeds,
             "seed_summaries": seed_summaries,
         }
@@ -779,78 +754,88 @@ class ExperimentRunner:
                         flush=True,
                     )
 
-    def _validation_ablation_group_name(self) -> str:
-        assert self.run is not None
-        return f"{self.run.id}_validation_ablation"
+    def _build_validation_ablation_band_figure(
+        self,
+        *,
+        metric: str,
+        title: str,
+        y_label: str,
+    ):
+        history = self.validation_ablation_history
+        x = np.asarray(history["epoch"], dtype=float)
+        y = np.asarray(history[f"{metric}_mean"], dtype=float)
+        s = np.asarray(history[f"{metric}_std"], dtype=float)
 
-    def _ensure_validation_ablation_runs(self, *, seeds: list[int]) -> None:
-        if not bool(self.validation_cfg.get("wandb_grouped_ablation_runs", False)):
-            return
-        if self.run is None:
-            return
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.fill_between(x, y - s, y + s, alpha=0.25, label="±1 std")
+        ax.plot(x, y, marker="o", linewidth=2, label=f"mean {y_label}")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(y_label)
+        ax.legend()
+        fig.tight_layout()
+        return fig
 
-        group_name = self._validation_ablation_group_name()
-        for seed in seeds:
-            if seed in self.validation_ablation_runs:
-                continue
-            run_id = f"{self.run.id}-validation-seed-{seed}"
-            eval_run = wandb.init(
-                project=self.wandb_project,
-                name=f"{self.wandb_run_name}_validation_seed_{seed}",
-                group=group_name,
-                job_type="validation-ablation",
-                id=run_id,
-                resume="allow",
-                reinit="create_new",
-                config={
-                    "experiment_name": self.experiment_name,
-                    "config_path": str(self.config_path),
-                    "parent_run_id": self.run.id,
-                    "validation_seed": seed,
-                    "validation_mode": "ablation",
-                },
-            )
-            self.validation_ablation_runs[seed] = eval_run
-
-    def _log_validation_ablation_runs(
+    def _log_validation_ablation_band_plots(
         self,
         *,
         epoch: int,
-        seed_summaries: list[dict[str, Any]],
+        val_sample_metrics: Mapping[str, Any],
     ) -> None:
-        if not seed_summaries:
+        if self.run is None:
             return
-        if not bool(self.validation_cfg.get("wandb_grouped_ablation_runs", False)):
+        if not hasattr(wandb, "Image"):
+            if not self._warned_missing_wandb_image:
+                print(
+                    "validation_ablation_plot_warning=wandb.Image unavailable; skipping mean/std band plots",
+                    flush=True,
+                )
+                self._warned_missing_wandb_image = True
+            return
+        rmse_std = val_sample_metrics.get("rmse_std")
+        match_rate_std = val_sample_metrics.get("match_rate_std")
+        valid_std = val_sample_metrics.get("valid_std")
+        if rmse_std is None or match_rate_std is None or valid_std is None:
             return
 
-        self._ensure_validation_ablation_runs(
-            seeds=[int(summary["seed"]) for summary in seed_summaries]
+        history = self.validation_ablation_history
+        history["epoch"].append(float(epoch))
+        history["rmse_mean"].append(float(val_sample_metrics["rmse"]))
+        history["rmse_std"].append(float(rmse_std))
+        history["match_rate_mean"].append(float(val_sample_metrics["match_rate"]))
+        history["match_rate_std"].append(float(match_rate_std))
+        history["valid_mean"].append(float(val_sample_metrics["valid"]))
+        history["valid_std"].append(float(valid_std))
+
+        rmse_fig = self._build_validation_ablation_band_figure(
+            metric="rmse",
+            title="Validation RMSE across sampling seeds",
+            y_label="RMSE",
         )
-        for summary in seed_summaries:
-            seed = int(summary["seed"])
-            eval_run = self.validation_ablation_runs[seed]
-            log_data = {
-                "epoch": epoch,
-                "eval/valid": summary.get("valid"),
-                "eval/match_rate": summary.get("match_rate"),
-                "eval/rmse": summary.get("rmse"),
-                "eval/num_samples": summary.get("num_samples"),
-            }
-            for num_atoms, metrics in sorted((summary.get("by_size") or {}).items()):
-                prefix = f"eval/by_size/num_atoms_{num_atoms}"
-                log_data[f"{prefix}/num_samples"] = metrics.get("num_samples")
-                log_data[f"{prefix}/valid"] = metrics.get("valid")
-                log_data[f"{prefix}/match_rate"] = metrics.get("match_rate")
-                log_data[f"{prefix}/rmse"] = metrics.get("rmse")
-            eval_run.log(log_data, step=epoch)
+        match_rate_fig = self._build_validation_ablation_band_figure(
+            metric="match_rate",
+            title="Validation match rate across sampling seeds",
+            y_label="Match rate",
+        )
+        valid_fig = self._build_validation_ablation_band_figure(
+            metric="valid",
+            title="Validation validity across sampling seeds",
+            y_label="Validity",
+        )
 
-    def _finish_validation_ablation_runs(self) -> None:
-        for run in self.validation_ablation_runs.values():
-            try:
-                run.finish()
-            except Exception:
-                pass
-        self.validation_ablation_runs.clear()
+        self.run.log(
+            {
+                "epoch": epoch,
+                "val_sampling/rmse_mean_std_plot": wandb.Image(rmse_fig),
+                "val_sampling/match_rate_mean_std_plot": wandb.Image(match_rate_fig),
+                "val_sampling/valid_mean_std_plot": wandb.Image(valid_fig),
+            },
+            step=epoch,
+        )
+
+        plt.close(rmse_fig)
+        plt.close(match_rate_fig)
+        plt.close(valid_fig)
 
     def validate_epoch(self, epoch: int) -> None:
         # Match facitKLDM semantics:
@@ -896,31 +881,10 @@ class ExperimentRunner:
             "val/match_rate": merged_metrics["match_rate"],
             "val/rmse": merged_metrics["rmse"],
         }
-        if "valid_std" in merged_metrics:
-            log_data["val/valid_std"] = merged_metrics["valid_std"]
-        if "match_rate_std" in merged_metrics:
-            log_data["val/match_rate_std"] = merged_metrics["match_rate_std"]
-        if "rmse_std" in merged_metrics:
-            log_data["val/rmse_std"] = merged_metrics["rmse_std"]
-        size_metrics = val_sample_metrics.get("by_size") or {}
-        for num_atoms, metrics in sorted(size_metrics.items()):
-            prefix = f"val/by_size/num_atoms_{num_atoms}"
-            log_data[f"{prefix}/num_samples"] = metrics.get("num_samples")
-            if "valid_mean" in metrics:
-                log_data[f"{prefix}/valid"] = metrics.get("valid_mean")
-                log_data[f"{prefix}/valid_std"] = metrics.get("valid_std")
-                log_data[f"{prefix}/match_rate"] = metrics.get("match_rate_mean")
-                log_data[f"{prefix}/match_rate_std"] = metrics.get("match_rate_std")
-                log_data[f"{prefix}/rmse"] = metrics.get("rmse_mean")
-                log_data[f"{prefix}/rmse_std"] = metrics.get("rmse_std")
-            else:
-                log_data[f"{prefix}/valid"] = metrics.get("valid")
-                log_data[f"{prefix}/match_rate"] = metrics.get("match_rate")
-                log_data[f"{prefix}/rmse"] = metrics.get("rmse")
         self.run.log(log_data, step=epoch)
-        self._log_validation_ablation_runs(
+        self._log_validation_ablation_band_plots(
             epoch=epoch,
-            seed_summaries=val_sample_metrics.get("seed_summaries", []),
+            val_sample_metrics=val_sample_metrics,
         )
 
         self.save_validation_checkpoint_to_wandb(epoch, merged_metrics)
@@ -941,27 +905,24 @@ class ExperimentRunner:
                 f"rmse_std={format_metric(merged_metrics.get('rmse_std'), '.6f')}",
                 flush=True,
             )
-        if size_metrics:
-            size_fragments = []
-            for num_atoms, metrics in sorted(size_metrics.items()):
-                if "valid_mean" in metrics:
-                    size_fragments.append(
-                        f"atoms={num_atoms}"
-                        f"(n={metrics.get('num_samples', 0)},"
-                        f"valid={format_metric(metrics.get('valid_mean'), '.4f')}±{format_metric(metrics.get('valid_std'), '.4f')},"
-                        f"match_rate={format_metric(metrics.get('match_rate_mean'), '.4f')}±{format_metric(metrics.get('match_rate_std'), '.4f')},"
-                        f"rmse={format_metric(metrics.get('rmse_mean'), '.6f')}±{format_metric(metrics.get('rmse_std'), '.6f')})"
-                    )
-                else:
-                    size_fragments.append(
-                        f"atoms={num_atoms}"
-                        f"(n={metrics.get('num_samples', 0)},"
-                        f"valid={format_metric(metrics.get('valid'), '.4f')},"
-                        f"match_rate={format_metric(metrics.get('match_rate'), '.4f')},"
-                        f"rmse={format_metric(metrics.get('rmse'), '.6f')})"
-                    )
+        seed_summaries = val_sample_metrics.get("seed_summaries", [])
+        if seed_summaries:
+            backup_payload = {
+                "epoch": epoch,
+                "num_seeds": val_sample_metrics.get("ablation_num_seeds"),
+                "seeds": [int(summary["seed"]) for summary in seed_summaries],
+                "valid_values": [summary.get("valid") for summary in seed_summaries],
+                "valid_mean": merged_metrics.get("valid"),
+                "valid_std": merged_metrics.get("valid_std"),
+                "match_rate_values": [summary.get("match_rate") for summary in seed_summaries],
+                "match_rate_mean": merged_metrics.get("match_rate"),
+                "match_rate_std": merged_metrics.get("match_rate_std"),
+                "rmse_values": [summary.get("rmse") for summary in seed_summaries],
+                "rmse_mean": merged_metrics.get("rmse"),
+                "rmse_std": merged_metrics.get("rmse_std"),
+            }
             print(
-                f"validation_by_size_epoch={epoch:04d} " + " ".join(size_fragments),
+                f"validation_ablation_backup={json.dumps(backup_payload, sort_keys=True)}",
                 flush=True,
             )
         if bool(self.logging_cfg["wandb_checkpoints"]):
@@ -1032,7 +993,6 @@ class ExperimentRunner:
                 final_filename,
                 upload_to_wandb=False,
             )
-            self._finish_validation_ablation_runs()
             if self.run is not None:
                 self.run.finish()
 
