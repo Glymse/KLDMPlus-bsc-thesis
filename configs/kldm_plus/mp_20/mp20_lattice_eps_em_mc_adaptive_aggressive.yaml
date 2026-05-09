@@ -72,6 +72,10 @@ logging:
 
 validation:
   every_n_epochs: 100
+  ablation: true # match paper-style validation by repeating sampling with multiple seeds and logging mean/std
+  ablation_num_seeds: 6
+  ablation_seed_offset: 0
+  wandb_grouped_ablation_runs: true # create one persistent W&B eval run per validation seed so grouped plots can show mean ± std shading
   ema_val: true # Facit-style behavior in kldmPlus: validation loss stays on the online model; sampling metrics (valid, match_rate, rmse) use EMA when available.
   subset_size: 1024
   subset_seed: 123
