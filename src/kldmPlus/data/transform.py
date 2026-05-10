@@ -7,7 +7,11 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch_geometric.utils import dense_to_sparse
+
+try:
+    from torch_geometric.utils import dense_to_sparse
+except ImportError:  # pragma: no cover
+    dense_to_sparse = None
 
 try:
     from mattergen.common.data.chemgraph import ChemGraph
@@ -334,6 +338,7 @@ def ensure_mattergen_lattice_cache(
     *,
     cache_file: str | Path,
     processed_dir: str | Path,
+    limit_var_scaling_constant: float = 0.25,
     eps: float = 1e-8,
 ) -> Path:
     """Create train-set statistics for the MatterGen-style lattice prior.
@@ -365,7 +370,13 @@ def ensure_mattergen_lattice_cache(
         try:
             with cache_path.open("r", encoding="utf-8") as handle:
                 existing_payload = json.load(handle)
-            if _has_mattergen_lattice_stats(existing_payload):
+            cached_scaling = existing_payload.get("limit_var_scaling_constant")
+            requested_scaling = float(max(limit_var_scaling_constant, eps))
+            if (
+                _has_mattergen_lattice_stats(existing_payload)
+                and isinstance(cached_scaling, (int, float))
+                and abs(float(cached_scaling) - requested_scaling) <= max(eps, 1e-12)
+            ):
                 return cache_path
         except (json.JSONDecodeError, OSError, ValueError):
             pass
@@ -394,8 +405,11 @@ def ensure_mattergen_lattice_cache(
     #  mattergen/common/diffusion/corruption.py:110-152).
     average_density = torch.stack(densities).mean().clamp_min(eps)
     c = average_density.reciprocal()
-    limit_var_scaling_constant = torch.as_tensor(0.25, dtype=torch.get_default_dtype()).clamp_min(eps)
-    nu = limit_var_scaling_constant.pow(1.5)
+    limit_var_scaling_constant_t = torch.as_tensor(
+        float(limit_var_scaling_constant),
+        dtype=torch.get_default_dtype(),
+    ).clamp_min(eps)
+    nu = limit_var_scaling_constant_t.pow(1.5)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with cache_path.open("w", encoding="utf-8") as handle:
@@ -403,7 +417,7 @@ def ensure_mattergen_lattice_cache(
             _pack_mattergen_stats(
                 average_density=float(average_density.item()),
                 c=float(c.item()),
-                limit_var_scaling_constant=float(limit_var_scaling_constant.item()),
+                limit_var_scaling_constant=float(limit_var_scaling_constant_t.item()),
                 nu=float(nu.item()),
                 eps=eps,
             ),
@@ -434,6 +448,8 @@ class FullyConnectedGraph(Transform):
         self.len_from = len_from
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
+        if dense_to_sparse is None:
+            raise ImportError("torch_geometric is required to build fully connected crystal graphs.")
 
         n = len(getattr(sample, self.len_from))
 
@@ -699,6 +715,7 @@ class MatterGenContinuousIntervalLattice(ContinuousIntervalLattice):
         out_key: str = "l",
         standardize: bool = False,
         cache_file: str | Path | None = None,
+        limit_var_scaling_constant: float | None = None,
         eps: float = 1e-8,
     ) -> None:
         if standardize:
@@ -722,6 +739,10 @@ class MatterGenContinuousIntervalLattice(ContinuousIntervalLattice):
                 self.c = float(stats["c"])
                 self.limit_var_scaling_constant = float(stats["limit_var_scaling_constant"])
                 self.nu = float(stats["nu"])
+        if limit_var_scaling_constant is not None:
+            scaling = float(max(limit_var_scaling_constant, eps))
+            self.limit_var_scaling_constant = scaling
+            self.nu = scaling ** 1.5
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         cell = sample.cell.squeeze(0)
@@ -736,6 +757,8 @@ class MatterGenContinuousIntervalLattice(ContinuousIntervalLattice):
         # (mattergen/common/data/transform.py:22-23,
         #  mattergen/common/utils/data_utils.py:373-386).
         # MatterGen-style symmetric lattice representation used by the KLDM port.
+        # The polar factor preserves the lattice metric, so keeping fractional
+        # coordinates represents the same periodic crystal up to global rotation.
         features = mattergen_lattice_feature_vector(cell)
         return sample.replace(**{self.out_key: features.view(1, 6)})
 

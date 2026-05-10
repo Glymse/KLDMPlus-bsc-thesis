@@ -153,6 +153,7 @@ class CSPTask:
         self,
         root: str | Path | None = None,
         download: bool = False,
+        mattergen_limit_var_scaling_constant: float | None = None,
     ) -> ContinuousIntervalLattice:
         """Create the lattice transform.
 
@@ -193,6 +194,11 @@ class CSPTask:
                 ensure_mattergen_lattice_cache(
                     cache_file=cache_file,
                     processed_dir=root / self.dataset_cls.dataset_name / "processed" / "train",
+                    limit_var_scaling_constant=(
+                        0.25
+                        if mattergen_limit_var_scaling_constant is None
+                        else float(mattergen_limit_var_scaling_constant)
+                    ),
                 )
             else:
                 ensure_lattice_standardization_cache(
@@ -204,6 +210,7 @@ class CSPTask:
             return MatterGenContinuousIntervalLattice(
                 standardize=False,
                 cache_file=cache_file,
+                limit_var_scaling_constant=mattergen_limit_var_scaling_constant,
             )
 
         return KLDMContinuousIntervalLattice(

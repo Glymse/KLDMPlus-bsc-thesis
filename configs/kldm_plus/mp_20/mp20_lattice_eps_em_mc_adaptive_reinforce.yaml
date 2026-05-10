@@ -11,30 +11,45 @@ dataset:
   pin_memory: true
 
 time_sampler:
-  type: adaptive_reinforce
+  type: adaptive_reinforce_kldm_velocity_fstat
   policy_hidden_dim: 128
   policy_hidden_depth: 2
-  min_concentration: 0.1
-  policy_lr: 1.0e-5
-  entropy_coef: 1.0e-2
-  policy_update_every: 500
+  min_concentration: 0.25
+  policy_lr: 1.0e-4
+  entropy_coef: 3.0e-3
+  policy_update_every: 80
   policy_warmup_epochs: 550 # enable the policy near the train-loss plateau observed around epochs 500-600
-  reward_candidate_times: 9
-  reward_active_times: 5
-  reward_history_size: 64
+  reward_probe_times:
+    - 0.001
+    - 0.002
+    - 0.004
+    - 0.008
+    - 0.015
+    - 0.030
+    - 0.060
+    - 0.100
+    - 0.180
+    - 0.320
+    - 0.550
+    - 0.800
+    - 1.000
+  reward_active_times: 3
+  reward_history_size: 128
+  feature_selection_method: f_stat
   use_baseline: true
-  reward_baseline_momentum: 0.99
-  reward_velocity_weight: 0.7
-  reward_lattice_weight: 0.3
-  reward_size_weight_power: 0.5
-  reward_size_weight_max: 1.5
+  reward_baseline_momentum: 0.9
+  reward_velocity_weight: 1.0
+  reward_lattice_weight: 0.05
+  reward_forgetting_penalty: 0.25
+  reward_size_weight_power: 0.0
   reward_normalization_eps: 1.0e-6
-  entropy_in_reward: true
+  entropy_in_reward: false
   feature_selection_min_history: 32
-  use_importance_weights: false
-  clip_importance_weights: false
-  weight_clip_min: 0.25
-  weight_clip_max: 4.0
+  use_importance_weights: true
+  clip_importance_weights: true
+  weight_clip_min: 0.5
+  weight_clip_max: 2.0
+  normalize_importance_weights: true
   gradient_clip_norm: 1.0
 
 model:

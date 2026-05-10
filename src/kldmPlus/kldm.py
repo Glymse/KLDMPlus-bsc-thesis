@@ -76,6 +76,9 @@ class ModelKLDM(nn.Module):
         lattice_representation: str = "kldm",
         mattergen_lattice_c: float | None = None,
         mattergen_lattice_nu: float | None = None,
+        mattergen_pos_loss_weight: float | None = None,
+        mattergen_cell_loss_weight: float | None = None,
+        mattergen_pos_loss_reduce: str | None = None,
         *,
         score_network_kwargs: dict[str, Any],
     ) -> None:
@@ -109,6 +112,17 @@ class ModelKLDM(nn.Module):
         self.lattice_parameterization = lattice_parameterization
         self.lattice_diffusion_type = lattice_diffusion_type
         self.lattice_representation = lattice_representation
+        self.mattergen_pos_loss_weight = (
+            0.1 if mattergen_pos_loss_weight is None else float(mattergen_pos_loss_weight)
+        )
+        self.mattergen_cell_loss_weight = (
+            1.0 if mattergen_cell_loss_weight is None else float(mattergen_cell_loss_weight)
+        )
+        self.mattergen_pos_loss_reduce = (
+            "sum" if mattergen_pos_loss_reduce is None else str(mattergen_pos_loss_reduce)
+        )
+        if self.mattergen_pos_loss_reduce not in {"sum", "mean"}:
+            raise ValueError("mattergen_pos_loss_reduce must be 'sum' or 'mean'.")
 
     @staticmethod
     def _build_lattice_diffusion(
@@ -333,8 +347,23 @@ class ModelKLDM(nn.Module):
             dtype=loss_v_node.dtype,
         ).clamp_min(1.0)
 
-        loss_v_graph = loss_v_sum / counts
-        loss_graph = loss_v_graph + loss_l_graph
+        if prepared.lattice_representation == "mattergen":
+            # Official MatterGen uses a weighted summed-field objective:
+            # `cell: 1.0`, `pos: 0.1`, with `reduce=sum` over nodes for the
+            # position field. The KLDM port still trains the TDM velocity head,
+            # but matching the graph-level reduction and branch weighting keeps
+            # the overall objective aligned with the MatterGen implementation.
+            if self.mattergen_pos_loss_reduce == "sum":
+                loss_v_graph = loss_v_sum
+            else:
+                loss_v_graph = loss_v_sum / counts
+            loss_graph = (
+                self.mattergen_pos_loss_weight * loss_v_graph
+                + self.mattergen_cell_loss_weight * loss_l_graph
+            )
+        else:
+            loss_v_graph = loss_v_sum / counts
+            loss_graph = loss_v_graph + loss_l_graph
 
         if time_weight is not None:
             weight = time_weight.reshape(-1).to(device=loss_graph.device, dtype=loss_graph.dtype)
@@ -560,9 +589,10 @@ class ModelKLDM(nn.Module):
         edge_node_index = batch.edge_node_index
         num_graphs = batch.num_graphs
 
-        # Appendix H priors, kept in one place so the sampler owns its initial state:
-        # f_T ~ U(0, 1) represented in TDM's signed chart, v_T ~ centered N_v(0, I),
-        # and l_T ~ N(0, I).
+        # Appendix H-style priors, kept in one place so the sampler owns its
+        # initial state: f_T ~ U(0, 1) represented in TDM's signed chart,
+        # v_T ~ centered N_v(0, I), and l_T follows either the KLDM standard
+        # normal prior or the MatterGen atom-count-aware prior.
         f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         v_t = self.tdm.sample_velocity_noise(f_t, index=node_index)
         l_t = self.diffusion_l.sample_prior(

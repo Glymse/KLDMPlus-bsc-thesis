@@ -145,7 +145,11 @@ class SamplingRunner:
             pin_memory=bool(dataset_cfg["pin_memory"]),
             collate_fn=dataset_full.collate_fn,
         )
-        return loader, task.make_lattice_transform(root=root, download=True)
+        return loader, task.make_lattice_transform(
+            root=root,
+            download=True,
+            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
+        )
 
     def _inject_mattergen_lattice_stats(self) -> None:
         if getattr(self.lattice_transform, "representation", None) != "mattergen":

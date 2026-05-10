@@ -45,6 +45,9 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
         mattergen_lattice_c=cfg.get("mattergen_lattice_c"),
         mattergen_lattice_nu=cfg.get("mattergen_lattice_nu"),
+        mattergen_pos_loss_weight=cfg.get("mattergen_pos_loss_weight"),
+        mattergen_cell_loss_weight=cfg.get("mattergen_cell_loss_weight"),
+        mattergen_pos_loss_reduce=cfg.get("mattergen_pos_loss_reduce"),
         score_network_kwargs=score_network,
     ).to(device)
 

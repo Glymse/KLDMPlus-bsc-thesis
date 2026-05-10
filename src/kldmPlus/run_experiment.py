@@ -25,6 +25,7 @@ from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import sample_times
 from kldmPlus.utils.time_sampler import (
     AdaptiveReinforceTimeSampler,
+    AdaptiveReinforceVelocityFStatTimeSampler,
     KLDMUniformTimeSampler,
     LossSecondMomentTimeSampler,
 )
@@ -400,6 +401,50 @@ class ExperimentRunner:
                 reward_probe_times=cfg.get("reward_probe_times"),
             )
 
+        if sampler_type == "adaptive_reinforce_kldm_velocity_fstat":
+            policy_warmup_steps = int(cfg.get("policy_warmup_steps", 5000))
+            policy_warmup_epochs = cfg.get("policy_warmup_epochs")
+            if policy_warmup_epochs is not None:
+                batches_per_epoch = len(self.train_loader)
+                policy_warmup_steps = int(policy_warmup_epochs) * batches_per_epoch
+                self.config.setdefault("time_sampler", {})
+                self.config["time_sampler"]["policy_warmup_steps_resolved"] = policy_warmup_steps
+            return AdaptiveReinforceVelocityFStatTimeSampler(
+                lower_bound=TIME_LOWER_BOUND,
+                policy_hidden_dim=int(cfg.get("policy_hidden_dim", 128)),
+                policy_hidden_depth=int(cfg.get("policy_hidden_depth", 2)),
+                min_concentration=float(cfg.get("min_concentration", 0.25)),
+                policy_lr=float(cfg.get("policy_lr", 1e-4)),
+                entropy_coef=float(cfg.get("entropy_coef", 3e-3)),
+                policy_update_every=int(cfg.get("policy_update_every", 80)),
+                policy_warmup_steps=policy_warmup_steps,
+                reward_candidate_times=int(cfg.get("reward_candidate_times", 7)),
+                reward_active_times=int(cfg.get("reward_active_times", 3)),
+                reward_history_size=int(cfg.get("reward_history_size", 128)),
+                use_baseline=bool(cfg.get("use_baseline", True)),
+                reward_baseline_momentum=float(cfg.get("reward_baseline_momentum", 0.9)),
+                reward_velocity_weight=float(cfg.get("reward_velocity_weight", 1.0)),
+                reward_lattice_weight=float(cfg.get("reward_lattice_weight", 0.05)),
+                reward_forgetting_penalty=float(cfg.get("reward_forgetting_penalty", 0.25)),
+                reward_size_weight_power=float(cfg.get("reward_size_weight_power", 0.0)),
+                reward_size_weight_max=float(cfg.get("reward_size_weight_max", 2.0)),
+                reward_normalization_eps=float(cfg.get("reward_normalization_eps", 1e-6)),
+                entropy_in_reward=bool(cfg.get("entropy_in_reward", False)),
+                use_importance_weights=bool(cfg.get("use_importance_weights", True)),
+                clip_importance_weights=bool(cfg.get("clip_importance_weights", True)),
+                weight_clip_min=float(cfg.get("weight_clip_min", 0.5)),
+                weight_clip_max=float(cfg.get("weight_clip_max", 2.0)),
+                normalize_importance_weights=bool(
+                    cfg.get("normalize_importance_weights", True)
+                ),
+                gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
+                feature_selection_min_history=int(cfg.get("feature_selection_min_history", 32)),
+                feature_selection_method=str(cfg.get("feature_selection_method", "f_stat")),
+                seed=TRAIN_SEED,
+                device=self.device,
+                reward_probe_times=cfg.get("reward_probe_times"),
+            )
+
         raise ValueError(f"Unknown time_sampler.type={sampler_type!r}")
 
     def create_loaders(self) -> tuple[DataLoader, DataLoader, Any]:
@@ -461,7 +506,11 @@ class ExperimentRunner:
             collate_fn=val_dataset_full.collate_fn,
         )
 
-        return train_loader, val_loader, task.make_lattice_transform(root=root, download=True)
+        return train_loader, val_loader, task.make_lattice_transform(
+            root=root,
+            download=True,
+            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
+        )
 
     def _inject_mattergen_lattice_stats(self) -> None:
         if getattr(self.lattice_transform, "representation", None) != "mattergen":
@@ -476,7 +525,7 @@ class ExperimentRunner:
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
 
-        total_loss_v = total_loss_l = 0.0
+        total_loss_v = total_loss_l = total_loss_weighted = 0.0
         total_graphs = 0
 
         for batch in self.train_loader:
@@ -507,6 +556,7 @@ class ExperimentRunner:
             if self.ema is not None:
                 self.ema.update(self.model, current_epoch=epoch)
 
+            total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
             total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
             total_graphs += int(batch.num_graphs)
@@ -515,9 +565,10 @@ class ExperimentRunner:
             raise RuntimeError("Training stopped before any batches were processed.")
 
         metrics = {
+            "loss": total_loss_weighted / total_graphs,
             "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
-            "loss_weighted": (total_loss_v / total_graphs) + (total_loss_l / total_graphs),
+            "loss_weighted": total_loss_weighted / total_graphs,
         }
         metrics.update(self.time_sampler.diagnostics())
         return metrics
@@ -525,7 +576,7 @@ class ExperimentRunner:
     def evaluate_loss(self) -> dict[str, float]:
         self.model.eval()
 
-        total_loss_v = total_loss_l = 0.0
+        total_loss_v = total_loss_l = total_loss_weighted = 0.0
         total_graphs = 0
 
         for batch in self.val_loader:
@@ -537,6 +588,7 @@ class ExperimentRunner:
             with torch.no_grad():
                 _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
 
+            total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
             total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
             total_graphs += int(batch.num_graphs)
@@ -545,9 +597,10 @@ class ExperimentRunner:
             raise RuntimeError("Validation loader is empty.")
 
         return {
+            "loss": total_loss_weighted / total_graphs,
             "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
-            "loss_weighted": (total_loss_v / total_graphs) + (total_loss_l / total_graphs),
+            "loss_weighted": total_loss_weighted / total_graphs,
         }
 
     def run_sampling_evaluation(self) -> dict[str, Any]:

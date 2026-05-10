@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -324,6 +325,46 @@ def _graphwise_std(
     return torch.sqrt(var)
 
 
+def _single_feature_f_stat_scores(history: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Score each timestep feature with a single-feature regression F-statistic.
+
+    The target is provided explicitly so we can mirror the paper/source setup of
+    a replay buffer with probe-time features X and an aggregate improvement y.
+    """
+    if history.ndim != 2:
+        raise ValueError("history must have shape [num_updates, num_probe_times].")
+    if target.ndim != 1:
+        raise ValueError("target must have shape [num_updates].")
+    if int(history.shape[0]) != int(target.shape[0]):
+        raise ValueError("history and target must agree on num_updates.")
+
+    num_updates = int(history.shape[0])
+    if num_updates <= 2:
+        return torch.zeros(history.shape[1], device=history.device, dtype=history.dtype)
+
+    target_centered = target - target.mean()
+    target_ss = target_centered.square().sum().clamp_min(1e-12)
+    scores = []
+
+    for column in history.T:
+        column_centered = column - column.mean()
+        column_ss = column_centered.square().sum()
+        if float(column_ss.item()) <= 1e-12:
+            scores.append(torch.zeros((), device=history.device, dtype=history.dtype))
+            continue
+
+        corr_num = torch.dot(column_centered, target_centered)
+        r_squared = (corr_num.square() / (column_ss * target_ss).clamp_min(1e-12)).clamp(
+            min=0.0,
+            max=1.0 - 1e-12,
+        )
+        f_stat = r_squared * (num_updates - 2) / (1.0 - r_squared).clamp_min(1e-12)
+        scores.append(f_stat)
+
+    return torch.stack(scores)
+
+
 class GraphTimeBetaPolicy(nn.Module):
     """
     Graph-level Beta policy for continuous KLDM++ training times.
@@ -562,10 +603,22 @@ class AdaptiveReinforceTimeSampler:
         return self.num_model_steps >= self.policy_warmup_steps
 
     def _default_probe_indices(self) -> torch.Tensor:
-        return torch.arange(
-            min(self.reward_active_times, self.reward_probe_times.numel()),
-            dtype=torch.long,
-        )
+        num_probe_times = int(self.reward_probe_times.numel())
+        num_selected = min(self.reward_active_times, num_probe_times)
+        if num_selected <= 0:
+            return torch.zeros(0, dtype=torch.long)
+        if num_selected == 1:
+            return torch.tensor([num_probe_times // 2], dtype=torch.long)
+
+        # Spread fallback probes across the grid so early policy updates do not
+        # over-focus on the very lowest-noise region before F-stat history is ready.
+        indices = torch.linspace(
+            0,
+            num_probe_times - 1,
+            steps=num_selected + 2,
+            dtype=torch.float64,
+        )[1:-1]
+        return torch.round(indices).to(dtype=torch.long)
 
     def _append_probe_history(self, delta_vector: torch.Tensor) -> None:
         self._probe_history.append(delta_vector.detach().to(device="cpu", dtype=torch.float64))
@@ -926,3 +979,341 @@ class AdaptiveReinforceTimeSampler:
             "time_sampler/policy_selected_t_min": float(selected_times.min().item()),
             "time_sampler/policy_selected_t_max": float(selected_times.max().item()),
         }
+
+
+class AdaptiveReinforceVelocityFStatTimeSampler(AdaptiveReinforceTimeSampler):
+    """
+    Velocity-dominant KLDM REINFORCE sampler with paper-style F-stat selection.
+
+    Compared to the generic adaptive sampler, this variant:
+        - scores probe times with an F-statistic over normalized velocity gains
+        - rewards velocity improvement on selected times
+        - penalizes forgetting on non-selected velocity times
+        - applies only a light lattice-damage penalty
+        - uses q(t | x) / p_uniform(t) importance weights with clipping and
+          batch-mean normalization
+    """
+
+    def __init__(
+        self,
+        *,
+        reward_forgetting_penalty: float = 0.25,
+        normalize_importance_weights: bool = True,
+        feature_selection_method: str = "f_stat",
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.reward_forgetting_penalty = float(reward_forgetting_penalty)
+        self.normalize_importance_weights = bool(normalize_importance_weights)
+        self.feature_selection_method = str(feature_selection_method)
+
+        self._velocity_delta_history: list[torch.Tensor] = []
+        self._lattice_delta_history: list[torch.Tensor] = []
+        self._feature_buffer_X: list[torch.Tensor] = []
+        self._feature_buffer_y: list[torch.Tensor] = []
+
+        self.last_reward_forgetting_penalty_mean = 0.0
+        self.last_reward_lattice_penalty_mean = 0.0
+
+    def _append_history(self, store: list[torch.Tensor], value: torch.Tensor) -> None:
+        store.append(value.detach().to(device="cpu", dtype=torch.float64))
+        if len(store) > self.reward_history_size:
+            del store[:-self.reward_history_size]
+
+    def _history_stats(
+        self,
+        *,
+        history: list[torch.Tensor],
+        current_delta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if history:
+            history_tensor = torch.cat(history, dim=0).to(
+                device=current_delta.device,
+                dtype=current_delta.dtype,
+            )
+            mean = history_tensor.mean(dim=0)
+            std = history_tensor.std(dim=0, unbiased=False).clamp_min(
+                self.reward_normalization_eps
+            )
+            return mean, std
+
+        mean = current_delta.mean(dim=0)
+        std = current_delta.std(dim=0, unbiased=False).clamp_min(self.reward_normalization_eps)
+        return mean, std
+
+    def _append_feature_selection_sample(self, velocity_z: torch.Tensor) -> None:
+        generator = self._generator_for(velocity_z.device)
+        graph_index = int(
+            torch.randint(
+                low=0,
+                high=int(velocity_z.shape[0]),
+                size=(1,),
+                device=velocity_z.device,
+                generator=generator,
+            ).item()
+        )
+        feature_vector = velocity_z[graph_index].detach().to(device="cpu", dtype=torch.float64)
+        target_value = feature_vector.mean().reshape(1)
+
+        self._feature_buffer_X.append(feature_vector)
+        self._feature_buffer_y.append(target_value)
+        if len(self._feature_buffer_X) > self.reward_history_size:
+            del self._feature_buffer_X[:-self.reward_history_size]
+        if len(self._feature_buffer_y) > self.reward_history_size:
+            del self._feature_buffer_y[:-self.reward_history_size]
+
+    def _selected_probe_rewards(
+        self,
+        *,
+        velocity_z: torch.Tensor,
+        lattice_z: torch.Tensor,
+        selected_probe_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_probe_times = int(velocity_z.shape[1])
+        selected_mask = torch.zeros(
+            num_probe_times,
+            device=velocity_z.device,
+            dtype=torch.bool,
+        )
+        selected_mask[selected_probe_indices] = True
+
+        selected_velocity_reward = velocity_z[:, selected_mask].mean(dim=1)
+        if bool((~selected_mask).any().item()):
+            forgetting_penalty = torch.relu(-velocity_z[:, ~selected_mask]).mean(dim=1)
+        else:
+            forgetting_penalty = torch.zeros_like(selected_velocity_reward)
+        lattice_penalty = torch.relu(-lattice_z.mean(dim=1))
+
+        return selected_velocity_reward, forgetting_penalty, lattice_penalty
+
+    def _select_probe_indices(self) -> torch.Tensor:
+        if self.reward_active_times >= self.reward_probe_times.numel():
+            return torch.arange(self.reward_probe_times.numel(), dtype=torch.long)
+        if self.feature_selection_method != "f_stat":
+            return super()._select_probe_indices()
+        if len(self._feature_buffer_X) < self.feature_selection_min_history:
+            return self._default_probe_indices()
+
+        history = torch.stack(self._feature_buffer_X, dim=0)
+        target = torch.cat(self._feature_buffer_y, dim=0).to(dtype=history.dtype)
+        scores = _single_feature_f_stat_scores(history, target)
+        topk = torch.topk(scores, k=self.reward_active_times).indices
+        return torch.sort(topk).values.cpu()
+
+    def sample(self, batch: Batch | Data) -> TimeSamplerOutput:
+        device = batch.pos.device
+        dtype = batch.pos.dtype
+        num_graphs = int(batch.num_graphs)
+        generator = self._generator_for(device)
+
+        if not self._policy_active():
+            return super().sample(batch)
+
+        self._ensure_policy(batch)
+        assert self.policy is not None
+
+        features = self._graph_features(batch)
+        alpha, beta = self.policy(features)
+        dist = torch.distributions.Beta(alpha, beta)
+        u = dist.sample().clamp(1e-6, 1.0 - 1e-6)
+        log_probs = dist.log_prob(u)
+        entropies = dist.entropy()
+        t = self.lower_bound + (1.0 - self.lower_bound) * u.to(dtype=dtype)
+
+        if self.use_importance_weights:
+            # q(t | x) / p_uniform(t) simplifies to the Beta density on the
+            # rescaled u because both share the same affine interval transform.
+            weights = log_probs.detach().exp()
+            if self.clip_importance_weights:
+                weights = weights.clamp(self.weight_clip_min, self.weight_clip_max)
+            if self.normalize_importance_weights:
+                weights = weights / weights.mean().clamp_min(1e-12)
+        else:
+            weights = torch.ones_like(log_probs, dtype=dtype)
+
+        self.last_alpha_mean = float(alpha.detach().mean().item())
+        self.last_beta_mean = float(beta.detach().mean().item())
+        self.last_sampled_t_mean = float(t.detach().mean().item())
+        self.last_sampled_t_std = float(t.detach().std(unbiased=False).item())
+        self.last_sampled_t_min = float(t.detach().min().item())
+        self.last_sampled_t_max = float(t.detach().max().item())
+
+        return TimeSamplerOutput(
+            t=t[:, None].detach(),
+            bins=torch.zeros(num_graphs, device=device, dtype=torch.long),
+            weights=weights[:, None].to(dtype=dtype),
+            probs=torch.ones(1, device=device, dtype=dtype),
+            log_probs=log_probs - math.log(1.0 - self.lower_bound),
+            entropies=entropies,
+            policy_alpha=alpha.detach(),
+            policy_beta=beta.detach(),
+        )
+
+    def after_model_update(
+        self,
+        *,
+        batch: Batch | Data,
+        model,
+        sampled_time: TimeSamplerOutput,
+        metrics: dict[str, torch.Tensor],
+    ) -> None:
+        del metrics
+        if not self._pending_policy_update or self._probe_cache is None:
+            return
+        if sampled_time.log_probs is None or sampled_time.entropies is None:
+            self._probe_cache = None
+            return
+
+        assert self.policy is not None
+        assert self.policy_optimizer is not None
+
+        prepared_batches = self._probe_cache["prepared"]
+        before_velocity_losses = self._probe_cache["before_velocity_losses"]
+        before_lattice_losses = self._probe_cache["before_lattice_losses"]
+        after_velocity_losses = []
+        after_lattice_losses = []
+
+        with torch.no_grad():
+            for prepared in prepared_batches:
+                _loss, probe_metrics = model.loss_from_prepared(prepared)
+                after_velocity_losses.append(probe_metrics["loss_v_graph"])
+                after_lattice_losses.append(probe_metrics["loss_l_graph"])
+
+        after_velocity_losses_t = torch.stack(after_velocity_losses, dim=1)
+        after_lattice_losses_t = torch.stack(after_lattice_losses, dim=1)
+
+        velocity_delta = before_velocity_losses - after_velocity_losses_t
+        lattice_delta = before_lattice_losses - after_lattice_losses_t
+
+        velocity_mean, velocity_std = self._history_stats(
+            history=self._velocity_delta_history,
+            current_delta=velocity_delta.detach(),
+        )
+        lattice_mean, lattice_std = self._history_stats(
+            history=self._lattice_delta_history,
+            current_delta=lattice_delta.detach(),
+        )
+
+        velocity_z = (velocity_delta - velocity_mean[None, :]) / velocity_std[None, :]
+        lattice_z = (lattice_delta - lattice_mean[None, :]) / lattice_std[None, :]
+
+        selected_probe_indices = self.selected_probe_indices.to(device=velocity_z.device)
+        (
+            selected_velocity_reward,
+            forgetting_penalty,
+            lattice_penalty,
+        ) = self._selected_probe_rewards(
+            velocity_z=velocity_z,
+            lattice_z=lattice_z,
+            selected_probe_indices=selected_probe_indices,
+        )
+
+        rewards = (
+            self.reward_velocity_weight * selected_velocity_reward
+            - self.reward_forgetting_penalty * forgetting_penalty
+            - self.reward_lattice_weight * lattice_penalty
+        )
+        size_weights = self._graph_size_weights(
+            batch=batch,
+            device=rewards.device,
+            dtype=rewards.dtype,
+        )
+        rewards = rewards * size_weights
+        reward_mean = float(rewards.mean().item())
+        reward_std = float(rewards.std(unbiased=False).item())
+
+        advantages = rewards
+        if self.use_baseline:
+            if not self.reward_baseline_initialized:
+                self.reward_baseline = reward_mean
+                self.reward_baseline_initialized = True
+            else:
+                self.reward_baseline = (
+                    self.reward_baseline_momentum * self.reward_baseline
+                    + (1.0 - self.reward_baseline_momentum) * reward_mean
+                )
+            advantages = rewards - self.reward_baseline
+        else:
+            self.reward_baseline = 0.0
+            self.reward_baseline_initialized = False
+
+        policy_loss = -(advantages.detach() * sampled_time.log_probs).mean()
+        policy_loss = policy_loss - self.entropy_coef * sampled_time.entropies.mean()
+
+        self.policy_optimizer.zero_grad(set_to_none=True)
+        policy_loss.backward()
+        if self.gradient_clip_norm > 0.0:
+            nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.gradient_clip_norm)
+        self.policy_optimizer.step()
+
+        self.last_reward_mean = reward_mean
+        self.last_reward_std = reward_std
+        self.last_policy_loss = float(policy_loss.detach().item())
+        self.last_entropy = float(sampled_time.entropies.detach().mean().item())
+        self.last_reward_velocity_mean = float(selected_velocity_reward.mean().item())
+        self.last_reward_lattice_mean = float(lattice_z.mean().item())
+        self.last_reward_size_weight_mean = float(size_weights.mean().item())
+        self.last_reward_forgetting_penalty_mean = float(forgetting_penalty.mean().item())
+        self.last_reward_lattice_penalty_mean = float(lattice_penalty.mean().item())
+
+        self._append_history(self._velocity_delta_history, velocity_delta)
+        self._append_history(self._lattice_delta_history, lattice_delta)
+        self._append_feature_selection_sample(velocity_z)
+        self._probe_cache = None
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state.update(
+            {
+                "velocity_delta_history": self._velocity_delta_history,
+                "lattice_delta_history": self._lattice_delta_history,
+                "feature_buffer_X": self._feature_buffer_X,
+                "feature_buffer_y": self._feature_buffer_y,
+            }
+        )
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any] | None) -> None:
+        if not state_dict:
+            return
+
+        velocity_delta_history = state_dict.get("velocity_delta_history")
+        if velocity_delta_history is not None:
+            self._velocity_delta_history = [
+                item.to(device="cpu", dtype=torch.float64)
+                for item in velocity_delta_history
+            ]
+        lattice_delta_history = state_dict.get("lattice_delta_history")
+        if lattice_delta_history is not None:
+            self._lattice_delta_history = [
+                item.to(device="cpu", dtype=torch.float64)
+                for item in lattice_delta_history
+            ]
+        feature_buffer_X = state_dict.get("feature_buffer_X")
+        if feature_buffer_X is not None:
+            self._feature_buffer_X = [
+                item.to(device="cpu", dtype=torch.float64)
+                for item in feature_buffer_X
+            ]
+        feature_buffer_y = state_dict.get("feature_buffer_y")
+        if feature_buffer_y is not None:
+            self._feature_buffer_y = [
+                item.to(device="cpu", dtype=torch.float64)
+                for item in feature_buffer_y
+            ]
+
+        super().load_state_dict(state_dict)
+
+    def diagnostics(self) -> dict[str, float]:
+        diagnostics = super().diagnostics()
+        diagnostics.update(
+            {
+                "time_sampler/reward_forgetting_penalty_mean": float(
+                    self.last_reward_forgetting_penalty_mean
+                ),
+                "time_sampler/reward_lattice_penalty_mean": float(
+                    self.last_reward_lattice_penalty_mean
+                ),
+            }
+        )
+        return diagnostics

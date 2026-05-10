@@ -5,8 +5,12 @@ from typing import Any
 
 import requests
 from torch.utils.data import Dataset
-from torch_geometric.data import Batch
 from tqdm.auto import tqdm
+
+try:
+    from torch_geometric.data import Batch
+except ImportError:  # pragma: no cover
+    Batch = Any
 
 try:
     from mattergen.common.data.chemgraph import ChemGraph
