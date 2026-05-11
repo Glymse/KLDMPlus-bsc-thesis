@@ -351,3 +351,54 @@ class ContinuousMattergenVPDiffusion(ContinuousVPDiffusion):
         forward_drift = -0.5 * beta_t * (x_t - mu_vec)
         reverse_drift = forward_drift - beta_t * sigma_n.pow(2) * score_x
         return x_t - reverse_drift * dt_t + sigma_n * torch.sqrt(beta_t * dt_t).clamp_min(self.eps) * noise
+
+    def reverse_step_ancestral(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+        dt: float,
+        num_atoms: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Code segment inspired from mattergen
+        # (mattergen/common/diffusion/predictors_correctors.py:16-53,
+        #  mattergen/diffusion/sampling/predictors.py:122-165).
+        #
+        # MatterGen samples the lattice with an ancestral predictor, not the
+        # generic Euler-Maruyama reverse-SDE step. `pred` is our eps target
+        # (+raw noise), so convert it to a score with the corresponding sign.
+        if num_atoms is None:
+            raise ValueError("num_atoms is required for MatterGen lattice ancestral sampling.")
+
+        dt_t = torch.as_tensor(dt, device=x_t.device, dtype=x_t.dtype)
+        t_ref = t.to(device=x_t.device, dtype=x_t.dtype)
+        s = (t_ref - dt_t).clamp_min(0.0)
+
+        alpha_t = self._match_dims(self.alpha(t_ref), x_t)
+        alpha_s = self._match_dims(self.alpha(s), x_t)
+        sigma_base_t = self._match_dims(self.sigma_base(t_ref), x_t)
+        sigma_base_s = self._match_dims(self.sigma_base(s), x_t)
+
+        mu_vec = self.prior_mean(num_atoms=num_atoms, ref=x_t)
+        _, sigma_n = self.mu_sigma_n(num_atoms=num_atoms, ref=x_t)
+        sigma_n = self._match_dims(sigma_n, x_t)
+
+        sigma_t = sigma_base_t * sigma_n
+        sigma_s = sigma_base_s * sigma_n
+        score_x = -pred / sigma_t.clamp_min(self.eps)
+
+        alpha_t_given_s = (alpha_t / alpha_s.clamp_min(self.eps)).clamp_min(1e-3)
+        sigma2_t_given_s = sigma_t.pow(2) - sigma_s.pow(2) * alpha_t.pow(2) / alpha_s.pow(2).clamp_min(self.eps)
+        sigma2_t_given_s = sigma2_t_given_s.clamp_min(0.0)
+        sigma_t_given_s = torch.sqrt(sigma2_t_given_s)
+
+        x_coeff = 1.0 / alpha_t_given_s
+        score_coeff = sigma2_t_given_s / alpha_t_given_s
+        mean_coeff = 1.0 - x_coeff
+        mean = x_coeff * x_t + score_coeff * score_x + mean_coeff * mu_vec
+
+        std = sigma_t_given_s * sigma_s / sigma_t.clamp_min(self.eps)
+        if noise is None:
+            noise = torch.randn_like(x_t)
+        return mean + std * noise

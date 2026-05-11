@@ -396,7 +396,31 @@ class ModelKLDM(nn.Module):
         prepared = self.prepare_training_batch(batch=batch, t=t)
         return self.loss_from_prepared(prepared, time_weight=time_weight)
 
+    def _reverse_lattice_sampling_step(
+        self,
+        *,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+        dt: float,
+        num_atoms: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(self.diffusion_l, ContinuousMattergenVPDiffusion):
+            return self.diffusion_l.reverse_step_ancestral(
+                t=t,
+                x_t=x_t,
+                pred=pred,
+                dt=dt,
+                num_atoms=num_atoms,
+            )
 
+        return self.diffusion_l.reverse_step(
+            t=t,
+            x_t=x_t,
+            pred=pred,
+            dt=dt,
+            num_atoms=num_atoms,
+        )
 
     def sample_CSP_algorithm3(
         self,
@@ -456,8 +480,9 @@ class ModelKLDM(nn.Module):
                     dt=times.dt,
                 )
 
-                # Lattice branch: one reverse step using the lattice prediction.
-                state["l_t"] = state["sampling_diffusion_l"].reverse_step(
+                # Lattice branch: KLDM VP uses EM; MatterGen VP uses the
+                # source-style ancestral lattice predictor.
+                state["l_t"] = self._reverse_lattice_sampling_step(
                     t=times.now.lattice,
                     x_t=state["l_t"],
                     pred=preds_curr["l"],
@@ -561,8 +586,9 @@ class ModelKLDM(nn.Module):
                     tau=tau,
                 )
 
-                # 5. Lattice remains a single EM step in Appendix H.
-                state["l_t"] = state["sampling_diffusion_l"].reverse_step(
+                # 5. Lattice branch: KLDM VP uses EM; MatterGen VP uses the
+                # source-style ancestral lattice predictor.
+                state["l_t"] = self._reverse_lattice_sampling_step(
                     t=times.next.lattice,
                     x_t=state["l_t"],
                     pred=preds_next["l"],
