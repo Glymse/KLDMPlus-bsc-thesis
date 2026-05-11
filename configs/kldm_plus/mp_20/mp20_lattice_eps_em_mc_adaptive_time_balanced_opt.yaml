@@ -1,4 +1,4 @@
-experiment_name: plus_mp20_lattice_eps_em_mc_adaptive_paper
+experiment_name: plus_mp20_lattice_eps_em_mc_adaptive_time_balanced
 sampler_config: ../../samplers/euler_maruyama.yaml
 
 dataset:
@@ -11,30 +11,23 @@ dataset:
   pin_memory: true
 
 time_sampler:
-  type: adaptive_reinforce_paper
+  type: loss_second_moment
+  n_bins: 64
+  history_per_bin: 50
 
-  # Keep large / faithful probe grid
-  reward_candidate_times: 1000
-  reward_active_times: 3
-  feature_queue_single_graph: true
+  alpha: 0.15
+  adaptive_power: 0.55
 
-  # Policy network
-  policy_hidden_dim: 256
-  policy_hidden_depth: 2
+  min_prob: 0.008
+  max_prob: 0.038
 
-  # Much safer for long KLDM/CSP training
-  min_concentration: 0.05
-  policy_lr: 5.0e-4
-  entropy_coef: 3.0e-2
-  policy_update_every: 160
-  policy_warmup_epochs: 700
+  velocity_weight: 0.7
+  lattice_weight: 0.3
 
-  # Less reactive feature selection
-  reward_history_size: 96
-  feature_selection_min_history: 24
-
-  # Stability
-  gradient_clip_norm: 0.5
+  use_importance_weights: true
+  clip_importance_weights: true
+  weight_clip_min: 0.33
+  weight_clip_max: 2.5
 
 model:
   eps: 1.0e-6
@@ -70,7 +63,8 @@ optimizer:
 
 ema:
   enabled: true
-  type: fixed
+  type: fixed #fixed
+  #gamma: 6.94
   decay: 0.999
   start_epoch: 500
 
@@ -78,7 +72,7 @@ logging:
   train_every_epochs: 1
   wandb_checkpoints: true
   wandb_project: plus_mp20_lattice_eps_em_ablation
-  wandb_run_name: mc_adaptive_reinforce
+  wandb_run_name: mc_adaptive_time_balanced
 
 validation:
   every_n_epochs: 100

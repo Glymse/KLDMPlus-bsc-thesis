@@ -25,6 +25,7 @@ from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import sample_times
 from kldmPlus.utils.time_sampler import (
     AdaptiveReinforceTimeSampler,
+    AdaptiveReinforcePaperTimeSampler,
     AdaptiveReinforceVelocityFStatTimeSampler,
     KLDMUniformTimeSampler,
     LossSecondMomentTimeSampler,
@@ -396,6 +397,34 @@ class ExperimentRunner:
                 weight_clip_max=float(cfg.get("weight_clip_max", 4.0)),
                 gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
                 feature_selection_min_history=int(cfg.get("feature_selection_min_history", 32)),
+                seed=TRAIN_SEED,
+                device=self.device,
+                reward_probe_times=cfg.get("reward_probe_times"),
+            )
+
+        if sampler_type == "adaptive_reinforce_paper":
+            policy_warmup_steps = int(cfg.get("policy_warmup_steps", 0))
+            policy_warmup_epochs = cfg.get("policy_warmup_epochs")
+            if policy_warmup_epochs is not None:
+                batches_per_epoch = len(self.train_loader)
+                policy_warmup_steps = int(policy_warmup_epochs) * batches_per_epoch
+                self.config.setdefault("time_sampler", {})
+                self.config["time_sampler"]["policy_warmup_steps_resolved"] = policy_warmup_steps
+            return AdaptiveReinforcePaperTimeSampler(
+                lower_bound=TIME_LOWER_BOUND,
+                policy_hidden_dim=int(cfg.get("policy_hidden_dim", 256)),
+                policy_hidden_depth=int(cfg.get("policy_hidden_depth", 2)),
+                min_concentration=float(cfg.get("min_concentration", 1e-5)),
+                policy_lr=float(cfg.get("policy_lr", 1e-2)),
+                entropy_coef=float(cfg.get("entropy_coef", 1e-2)),
+                policy_update_every=int(cfg.get("policy_update_every", 40)),
+                policy_warmup_steps=policy_warmup_steps,
+                reward_candidate_times=int(cfg.get("reward_candidate_times", 13)),
+                reward_active_times=int(cfg.get("reward_active_times", 3)),
+                reward_history_size=int(cfg.get("reward_history_size", 5)),
+                feature_selection_min_history=int(cfg.get("feature_selection_min_history", 2)),
+                feature_queue_single_graph=bool(cfg.get("feature_queue_single_graph", True)),
+                gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
                 seed=TRAIN_SEED,
                 device=self.device,
                 reward_probe_times=cfg.get("reward_probe_times"),
@@ -1029,8 +1058,22 @@ class ExperimentRunner:
                         flush=True,
                     )
 
-                if epoch % self.validate_every_epochs == 0 and not should_stop(self.run):
-                    self.validate_epoch(epoch)
+                if not should_stop(self.run):
+                    if epoch < 4000:
+                        validate_now = epoch % 250 == 0
+                        ablation_seeds = 1
+                    else:
+                        validate_now = epoch % 100 == 0
+                        ablation_seeds = int(self.validation_cfg.get("ablation_num_seeds", 4))
+
+                    if validate_now:
+                        original_validation_cfg = dict(self.validation_cfg)
+                        try:
+                            self.validation_cfg["ablation"] = True
+                            self.validation_cfg["ablation_num_seeds"] = ablation_seeds
+                            self.validate_epoch(epoch)
+                        finally:
+                            self.validation_cfg = original_validation_cfg
 
                 epoch += 1
         except KeyboardInterrupt:
