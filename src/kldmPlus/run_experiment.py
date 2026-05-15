@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 import json
 import random
+import re
+import shutil
 import signal
 from pathlib import Path
 import sys
@@ -198,11 +200,30 @@ def resolve_checkpoint_reference(reference: str | Path, *, config_path: Path) ->
 
     if candidate.parent.exists():
         options = sorted(candidate.parent.glob("*.pt"))
-        if options:
-            chosen = options[-1].resolve()
-            print(f"checkpoint_missing={candidate} fallback_latest={chosen}", flush=True)
-            return chosen
-    return candidate
+        latest_hint = f" latest_available={options[-1].resolve()}" if options else ""
+        raise FileNotFoundError(f"Checkpoint path does not exist: {candidate}.{latest_hint}")
+    raise FileNotFoundError(f"Checkpoint path parent does not exist: {candidate.parent}")
+
+
+def prune_wandb_artifact_cache(checkpoint_path: Path) -> None:
+    try:
+        relative = checkpoint_path.resolve().relative_to(WANDB_ARTIFACTS_ROOT)
+    except ValueError:
+        return
+    parts = relative.parts
+    if len(parts) < 6:
+        return
+
+    artifact_dir = WANDB_ARTIFACTS_ROOT.joinpath(*parts[:4])
+    keep_version_dir = artifact_dir / parts[4]
+    if not artifact_dir.exists():
+        return
+
+    for candidate in artifact_dir.iterdir():
+        if candidate == keep_version_dir:
+            continue
+        if candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
 
 
 def format_metric(value: float | int | None, fmt: str) -> str:
@@ -217,6 +238,36 @@ def set_validation_sampling_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+@contextmanager
+def preserve_rng_state():
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+@contextmanager
+def isolated_rng_seed(seed: int):
+    with preserve_rng_state():
+        set_validation_sampling_seed(seed)
+        yield
+
+
+def epoch_from_checkpoint_name(path: Path) -> int | None:
+    match = re.search(r"(?:^|[_-])epoch[_-](\d+)(?:\D|$)", path.name)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def checkpoint_dir(config: dict[str, Any], experiment_name: str) -> Path:
@@ -305,6 +356,7 @@ class ExperimentRunner:
         self.start_epoch = 0
         self.run = None
         self._last_validation_artifact = None
+        self._last_validation_artifact_epoch: int | None = None
         self._warned_missing_wandb_image = False
         self.validation_ablation_history: dict[str, list[float]] = {
             "epoch": [],
@@ -319,11 +371,12 @@ class ExperimentRunner:
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
         if resume_from:
+            resolved_checkpoint_path = resolve_checkpoint_reference(
+                resume_from,
+                config_path=self.config_path,
+            )
             checkpoint = load_checkpoint(
-                checkpoint_path=resolve_checkpoint_reference(
-                    resume_from,
-                    config_path=self.config_path,
-                ),
+                checkpoint_path=resolved_checkpoint_path,
                 model=self.model,
                 optimizer=self.optimizer,
                 ema=self.ema,
@@ -331,7 +384,21 @@ class ExperimentRunner:
                 prefer_ema_weights=False,
             )
             self.start_epoch = int(checkpoint["epoch"])
+            filename_epoch = epoch_from_checkpoint_name(resolved_checkpoint_path)
+            if filename_epoch is not None and filename_epoch != self.start_epoch:
+                raise ValueError(
+                    "Checkpoint filename epoch does not match checkpoint payload epoch: "
+                    f"path={resolved_checkpoint_path} filename_epoch={filename_epoch} "
+                    f"payload_epoch={self.start_epoch}. Refusing to resume from an "
+                    "ambiguous checkpoint."
+                )
+            print(
+                f"checkpoint_loaded path={resolved_checkpoint_path} epoch={self.start_epoch}",
+                flush=True,
+            )
             self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
+            if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
+                prune_wandb_artifact_cache(resolved_checkpoint_path)
 
     def build_time_sampler(self):
         cfg = dict(self.config.get("time_sampler", {}))
@@ -423,6 +490,12 @@ class ExperimentRunner:
                 reward_history_size=int(cfg.get("reward_history_size", 5)),
                 feature_selection_min_history=int(cfg.get("feature_selection_min_history", 2)),
                 feature_queue_single_graph=bool(cfg.get("feature_queue_single_graph", True)),
+                feature_probe_graphs=int(
+                    cfg.get(
+                        "feature_probe_graphs",
+                        1 if bool(cfg.get("feature_queue_single_graph", True)) else 0,
+                    )
+                ),
                 gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
                 seed=TRAIN_SEED,
                 device=self.device,
@@ -508,8 +581,12 @@ class ExperimentRunner:
 
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
+        train_generator = getattr(self.train_loader, "generator", None)
+        if train_generator is not None:
+            train_generator.manual_seed(TRAIN_SEED + int(epoch))
 
         total_loss_v = total_loss_l = total_loss_weighted = 0.0
+        total_loss_v_weighted = total_loss_l_weighted = 0.0
         total_graphs = 0
 
         for batch in self.train_loader:
@@ -543,6 +620,8 @@ class ExperimentRunner:
             total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
             total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
+            total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.num_graphs)
+            total_loss_l_weighted += float(metrics["loss_l_weighted"]) * int(batch.num_graphs)
             total_graphs += int(batch.num_graphs)
 
         if total_graphs == 0:
@@ -552,6 +631,8 @@ class ExperimentRunner:
             "loss": total_loss_weighted / total_graphs,
             "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
+            "loss_v_weighted": total_loss_v_weighted / total_graphs,
+            "loss_l_weighted": total_loss_l_weighted / total_graphs,
             "loss_weighted": total_loss_weighted / total_graphs,
         }
         metrics.update(self.time_sampler.diagnostics())
@@ -561,21 +642,26 @@ class ExperimentRunner:
         self.model.eval()
 
         total_loss_v = total_loss_l = total_loss_weighted = 0.0
+        total_loss_v_weighted = total_loss_l_weighted = 0.0
         total_graphs = 0
+        loss_seed = int(self.validation_cfg.get("loss_seed", TRAIN_SEED + 17))
 
-        for batch in self.val_loader:
-            batch = batch.to(self.device)
+        with isolated_rng_seed(loss_seed):
+            for batch in self.val_loader:
+                batch = batch.to(self.device)
 
-            # Validation uses the same noisy-time sampling pattern as training.
-            t_graph = sample_times(batch, lower_bound=TIME_LOWER_BOUND)
+                # Validation uses the same noisy-time sampling pattern as training.
+                t_graph = sample_times(batch, lower_bound=TIME_LOWER_BOUND)
 
-            with torch.no_grad():
-                _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
+                with torch.no_grad():
+                    _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
 
-            total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
-            total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
-            total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
-            total_graphs += int(batch.num_graphs)
+                total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
+                total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
+                total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
+                total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.num_graphs)
+                total_loss_l_weighted += float(metrics["loss_l_weighted"]) * int(batch.num_graphs)
+                total_graphs += int(batch.num_graphs)
 
         if total_graphs == 0:
             raise RuntimeError("Validation loader is empty.")
@@ -584,6 +670,8 @@ class ExperimentRunner:
             "loss": total_loss_weighted / total_graphs,
             "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
+            "loss_v_weighted": total_loss_v_weighted / total_graphs,
+            "loss_l_weighted": total_loss_l_weighted / total_graphs,
             "loss_weighted": total_loss_weighted / total_graphs,
         }
 
@@ -597,60 +685,61 @@ class ExperimentRunner:
 
         def collect_one_pass(*, seed: int | None = None) -> dict[str, Any]:
             if seed is not None:
-                set_validation_sampling_seed(seed)
                 print(f"validation_sampling_seed={seed} pass_start", flush=True)
 
-            results = []
-            num_graphs_seen = 0
+            seed_context = isolated_rng_seed(seed) if seed is not None else preserve_rng_state()
+            with seed_context:
+                results = []
+                num_graphs_seen = 0
 
-            for batch in self.val_loader:
-                batch = batch.to(self.device)
+                for batch in self.val_loader:
+                    batch = batch.to(self.device)
 
-                with torch.no_grad():
-                    sample_fn = (
-                        self.model.sample_CSP_algorithm4
-                        if str(self.sampler_cfg["method"]) == "pc"
-                        else self.model.sample_CSP_algorithm3
-                    )
-
-                    sample_kwargs = {
-                        "n_steps": int(self.sampler_cfg["n_steps"]),
-                        "batch": batch,
-                        "t_start": float(self.sampler_cfg["t_start"]),
-                        "t_final": float(self.sampler_cfg["t_final"]),
-                    }
-                    if str(self.sampler_cfg["method"]) == "pc":
-                        sample_kwargs["tau"] = float(self.sampler_cfg["tau"])
-                        sample_kwargs["n_correction_steps"] = int(self.sampler_cfg["n_correction_steps"])
-
-                    pos_t, _v_t, l_t, h_t = sample_fn(**sample_kwargs)
-
-                ptr = batch.ptr.tolist()
-                for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr[:-1], ptr[1:])):
-                    results.append(
-                        evaluate_csp_reconstruction(
-                            pred_f=pos_t[start_idx:end_idx],
-                            pred_l=l_t[graph_idx],
-                            pred_a=h_t[start_idx:end_idx],
-                            target_f=batch.pos[start_idx:end_idx],
-                            target_l=batch.l[graph_idx],
-                            target_a=batch.atomic_numbers[start_idx:end_idx],
-                            lattice_transform=self.lattice_transform,
+                    with torch.no_grad():
+                        sample_fn = (
+                            self.model.sample_CSP_algorithm4
+                            if str(self.sampler_cfg["method"]) == "pc"
+                            else self.model.sample_CSP_algorithm3
                         )
-                    )
-                    num_graphs_seen += 1
+
+                        sample_kwargs = {
+                            "n_steps": int(self.sampler_cfg["n_steps"]),
+                            "batch": batch,
+                            "t_start": float(self.sampler_cfg["t_start"]),
+                            "t_final": float(self.sampler_cfg["t_final"]),
+                        }
+                        if str(self.sampler_cfg["method"]) == "pc":
+                            sample_kwargs["tau"] = float(self.sampler_cfg["tau"])
+                            sample_kwargs["n_correction_steps"] = int(self.sampler_cfg["n_correction_steps"])
+
+                        pos_t, _v_t, l_t, h_t = sample_fn(**sample_kwargs)
+
+                    ptr = batch.ptr.tolist()
+                    for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr[:-1], ptr[1:])):
+                        results.append(
+                            evaluate_csp_reconstruction(
+                                pred_f=pos_t[start_idx:end_idx],
+                                pred_l=l_t[graph_idx],
+                                pred_a=h_t[start_idx:end_idx],
+                                target_f=batch.pos[start_idx:end_idx],
+                                target_l=batch.l[graph_idx],
+                                target_a=batch.atomic_numbers[start_idx:end_idx],
+                                lattice_transform=self.lattice_transform,
+                            )
+                        )
+                        num_graphs_seen += 1
+
+                        if (
+                            self.validation_cfg["sampling_max_graphs"] is not None
+                            and num_graphs_seen >= self.validation_cfg["sampling_max_graphs"]
+                        ):
+                            break
 
                     if (
                         self.validation_cfg["sampling_max_graphs"] is not None
                         and num_graphs_seen >= self.validation_cfg["sampling_max_graphs"]
                     ):
                         break
-
-                if (
-                    self.validation_cfg["sampling_max_graphs"] is not None
-                    and num_graphs_seen >= self.validation_cfg["sampling_max_graphs"]
-                ):
-                    break
 
             if seed is not None:
                 print(
@@ -667,7 +756,13 @@ class ExperimentRunner:
             }
 
         if not bool(self.validation_cfg.get("ablation", False)):
-            return collect_one_pass()
+            single_seed = int(
+                self.validation_cfg.get(
+                    "sampling_seed",
+                    self.validation_cfg.get("ablation_seed_offset", 0),
+                )
+            )
+            return collect_one_pass(seed=single_seed)
 
         num_seeds = int(self.validation_cfg.get("ablation_num_seeds", 6))
         seed_offset = int(self.validation_cfg.get("ablation_seed_offset", 0))
@@ -749,47 +844,69 @@ class ExperimentRunner:
         self,
         epoch: int,
         metrics: Mapping[str, float | int | None],
-    ) -> None:
+    ) -> bool:
         from kldmPlus.utils.model_loader import save_checkpoint
 
-        if not bool(self.logging_cfg["wandb_checkpoints"]):
-            return
-
-        with tempfile.TemporaryDirectory(prefix="kldm_val_ckpt_") as temp_dir_name:
-            path = Path(temp_dir_name) / f"epoch_{epoch}.pt"
-            save_checkpoint(
-                model=self.model,
-                optimizer=self.optimizer,
-                ema=self.ema,
-                time_sampler=self.time_sampler,
-                output_path=path,
-                config=self.config,
-                epoch=epoch,
-                metrics=metrics,
+        if not bool(self.logging_cfg["wandb_checkpoints"]) or self.run is None:
+            return False
+        upload_every = int(
+            self.logging_cfg.get(
+                "validation_checkpoint_every_n_epochs",
+                self.validation_cfg.get("seeded_every_n_epochs", self.validate_every_epochs),
             )
-            artifact = wandb.Artifact(f"{self.experiment_name}_validation", type="model")
-            artifact.add_file(str(path), name=path.name)
-            logged_artifact = self.run.log_artifact(
-                artifact,
-                aliases=["latest-validation"],
+        )
+        upload_start_epoch = int(self.logging_cfg.get("validation_checkpoint_start_epoch", 0))
+        if upload_every <= 0 or epoch <= upload_start_epoch or epoch % upload_every != 0:
+            return False
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="kldm_val_ckpt_") as temp_dir_name:
+                path = Path(temp_dir_name) / f"epoch_{epoch}.pt"
+                save_checkpoint(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    ema=self.ema,
+                    time_sampler=self.time_sampler,
+                    output_path=path,
+                    config=self.config,
+                    epoch=epoch,
+                    metrics=metrics,
+                )
+                artifact = wandb.Artifact(f"{self.experiment_name}_validation", type="model")
+                artifact.add_file(str(path), name=path.name)
+                logged_artifact = self.run.log_artifact(
+                    artifact,
+                    aliases=["latest-validation", f"epoch-{epoch}"],
+                )
+                logged_artifact.wait()
+
+                previous_artifact = self._last_validation_artifact
+                previous_epoch = self._last_validation_artifact_epoch
+                self._last_validation_artifact = logged_artifact
+                self._last_validation_artifact_epoch = int(epoch)
+
+                if bool(self.logging_cfg.get("delete_previous_validation_artifacts", False)):
+                    if previous_artifact is not None:
+                        try:
+                            previous_artifact.delete(delete_aliases=True)
+                            print(
+                                f"checkpoint_deleted=wandb previous_validation epoch={previous_epoch}",
+                                flush=True,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"checkpoint_delete_warning=wandb previous_validation epoch={previous_epoch} "
+                                f"error={exc}",
+                                flush=True,
+                            )
+        except Exception as exc:
+            print(
+                f"checkpoint_upload_warning=wandb validation epoch={epoch} error={exc}",
+                flush=True,
             )
-            logged_artifact.wait()
+            return False
 
-            previous_artifact = self._last_validation_artifact
-            self._last_validation_artifact = logged_artifact
-
-            if previous_artifact is not None:
-                try:
-                    previous_artifact.delete(delete_aliases=True)
-                    print(
-                        f"checkpoint_deleted=wandb previous_validation epoch={epoch}",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        f"checkpoint_delete_warning=wandb previous_validation error={exc}",
-                        flush=True,
-                    )
+        return True
 
     def _build_validation_ablation_band_figure(
         self,
@@ -898,6 +1015,8 @@ class ExperimentRunner:
         merged_metrics = {
             "loss_v": val_loss_metrics["loss_v"],
             "loss_l": val_loss_metrics["loss_l"],
+            "loss_v_weighted": val_loss_metrics["loss_v_weighted"],
+            "loss_l_weighted": val_loss_metrics["loss_l_weighted"],
             "loss_weighted": val_loss_metrics["loss_weighted"],
             "valid": val_sample_metrics["valid"],
             "match_rate": val_sample_metrics["match_rate"],
@@ -913,6 +1032,8 @@ class ExperimentRunner:
             "epoch": epoch,
             "val/loss_v": merged_metrics["loss_v"],
             "val/loss_l": merged_metrics["loss_l"],
+            "val/loss_v_weighted": merged_metrics["loss_v_weighted"],
+            "val/loss_l_weighted": merged_metrics["loss_l_weighted"],
             "val/loss_weighted": merged_metrics["loss_weighted"],
             "val/valid": merged_metrics["valid"],
             "val/match_rate": merged_metrics["match_rate"],
@@ -924,11 +1045,13 @@ class ExperimentRunner:
             val_sample_metrics=val_sample_metrics,
         )
 
-        self.save_validation_checkpoint_to_wandb(epoch, merged_metrics)
+        checkpoint_uploaded = self.save_validation_checkpoint_to_wandb(epoch, merged_metrics)
 
         print(
             f"validation_epoch={epoch:04d} val_loss_weighted={merged_metrics['loss_weighted']:.6f} "
-            f"(loss_v={merged_metrics['loss_v']:.6f}, loss_l={merged_metrics['loss_l']:.6f}) "
+            f"(loss_v={merged_metrics['loss_v']:.6f}, loss_l={merged_metrics['loss_l']:.6f}, "
+            f"loss_v_weighted={merged_metrics['loss_v_weighted']:.6f}, "
+            f"loss_l_weighted={merged_metrics['loss_l_weighted']:.6f}) "
             f"valid={format_metric(merged_metrics['valid'], '.4f')} "
             f"match_rate={format_metric(merged_metrics['match_rate'], '.4f')} "
             f"rmse={format_metric(merged_metrics['rmse'], '.6f')}",
@@ -962,7 +1085,7 @@ class ExperimentRunner:
                 f"validation_ablation_backup={json.dumps(backup_payload, sort_keys=True)}",
                 flush=True,
             )
-        if bool(self.logging_cfg["wandb_checkpoints"]):
+        if checkpoint_uploaded:
             print(f"checkpoint_uploaded=wandb epoch={epoch}", flush=True)
 
     def run_training_loop(self) -> None:
@@ -989,8 +1112,16 @@ class ExperimentRunner:
         print(f"data_splits train={TRAIN_SPLIT} val={VAL_SPLIT}", flush=True)
         print(f"time_sampler={self.config.get('time_sampler', {'type': 'uniform'})}", flush=True)
         print(f"sampler={self.sampler_cfg}", flush=True)
+        print(
+            f"validation_schedule every_n_epochs={self.validate_every_epochs} "
+            f"seeded_start_epoch={int(self.validation_cfg.get('seeded_start_epoch', 4000))} "
+            f"seeded_every_n_epochs={int(self.validation_cfg.get('seeded_every_n_epochs', 200))} "
+            f"ablation_num_seeds={int(self.validation_cfg.get('ablation_num_seeds', 4))}",
+            flush=True,
+        )
 
         epoch = self.start_epoch + 1
+        interrupted = False
         try:
             while not should_stop(self.run):
                 train_metrics = self.train_epoch(epoch)
@@ -1000,6 +1131,8 @@ class ExperimentRunner:
                         "epoch": epoch,
                         "train/loss_v": train_metrics["loss_v"],
                         "train/loss_l": train_metrics["loss_l"],
+                        "train/loss_v_weighted": train_metrics["loss_v_weighted"],
+                        "train/loss_l_weighted": train_metrics["loss_l_weighted"],
                         "train/loss_weighted": train_metrics["loss_weighted"],
                     }
                     for key, value in train_metrics.items():
@@ -1009,41 +1142,73 @@ class ExperimentRunner:
 
                     print(
                         f"epoch={epoch:04d} train_loss_weighted={train_metrics['loss_weighted']:.6f} "
-                        f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f})",
+                        f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f}, "
+                        f"loss_v_weighted={train_metrics['loss_v_weighted']:.6f}, "
+                        f"loss_l_weighted={train_metrics['loss_l_weighted']:.6f})",
                         flush=True,
                     )
 
                 if not should_stop(self.run):
-                    if epoch < 4000:
-                        validate_now = epoch % 250 == 0
-                        ablation_seeds = 1
-                    else:
-                        validate_now = epoch % 100 == 0
-                        ablation_seeds = int(self.validation_cfg.get("ablation_num_seeds", 4))
-
+                    validate_now = self.validate_every_epochs > 0 and epoch % self.validate_every_epochs == 0
                     if validate_now:
                         original_validation_cfg = dict(self.validation_cfg)
                         try:
-                            self.validation_cfg["ablation"] = True
-                            self.validation_cfg["ablation_num_seeds"] = ablation_seeds
+                            seeded_start_epoch = int(
+                                original_validation_cfg.get("seeded_start_epoch", 4000)
+                            )
+                            seeded_every_epochs = int(
+                                original_validation_cfg.get("seeded_every_n_epochs", 200)
+                            )
+                            run_seeded_ablation = (
+                                bool(original_validation_cfg.get("ablation", False))
+                                and epoch > seeded_start_epoch
+                                and seeded_every_epochs > 0
+                                and epoch % seeded_every_epochs == 0
+                            )
+                            self.validation_cfg["ablation"] = run_seeded_ablation
+                            self.validation_cfg["ablation_num_seeds"] = (
+                                int(original_validation_cfg.get("ablation_num_seeds", 4))
+                                if run_seeded_ablation
+                                else 1
+                            )
                             self.validate_epoch(epoch)
                         finally:
                             self.validation_cfg = original_validation_cfg
 
                 epoch += 1
         except KeyboardInterrupt:
+            interrupted = True
             print("run_experiment interrupted", flush=True)
         finally:
             final_epoch = max(epoch - 1, self.start_epoch)
             final_filename = f"{self.experiment_name}_epoch_{final_epoch}.pt"
 
             # Save exactly one local checkpoint for the experiment: the final model.
-            self.save_checkpoint(
+            final_path = self.save_checkpoint(
                 final_epoch,
                 {"final_epoch": float(final_epoch)},
                 final_filename,
                 upload_to_wandb=False,
             )
+            shutdown_requested = interrupted or STOP_REQUESTED or should_stop(self.run)
+            seeded_start_epoch = int(self.validation_cfg.get("seeded_start_epoch", 4000))
+            if shutdown_requested and final_epoch < seeded_start_epoch:
+                shutdown_filename = f"{self.experiment_name}_shutdown_epoch_{final_epoch}.pt"
+                shutdown_path = self.save_checkpoint(
+                    final_epoch,
+                    {
+                        "shutdown_epoch": float(final_epoch),
+                        "stop_requested": float(STOP_REQUESTED),
+                        "keyboard_interrupt": float(interrupted),
+                    },
+                    shutdown_filename,
+                    keep_paths=[final_path],
+                    upload_to_wandb=bool(self.checkpoint_cfg.get("upload_shutdown_to_wandb", False)),
+                )
+                print(
+                    f"shutdown_checkpoint_saved path={shutdown_path} epoch={final_epoch}",
+                    flush=True,
+                )
             if self.run is not None:
                 self.run.finish()
 

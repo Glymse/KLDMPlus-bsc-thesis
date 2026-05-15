@@ -16,8 +16,11 @@ src/torsional
 src/TDM
 src/mattergen
 src/adapative
+src/papers/*
+!src/papers/readpdf.py
+src/DPnP
+src/diffCSPpp
 src/papers
-
 # other local dev info
 .vscode/
 

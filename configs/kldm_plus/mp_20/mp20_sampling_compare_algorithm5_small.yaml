@@ -1,0 +1,66 @@
+experiment_name: plus_mp20_sampling_compare_algorithm5_small
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: kldm
+  root: null
+  batch_size: 5
+  num_workers: 0
+  pin_memory: false
+
+model:
+  eps: 1.0e-6
+  lattice_parameterization: eps
+  lattice_diffusion_type: VP
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: false
+  tdm_velocity_scale: 0.15915494309189535
+  tdm_sigma_norm_estimator: quadrature
+  tdm_sigma_norm_density_K: 40
+  tdm_sigma_norm_grid_points: 8193
+  tdm_sigma_norm_mc_samples: 20000
+  tdm_centered_sigma_norm_correction: false
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+sampling_compare:
+  checkpoint_path: ../../../artifacts/HPC/checkpoints/epoch_8900.pt
+  split: test
+  batch_size: 5
+  num_targets: 5
+  subset_seed: 123
+  sample_seed: 2026
+  samplers:
+    - name: em_300
+      method: em
+      sampling_algorithm: 3
+      n_steps: 300
+      t_start: 1.0
+      t_final: 1e-3
+    - name: symmetry_algorithm5_300
+      method: em
+      sampling_algorithm: 5
+      n_steps: 300
+      t_start: 1.0
+      t_final: 1e-3
+      symmetry_guidance:
+        coord_scale: 2.0e-3
+        lattice_scale: 1.0e-5
+        guidance_interval: 5
+        guidance_start_fraction: 0.5
+        coord_grad_clip: 5.0
+        lattice_grad_clip: 0.5
+        coord_max_step: 2.0e-2
+        lattice_max_step: 2.0e-3

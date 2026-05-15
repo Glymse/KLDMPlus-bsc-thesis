@@ -17,6 +17,9 @@ time_sampler:
   reward_candidate_times: 1000
   reward_active_times: 3
   feature_queue_single_graph: true
+  # Match src/adaptive: scan the full candidate grid on a tiny feature subset,
+  # then score only the selected active times on the full training batch.
+  feature_probe_graphs: 10
 
   # Policy network
   policy_hidden_dim: 256
@@ -77,11 +80,16 @@ ema:
 logging:
   train_every_epochs: 1
   wandb_checkpoints: true
+  validation_checkpoint_every_n_epochs: 200
+  validation_checkpoint_start_epoch: 4000
+  delete_previous_validation_artifacts: true
   wandb_project: plus_mp20_lattice_eps_em_ablation
   wandb_run_name: mc_adaptive_reinforce
 
 validation:
   every_n_epochs: 100
+  seeded_start_epoch: 4000
+  seeded_every_n_epochs: 200
   ablation: true # match paper-style validation by repeating sampling with multiple seeds and logging mean/std
   ablation_num_seeds: 4
   ablation_seed_offset: 0
@@ -93,6 +101,7 @@ validation:
 checkpoint:
   resume_from: null
   wandb_resume_id: null
+  prune_wandb_artifact_cache: true
 
 sampling_eval:
   split: test

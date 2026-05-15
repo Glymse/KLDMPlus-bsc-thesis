@@ -20,6 +20,27 @@ class TimeSamplerOutput:
     policy_beta: torch.Tensor | None = None
 
 
+def _generator_states(generators: dict[str, torch.Generator]) -> dict[str, torch.Tensor]:
+    return {key: generator.get_state().detach().cpu() for key, generator in generators.items()}
+
+
+def _load_generator_states(
+    generators: dict[str, torch.Generator],
+    state_dict: dict[str, torch.Tensor] | None,
+) -> None:
+    if not state_dict:
+        return
+    generators.clear()
+    for key, state in state_dict.items():
+        try:
+            device = torch.device(key)
+            generator = torch.Generator(device=device)
+            generator.set_state(state.detach().cpu())
+        except Exception:
+            continue
+        generators[str(device)] = generator
+
+
 class KLDMUniformTimeSampler:
     """
     Drop-in replacement for sample_times(...) when we want sampler objects.
@@ -74,10 +95,12 @@ class KLDMUniformTimeSampler:
         del batch, model, sampled_time, metrics
 
     def state_dict(self) -> dict[str, Any]:
-        return {}
+        return {"generator_states": _generator_states(self._generators)}
 
     def load_state_dict(self, state_dict: dict[str, Any] | None) -> None:
-        del state_dict
+        if not state_dict:
+            return
+        _load_generator_states(self._generators, state_dict.get("generator_states"))
 
     def diagnostics(self) -> dict[str, float]:
         return {}
@@ -268,11 +291,13 @@ class LossSecondMomentTimeSampler:
             "loss_v_history": self.loss_v_history,
             "loss_l_history": self.loss_l_history,
             "loss_counts": self.loss_counts,
+            "generator_states": _generator_states(self._generators),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any] | None) -> None:
         if not state_dict:
             return
+        _load_generator_states(self._generators, state_dict.get("generator_states"))
         device = self.loss_v_history.device
         self.loss_v_history.copy_(state_dict["loss_v_history"].to(device=device, dtype=torch.float64))
         self.loss_l_history.copy_(state_dict["loss_l_history"].to(device=device, dtype=torch.float64))
@@ -322,6 +347,30 @@ def _graphwise_std(
     second_moment = _graphwise_mean(values.square(), index, num_graphs)
     var = (second_moment - mean.square()).clamp_min(1e-12)
     return torch.sqrt(var)
+
+
+def _select_graph_batch(batch: Batch | Data, graph_indices: torch.Tensor) -> Batch | Data:
+    """Build a smaller PyG batch from graph indices."""
+    num_graphs = int(batch.num_graphs)
+    index_list = [int(index) for index in graph_indices.detach().cpu().flatten().tolist()]
+    if len(index_list) == 0:
+        raise ValueError("feature probe graph subset cannot be empty.")
+    if len(index_list) >= num_graphs and index_list == list(range(num_graphs)):
+        return batch
+    if num_graphs == 1:
+        return batch
+
+    if hasattr(batch, "get_example"):
+        data_list = [batch.get_example(index) for index in index_list]
+        return Batch.from_data_list(data_list).to(batch.pos.device)
+
+    if hasattr(batch, "index_select"):
+        selected = batch.index_select(index_list)
+        if isinstance(selected, list):
+            return Batch.from_data_list(selected).to(batch.pos.device)
+        return selected.to(batch.pos.device)
+
+    raise TypeError("Graph subset probes require a torch_geometric Batch-like object.")
 
 
 def _single_feature_f_stat_scores(history: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -923,6 +972,7 @@ class AdaptiveReinforceTimeSampler:
             "selected_probe_indices": self.selected_probe_indices,
             "probe_history": self._probe_history,
             "feature_dim": self._feature_dim,
+            "generator_states": _generator_states(self._generators),
         }
         if self.policy is not None and self.policy_optimizer is not None:
             state["policy_state_dict"] = self.policy.state_dict()
@@ -936,6 +986,7 @@ class AdaptiveReinforceTimeSampler:
         self.num_model_steps = int(state_dict.get("num_model_steps", 0))
         self.reward_baseline = float(state_dict.get("reward_baseline", 0.0))
         self.reward_baseline_initialized = bool(state_dict.get("reward_baseline_initialized", False))
+        _load_generator_states(self._generators, state_dict.get("generator_states"))
         selected_probe_indices = state_dict.get("selected_probe_indices")
         if selected_probe_indices is not None:
             self.selected_probe_indices = selected_probe_indices.to(dtype=torch.long, device="cpu")
@@ -1005,6 +1056,7 @@ class AdaptiveReinforcePaperTimeSampler:
         reward_history_size: int = 5,
         feature_selection_min_history: int = 2,
         feature_queue_single_graph: bool = True,
+        feature_probe_graphs: int | None = None,
         gradient_clip_norm: float = 1.0,
         seed: int = 2002,
         device: torch.device | str = "cpu",
@@ -1022,9 +1074,14 @@ class AdaptiveReinforcePaperTimeSampler:
         self.reward_active_times = int(reward_active_times)
         self.feature_selection_min_history = int(feature_selection_min_history)
         self.feature_queue_single_graph = bool(feature_queue_single_graph)
+        if feature_probe_graphs is None:
+            feature_probe_graphs = 1 if self.feature_queue_single_graph else 0
+        self.feature_probe_graphs = int(feature_probe_graphs)
         self.gradient_clip_norm = float(gradient_clip_norm)
         self.seed = int(seed)
         self.device = torch.device(device)
+        if self.feature_probe_graphs < 0:
+            raise ValueError("feature_probe_graphs must be non-negative.")
 
         if reward_probe_times is not None:
             probe_times = [float(value) for value in reward_probe_times]
@@ -1059,6 +1116,7 @@ class AdaptiveReinforcePaperTimeSampler:
         self.last_sampled_t_std = 0.0
         self.last_sampled_t_min = 0.0
         self.last_sampled_t_max = 0.0
+        self.last_feature_probe_num_graphs = 0.0
 
         self.selected_probe_indices = self._default_probe_indices()
         self._feature_history: list[torch.Tensor] = []
@@ -1173,14 +1231,37 @@ class AdaptiveReinforcePaperTimeSampler:
         topk = torch.topk(scores, k=self.reward_active_times).indices
         return torch.sort(topk).values.cpu()
 
-    def _prepare_probe_cache(self, *, batch: Batch | Data, model) -> dict[str, Any]:
-        candidate_times = self._candidate_times(device=batch.pos.device, dtype=batch.pos.dtype)
-        generator = self._generator_for(batch.pos.device)
+    def _feature_probe_batch(
+        self,
+        *,
+        batch: Batch | Data,
+        generator: torch.Generator,
+    ) -> Batch | Data:
+        num_graphs = int(batch.num_graphs)
+        if self.feature_probe_graphs <= 0 or self.feature_probe_graphs >= num_graphs:
+            return batch
+
+        graph_indices = torch.randperm(
+            num_graphs,
+            device=batch.pos.device,
+            generator=generator,
+        )[: self.feature_probe_graphs]
+        graph_indices = torch.sort(graph_indices).values
+        return _select_graph_batch(batch, graph_indices)
+
+    def _prepare_probe_losses(
+        self,
+        *,
+        batch: Batch | Data,
+        model,
+        probe_times: torch.Tensor,
+        generator: torch.Generator,
+    ) -> tuple[list[Any], torch.Tensor]:
         prepared_batches = []
-        before_loss_graph = []
+        before_losses = []
 
         with torch.no_grad():
-            for tau in candidate_times.tolist():
+            for tau in probe_times.tolist():
                 graph_time = torch.full(
                     (int(batch.num_graphs), 1),
                     float(tau),
@@ -1214,25 +1295,37 @@ class AdaptiveReinforcePaperTimeSampler:
                 )
                 _loss, probe_metrics = model.loss_from_prepared(prepared)
                 prepared_batches.append(prepared)
-                before_loss_graph.append(probe_metrics["loss_graph"])
+                before_losses.append(probe_metrics["loss_graph"])
 
-        feature_graph_index = None
-        if self.feature_queue_single_graph and int(batch.num_graphs) > 1:
-            feature_graph_index = int(
-                torch.randint(
-                    low=0,
-                    high=int(batch.num_graphs),
-                    size=(1,),
-                    device=batch.pos.device,
-                    generator=generator,
-                ).item()
-            )
+        return prepared_batches, torch.stack(before_losses, dim=1)
+
+    def _prepare_probe_cache(self, *, batch: Batch | Data, model) -> dict[str, Any]:
+        candidate_times = self._candidate_times(device=batch.pos.device, dtype=batch.pos.dtype)
+        generator = self._generator_for(batch.pos.device)
+        selected_probe_indices = self.selected_probe_indices.to(dtype=torch.long)
+        selected_probe_times = candidate_times[selected_probe_indices.to(device=candidate_times.device)]
+        feature_batch = self._feature_probe_batch(batch=batch, generator=generator)
+        self.last_feature_probe_num_graphs = float(int(feature_batch.num_graphs))
+        feature_prepared, feature_before_loss_graph = self._prepare_probe_losses(
+            batch=feature_batch,
+            model=model,
+            probe_times=candidate_times,
+            generator=generator,
+        )
+        reward_prepared, reward_before_loss_graph = self._prepare_probe_losses(
+            batch=batch,
+            model=model,
+            probe_times=selected_probe_times,
+            generator=generator,
+        )
 
         return {
-            "prepared": prepared_batches,
-            "before_loss_graph": torch.stack(before_loss_graph, dim=1),
-            "selected_probe_indices": self.selected_probe_indices,
-            "feature_graph_index": feature_graph_index,
+            "feature_prepared": feature_prepared,
+            "feature_before_loss_graph": feature_before_loss_graph,
+            "reward_prepared": reward_prepared,
+            "reward_before_loss_graph": reward_before_loss_graph,
+            "selected_probe_indices": selected_probe_indices,
+            "feature_probe_num_graphs": int(feature_batch.num_graphs),
         }
 
     def sample(self, batch: Batch | Data) -> TimeSamplerOutput:
@@ -1321,29 +1414,34 @@ class AdaptiveReinforcePaperTimeSampler:
         assert self.policy is not None
         assert self.policy_optimizer is not None
 
-        prepared_batches = self._probe_cache["prepared"]
-        before_loss_graph = self._probe_cache["before_loss_graph"]
-        selected_probe_indices = self._probe_cache["selected_probe_indices"].to(
-            device=before_loss_graph.device
-        )
-        feature_graph_index = self._probe_cache["feature_graph_index"]
-        after_loss_graph = []
+        feature_prepared = self._probe_cache["feature_prepared"]
+        feature_before_loss_graph = self._probe_cache["feature_before_loss_graph"]
+        reward_prepared = self._probe_cache["reward_prepared"]
+        reward_before_loss_graph = self._probe_cache["reward_before_loss_graph"]
+        feature_after_loss_graph = []
+        reward_after_loss_graph = []
 
         with torch.no_grad():
-            for prepared in prepared_batches:
+            for prepared in feature_prepared:
                 _loss, probe_metrics = model.loss_from_prepared(prepared)
-                after_loss_graph.append(probe_metrics["loss_graph"])
+                feature_after_loss_graph.append(probe_metrics["loss_graph"])
+            for prepared in reward_prepared:
+                _loss, probe_metrics = model.loss_from_prepared(prepared)
+                reward_after_loss_graph.append(probe_metrics["loss_graph"])
 
-        after_loss_graph_t = torch.stack(after_loss_graph, dim=1)
-        delta = before_loss_graph - after_loss_graph_t
+        feature_after_loss_graph_t = torch.stack(feature_after_loss_graph, dim=1)
+        reward_after_loss_graph_t = torch.stack(reward_after_loss_graph, dim=1)
+        feature_delta = feature_before_loss_graph - feature_after_loss_graph_t
+        reward_delta = reward_before_loss_graph - reward_after_loss_graph_t
 
-        selected_delta = delta[:, selected_probe_indices]
-        reward_values = selected_delta.sum(dim=1)
+        reward_values = reward_delta.mean(dim=1)
         reward_mean = float(reward_values.mean().item())
         reward_std = float(reward_values.std(unbiased=False).item())
 
-        reinforce_reward = reward_values.detach() + self.entropy_coef * sampled_time.entropies
+        reinforce_reward = reward_values.detach()
         policy_loss = -(sampled_time.log_probs * reinforce_reward).mean()
+        if self.entropy_coef > 0.0:
+            policy_loss = policy_loss - self.entropy_coef * sampled_time.entropies.mean()
 
         self.policy_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()
@@ -1351,12 +1449,9 @@ class AdaptiveReinforcePaperTimeSampler:
             nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.gradient_clip_norm)
         self.policy_optimizer.step()
 
-        if feature_graph_index is None:
-            delta_vector = delta.mean(dim=0)
-        else:
-            delta_vector = delta[int(feature_graph_index)]
-        delta_sum = delta_vector.sum()
-        self._append_feature_history(delta_vector, delta_sum)
+        delta_vector = feature_delta.mean(dim=0)
+        delta_mean = delta_vector.mean()
+        self._append_feature_history(delta_vector, delta_mean)
         self.selected_probe_indices = self._select_probe_indices()
 
         self.last_reward_mean = reward_mean
@@ -1372,6 +1467,7 @@ class AdaptiveReinforcePaperTimeSampler:
             "feature_history": self._feature_history,
             "target_history": self._target_history,
             "feature_dim": self._feature_dim,
+            "generator_states": _generator_states(self._generators),
         }
         if self.policy is not None and self.policy_optimizer is not None:
             state["policy_state_dict"] = self.policy.state_dict()
@@ -1383,6 +1479,7 @@ class AdaptiveReinforcePaperTimeSampler:
             return
 
         self.num_model_steps = int(state_dict.get("num_model_steps", 0))
+        _load_generator_states(self._generators, state_dict.get("generator_states"))
         selected_probe_indices = state_dict.get("selected_probe_indices")
         if selected_probe_indices is not None:
             self.selected_probe_indices = selected_probe_indices.to(dtype=torch.long, device="cpu")
@@ -1430,4 +1527,5 @@ class AdaptiveReinforcePaperTimeSampler:
             "time_sampler/policy_selected_t_min": float(selected_times.min().item()),
             "time_sampler/policy_selected_t_max": float(selected_times.max().item()),
             "time_sampler/feature_queue_size": float(len(self._feature_history)),
+            "time_sampler/feature_probe_graphs": float(self.last_feature_probe_num_graphs),
         }

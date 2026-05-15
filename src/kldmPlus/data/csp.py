@@ -270,6 +270,11 @@ class CSPTask:
             atomic_numbers:
                 atom types
 
+            space_group:
+                integer space-group label carried alongside the graph for
+                sampling-time constraints; KLDM itself still conditions only on
+                composition `atomic_numbers`
+
             edge_node_index:
                 fully connected graph edges
 
@@ -333,6 +338,11 @@ class CSPTask:
 
             batch.atomic_numbers:
                 CSP conditioning composition.
+
+            batch.space_group:
+                Integer space-group labels available for external sampling-time
+                constraints. The KLDM model does not consume this field unless
+                a future sampler explicitly uses it.
 
             batch.edge_node_index:
                 Fully connected graph edges.

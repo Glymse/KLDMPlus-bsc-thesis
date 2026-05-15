@@ -13,17 +13,21 @@ dataset:
 time_sampler:
   type: loss_second_moment
   n_bins: 64
-  history_per_bin: 30
-  alpha: 0.2
-  adaptive_power: 0.6
-  min_prob: 0.01
-  max_prob: 0.03
+  history_per_bin: 50
+
+  alpha: 0.15
+  adaptive_power: 0.55
+
+  min_prob: 0.008
+  max_prob: 0.038
+
   velocity_weight: 0.7
   lattice_weight: 0.3
+
   use_importance_weights: true
   clip_importance_weights: true
   weight_clip_min: 0.33
-  weight_clip_max: 2.0
+  weight_clip_max: 2.5
 
 model:
   eps: 1.0e-6

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import random
 from typing import Any, Mapping
 
+import numpy as np
 import torch
 
 from kldmPlus.kldm import ModelKLDM
@@ -130,6 +132,18 @@ def load_checkpoint(
     if ema is not None and checkpoint.get("ema_state_dict") is not None:
         ema.load_state_dict(checkpoint["ema_state_dict"], strict=False)
 
+    rng_state = checkpoint.get("rng_state")
+    if isinstance(rng_state, dict):
+        if rng_state.get("python") is not None:
+            random.setstate(rng_state["python"])
+        if rng_state.get("numpy") is not None:
+            np.random.set_state(rng_state["numpy"])
+        if rng_state.get("torch") is not None:
+            torch.random.set_rng_state(rng_state["torch"].detach().cpu())
+        cuda_state = rng_state.get("cuda")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([state.detach().cpu() for state in cuda_state])
+
     return checkpoint
 
 
@@ -152,6 +166,12 @@ def save_checkpoint(
             "ema_state_dict": None if ema is None else ema.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "time_sampler_state_dict": None if time_sampler is None else time_sampler.state_dict(),
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.random.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
             "config": config,
             "metrics": metrics,
         },

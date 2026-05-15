@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 from pathlib import Path
+import pickle
 import random
 import sys
 import tempfile
+import time
 from typing import Any
 
 if __package__ in {None, ""}:
@@ -86,11 +90,14 @@ class SamplingRunner:
         self.experiment_name = str(self.config["experiment_name"])
         self.sampling_cfg = dict(self.config["sampling"])
         self.eval_cfg = dict(self.config["sampling_eval"])
+        self.validity_cutoff = float(self.eval_cfg.get("validity_cutoff", 0.5))
         self.evaluation = bool(self.eval_cfg["evaluation"])
         self.sample_count = int(self.sampling_cfg["n_samples"])
         self.device = get_default_device()
         self.checkpoint_path = self._checkpoint_path(self.sampling_cfg["checkpoint_path"])
         self.loader, self.lattice_transform = self._build_loader()
+        self.template_prior = None
+        self._template_prior_initialized = False
         self._inject_mattergen_lattice_stats()
         self.model = build_model(config=self.config, device=self.device)
         load_checkpoint(
@@ -161,19 +168,224 @@ class SamplingRunner:
         self.config["model"]["mattergen_lattice_c"] = float(c)
         self.config["model"]["mattergen_lattice_nu"] = float(nu)
 
-    # Samples one batch with either EM or PC, depending on the config.
+    def _ensure_template_prior(self):
+        if not self._template_prior_initialized:
+            self.template_prior = self._build_template_prior()
+            self._template_prior_initialized = True
+        return self.template_prior
+
+    def _build_template_prior(self):
+        from kldmPlus.data import CSPTask, resolve_data_root
+        from kldmPlus.symmetry import build_dataset_template_prior
+        from kldmPlus.symmetry.template_prior import _anonymous_count_key
+        from kldmPlus.symmetry.wyckoff_templates import requested_composition_key
+
+        sampling_algorithm = int(self.sampling_cfg.get("sampling_algorithm", 4 if str(self.sampling_cfg["method"]) == "pc" else 3))
+        if sampling_algorithm not in {6, 7}:
+            return None
+        prior_cfg = dict(self.sampling_cfg.get("pcs" if sampling_algorithm == 6 else "sgdpnp", {}))
+        if not bool(prior_cfg.get("template_prior_enabled", True)):
+            return None
+        if float(prior_cfg.get("template_prior_weight", 1.0)) <= 0.0:
+            return None
+
+        dataset_cfg = dict(self.config["dataset"])
+        model_cfg = dict(self.config["model"])
+        root = resolve_data_root(dataset_cfg["root"])
+        task = CSPTask(
+            dataset_name=str(dataset_cfg["name"]),
+            lattice_parameterization=str(model_cfg["lattice_parameterization"]),
+            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
+        )
+        train_dataset = task.fit_dataset(root=root, split="train", download=True)
+        max_samples = int(prior_cfg.get("template_prior_max_samples", 2000))
+        if max_samples <= 0:
+            return None
+        match_targets_only = bool(prior_cfg.get("template_prior_match_targets_only", True))
+        allowed_keys = None
+        if match_targets_only:
+            allowed_keys = {
+                requested_composition_key(
+                    space_group_number=int(torch.as_tensor(sample.space_group).reshape(-1)[0].item()),
+                    atomic_numbers=sample.atomic_numbers,
+                )
+                for sample in self.loader.dataset
+            }
+        cache_path = None
+        if bool(prior_cfg.get("template_prior_cache", True)):
+            cache_dir = Path.cwd() / ".cache" / "kldmPlus" / "template_prior"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "dataset": str(dataset_cfg["name"]),
+                "lattice_representation": str(dataset_cfg.get("lattice_representation", "kldm")),
+                "lattice_parameterization": str(model_cfg["lattice_parameterization"]),
+                "max_samples": int(max_samples),
+                "allowed_keys": sorted(map(repr, allowed_keys or [])),
+            }
+            cache_hash = hashlib.sha1(repr(cache_payload).encode("utf-8")).hexdigest()[:16]
+            cache_path = cache_dir / f"{cache_hash}.pkl"
+            if cache_path.exists():
+                with cache_path.open("rb") as handle:
+                    prior = pickle.load(handle)
+                print(
+                    f"template_prior_cache_hit path={cache_path} records={len(prior)}",
+                    flush=True,
+                )
+                return prior
+        allowed_render = 0 if allowed_keys is None else len(allowed_keys)
+        anonymous_render = 0 if allowed_keys is None else len({_anonymous_count_key(key) for key in allowed_keys})
+        print(
+            f"template_prior_build start max_samples={max_samples} "
+            f"match_targets_only={int(match_targets_only)} allowed_keys={allowed_render} "
+            f"allowed_anonymous_keys={anonymous_render}",
+            flush=True,
+        )
+        started_at = time.perf_counter()
+        prior = build_dataset_template_prior(
+            dataset=train_dataset,
+            lattice_transform=self.lattice_transform,
+            max_samples=max_samples,
+            allowed_keys=allowed_keys,
+        )
+        elapsed_s = time.perf_counter() - started_at
+        print(
+            f"template_prior_build done records={len(prior)} elapsed_s={elapsed_s:.1f}",
+            flush=True,
+        )
+        if cache_path is not None:
+            with cache_path.open("wb") as handle:
+                pickle.dump(prior, handle)
+            print(f"template_prior_cache_write path={cache_path}", flush=True)
+        return prior
+
+    # Samples one batch with the configured KLDM sampler.
     def _sample_batch(self, batch):
         method = str(self.sampling_cfg["method"])
-        sample_fn = self.model.sample_CSP_algorithm4 if method == "pc" else self.model.sample_CSP_algorithm3
+        sampling_algorithm = int(self.sampling_cfg.get("sampling_algorithm", 4 if method == "pc" else 3))
         kwargs = {
             "n_steps": int(self.sampling_cfg["n_steps"]),
             "batch": batch,
             "t_start": float(self.sampling_cfg["t_start"]),
             "t_final": float(self.sampling_cfg["t_final"]),
         }
-        if method == "pc":
+        if sampling_algorithm == 7:
+            if method != "em":
+                raise ValueError(
+                    "sampling_algorithm=7 currently extends the EM sampler, so sampling.method must be 'em'.",
+                )
+            kwargs["lattice_transform"] = self.lattice_transform
+            kwargs["sgdpnp_config"] = dict(self.sampling_cfg.get("sgdpnp", {}))
+            kwargs["template_prior"] = self._ensure_template_prior()
+            sample_fn = self.model.sample_CSP_algorithm7
+        elif sampling_algorithm == 6:
+            if method != "em":
+                raise ValueError(
+                    "sampling_algorithm=6 currently extends the EM sampler, so sampling.method must be 'em'.",
+                )
+            pcs_cfg = dict(self.sampling_cfg.get("pcs", {}))
+            kwargs["lattice_transform"] = self.lattice_transform
+            kwargs["pcs_standardization"] = str(pcs_cfg.get("standardization", "conventional"))
+            kwargs["pcs_symprec"] = float(pcs_cfg.get("symprec", 1e-2))
+            kwargs["pcs_angle_tolerance"] = float(pcs_cfg.get("angle_tolerance", 5.0))
+            kwargs["pcs_max_templates"] = int(pcs_cfg.get("max_templates", 256))
+            kwargs["pcs_template_eval_limit"] = int(pcs_cfg.get("template_eval_limit", 32))
+            kwargs["pcs_optimization_steps"] = int(pcs_cfg.get("optimization_steps", 150))
+            kwargs["pcs_learning_rate"] = float(pcs_cfg.get("learning_rate", 5e-2))
+            kwargs["pcs_coord_weight"] = float(pcs_cfg.get("coord_weight", 1.0))
+            kwargs["pcs_lattice_weight"] = float(pcs_cfg.get("lattice_weight", 0.25))
+            kwargs["pcs_pairdist_weight"] = float(pcs_cfg.get("pairdist_weight", 0.0))
+            kwargs["pcs_template_init_pairdist_weight"] = (
+                None
+                if "template_init_pairdist_weight" not in pcs_cfg
+                else float(pcs_cfg["template_init_pairdist_weight"])
+            )
+            kwargs["pcs_pairdist_bins"] = int(pcs_cfg.get("pairdist_bins", 32))
+            kwargs["pcs_pairdist_max_distance"] = float(pcs_cfg.get("pairdist_max_distance", 8.0))
+            kwargs["pcs_pairdist_bandwidth"] = float(pcs_cfg.get("pairdist_bandwidth", 0.25))
+            kwargs["pcs_steric_weight"] = float(pcs_cfg.get("steric_weight", 0.0))
+            kwargs["pcs_steric_min_distance"] = float(pcs_cfg.get("steric_min_distance", 0.8))
+            kwargs["pcs_volume_weight"] = float(pcs_cfg.get("volume_weight", 0.0))
+            kwargs["pcs_volume_ratio_min"] = float(pcs_cfg.get("volume_ratio_min", 0.0))
+            kwargs["pcs_volume_ratio_max"] = float(pcs_cfg.get("volume_ratio_max", 0.0))
+            kwargs["pcs_k6_weight"] = float(pcs_cfg.get("k6_weight", 0.0))
+            kwargs["pcs_hard_min_distance"] = float(pcs_cfg.get("hard_min_distance", 0.0))
+            kwargs["pcs_hard_volume_ratio_min"] = float(pcs_cfg.get("hard_volume_ratio_min", 0.0))
+            kwargs["pcs_hard_volume_ratio_max"] = float(pcs_cfg.get("hard_volume_ratio_max", 0.0))
+            kwargs["pcs_freeze_lattice"] = bool(pcs_cfg.get("freeze_lattice", False))
+            kwargs["pcs_initialization"] = str(pcs_cfg.get("initialization", "repair"))
+            kwargs["pcs_quick_templates"] = bool(pcs_cfg.get("quick_templates", False))
+            kwargs["pcs_top_k_templates"] = int(pcs_cfg.get("top_k_templates", 1))
+            kwargs["pcs_mala_steps"] = int(pcs_cfg.get("mala_steps", 8))
+            kwargs["pcs_mala_step_size"] = float(pcs_cfg.get("mala_step_size", 5e-2))
+            kwargs["pcs_debug_template_candidates"] = bool(pcs_cfg.get("debug_template_candidates", False))
+            if "pcs_debug_high_prior_templates" in inspect.signature(
+                self.model.sample_CSP_algorithm6
+            ).parameters:
+                kwargs["pcs_debug_high_prior_templates"] = bool(
+                    pcs_cfg.get("debug_high_prior_templates", False)
+                )
+                kwargs["pcs_debug_high_prior_min_score"] = int(
+                    pcs_cfg.get("debug_high_prior_min_score", 1)
+                )
+            if "pcs_allow_soft_physics_fallback" in inspect.signature(
+                self.model.sample_CSP_algorithm6
+            ).parameters:
+                kwargs["pcs_allow_soft_physics_fallback"] = bool(
+                    pcs_cfg.get("allow_soft_physics_fallback", True)
+                )
+            if "pcs_branch_selection_temperature" in inspect.signature(
+                self.model.sample_CSP_algorithm6
+            ).parameters:
+                kwargs["pcs_branch_selection_temperature"] = float(
+                    pcs_cfg.get("branch_selection_temperature", 1.0)
+                )
+            kwargs["pcs_oracle_template_orbit_rerank"] = bool(
+                pcs_cfg.get("oracle_template_orbit_rerank", False)
+            )
+            kwargs["pcs_oracle_template_fit_target"] = bool(
+                pcs_cfg.get("oracle_template_fit_target", False)
+            )
+            kwargs["pcs_dds_repair"] = bool(pcs_cfg.get("dds_repair", True))
+            kwargs["pcs_dds_n_steps"] = int(pcs_cfg.get("dds_n_steps", 60))
+            kwargs["pcs_dds_t_final"] = float(pcs_cfg.get("dds_t_final", kwargs["t_final"]))
+            kwargs["pcs_outer_steps"] = int(pcs_cfg.get("outer_steps", 1))
+            kwargs["pcs_outer_eta_start"] = float(pcs_cfg.get("outer_eta_start", pcs_cfg.get("dds_t_start", 0.2)))
+            kwargs["pcs_outer_eta_end"] = float(pcs_cfg.get("outer_eta_end", pcs_cfg.get("dds_t_start", 0.2)))
+            kwargs["pcs_outer_eta_k_start"] = int(pcs_cfg.get("outer_eta_k_start", 0))
+            kwargs["pcs_outer_eta_rho"] = float(pcs_cfg.get("outer_eta_rho", 1.0))
+            kwargs["pcs_final_projection"] = bool(pcs_cfg.get("final_projection", True))
+            kwargs["pcs_validate_requested_space_group"] = bool(pcs_cfg.get("validate_requested_space_group", True))
+            kwargs["pcs_return_last_pcs_on_validation_failure"] = bool(
+                pcs_cfg.get("return_last_pcs_on_validation_failure", False)
+            )
+            kwargs["pcs_template_prior"] = self._ensure_template_prior()
+            kwargs["pcs_template_prior_weight"] = float(pcs_cfg.get("template_prior_weight", 1.0))
+            sample_fn = self.model.sample_CSP_algorithm6
+        elif sampling_algorithm == 5:
+            if method != "em":
+                raise ValueError(
+                    "sampling_algorithm=5 currently extends the EM sampler, so sampling.method must be 'em'.",
+                )
+            guidance_cfg = dict(self.sampling_cfg.get("symmetry_guidance", {}))
+            kwargs["lattice_transform"] = self.lattice_transform
+            kwargs["coord_scale"] = float(guidance_cfg.get("coord_scale", 2e-3))
+            kwargs["lattice_scale"] = float(guidance_cfg.get("lattice_scale", 1e-5))
+            kwargs["guidance_interval"] = int(guidance_cfg.get("guidance_interval", 5))
+            kwargs["guidance_start_fraction"] = float(guidance_cfg.get("guidance_start_fraction", 0.5))
+            kwargs["coord_grad_clip"] = guidance_cfg.get("coord_grad_clip", 5.0)
+            kwargs["lattice_grad_clip"] = guidance_cfg.get("lattice_grad_clip", 0.5)
+            kwargs["coord_max_step"] = guidance_cfg.get("coord_max_step", 2e-2)
+            kwargs["lattice_max_step"] = guidance_cfg.get("lattice_max_step", 2e-3)
+            sample_fn = self.model.sample_CSP_algorithm5
+        elif sampling_algorithm == 4:
             kwargs["tau"] = float(self.sampling_cfg["tau"])
             kwargs["n_correction_steps"] = int(self.sampling_cfg["n_correction_steps"])
+            sample_fn = self.model.sample_CSP_algorithm4
+        elif sampling_algorithm == 3:
+            sample_fn = self.model.sample_CSP_algorithm3
+        else:
+            raise ValueError(f"Unsupported sampling_algorithm={sampling_algorithm}.")
+
         return sample_fn(**kwargs)
 
     # Renders a predicted/actual structure pair to a small side-by-side PNG.
@@ -207,9 +419,20 @@ class SamplingRunner:
         from kldmPlus.sample_evaluation import evaluate_csp_reconstruction
 
         self.model.eval()
+        started_at = time.perf_counter()
         if seed is not None:
             _set_seed(seed)
-            print(f"eval_seed={seed} sampling_pass_start samples_per_target={samples_per_target}", flush=True)
+            print(
+                f"eval_seed={seed} sampling_pass_start samples_per_target={samples_per_target}",
+                flush=True,
+            )
+        else:
+            total_batches = len(self.loader)
+            print(
+                f"sampling_progress phase=start total_batches={total_batches} "
+                f"samples_per_target={samples_per_target}",
+                flush=True,
+            )
 
         results: list[list[Any]] = []
         total_batches = len(self.loader)
@@ -218,14 +441,22 @@ class SamplingRunner:
             per_graph = [[] for _ in range(batch.num_graphs)]
 
             if seed is not None:
+                elapsed_s = time.perf_counter() - started_at
                 print(
-                    f"eval_seed={seed} batch={batch_idx}/{total_batches} graphs_in_batch={batch.num_graphs}",
+                    f"eval_seed={seed} batch={batch_idx}/{total_batches} "
+                    f"graphs_in_batch={batch.num_graphs} elapsed_s={elapsed_s:.1f}",
+                    flush=True,
+                )
+            else:
+                elapsed_s = time.perf_counter() - started_at
+                print(
+                    f"sampling_progress phase=batch batch={batch_idx}/{total_batches} "
+                    f"graphs_in_batch={batch.num_graphs} elapsed_s={elapsed_s:.1f}",
                     flush=True,
                 )
 
             for _ in range(samples_per_target):
-                with torch.no_grad():
-                    pos_t, _v_t, l_t, h_t = self._sample_batch(batch)
+                pos_t, _v_t, l_t, h_t = self._sample_batch(batch)
 
                 ptr = batch.ptr.tolist()
                 for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr[:-1], ptr[1:])):
@@ -238,13 +469,25 @@ class SamplingRunner:
                             target_l=batch.l[graph_idx],
                             target_a=batch.atomic_numbers[start_idx:end_idx],
                             lattice_transform=self.lattice_transform,
+                            requested_space_group=int(torch.as_tensor(batch.space_group).reshape(-1)[graph_idx].item()),
+                            validity_cutoff=self.validity_cutoff,
                         )
                     )
 
             results.extend(per_graph)
 
+        total_elapsed_s = time.perf_counter() - started_at
         if seed is not None:
-            print(f"eval_seed={seed} sampling_pass_done targets={len(results)}", flush=True)
+            print(
+                f"eval_seed={seed} sampling_pass_done targets={len(results)} "
+                f"elapsed_s={total_elapsed_s:.1f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"sampling_progress phase=done targets={len(results)} elapsed_s={total_elapsed_s:.1f}",
+                flush=True,
+            )
         return results
 
     # Runs repeated single-sample passes and aggregates them into @1/@20 summaries.
@@ -262,7 +505,9 @@ class SamplingRunner:
                 f"evaluation_seed_summary seed={seed} "
                 f"valid={format_metric(summary['valid'], '.4f')} "
                 f"match_rate={format_metric(summary['match_rate'], '.4f')} "
-                f"rmse={format_metric(summary['rmse'], '.6f')}",
+                f"rmse={format_metric(summary['rmse'], '.6f')} "
+                f"composition_match_rate={format_metric(summary.get('composition_match_rate'), '.4f')} "
+                f"requested_sg_match_rate={format_metric(summary.get('requested_space_group_match_rate'), '.4f')}",
                 flush=True,
             )
             pass_summaries.append(summary)
@@ -405,7 +650,9 @@ class SamplingRunner:
                 print(
                     f"samples valid={format_metric(recon['valid'], '.4f')} "
                     f"match_rate={format_metric(recon['match_rate'], '.4f')} "
-                    f"rmse={format_metric(recon['rmse'], '.6f')}",
+                    f"rmse={format_metric(recon['rmse'], '.6f')} "
+                    f"composition_match_rate={format_metric(recon.get('composition_match_rate'), '.4f')} "
+                    f"requested_sg_match_rate={format_metric(recon.get('requested_space_group_match_rate'), '.4f')}",
                     flush=True,
                 )
             else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +14,20 @@ except ImportError:  # pragma: no cover
     Batch = Any
 
 try:
+    import numpy as np
+    import torch
     from mattergen.common.data.chemgraph import ChemGraph
     from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
     from mattergen.common.data.transform import Transform
-except ImportError:  # pragma: no cover
+    MATTERGEN_AVAILABLE = True
+    MATTERGEN_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:  # pragma: no cover
     ChemGraph = Any
     CrystalDataset = Any
     CrystalDatasetBuilder = Any
     DatasetTransform = Any
+    MATTERGEN_AVAILABLE = False
+    MATTERGEN_IMPORT_ERROR = exc
 
     class Transform:  # type: ignore[override]
         pass
@@ -30,6 +37,8 @@ except ImportError:  # pragma: no cover
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_ROOT = WORKSPACE_ROOT / "data"
+SPACE_GROUP_PROPERTY = "space_group"
+SPACE_GROUP_COLUMN = "spacegroup.number"
 
 
 def resolve_data_root(root: str | Path | None = None) -> Path:
@@ -63,12 +72,18 @@ class CrystalDatasetWrapper(Dataset):
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be one of 'train', 'val', or 'test'")
+        if not MATTERGEN_AVAILABLE:
+            message = "kldmPlus.data.dataset requires mattergen to be importable."
+            if MATTERGEN_IMPORT_ERROR is not None:
+                message = f"{message} Underlying import error: {type(MATTERGEN_IMPORT_ERROR).__name__}: {MATTERGEN_IMPORT_ERROR}"
+            raise ImportError(message)
 
         # Store configuration.
         self.root = Path(root).expanduser()
         self.split = split
         self.transforms = transforms or []
         self.dataset_transforms = dataset_transforms or []
+        self._space_group_map: dict[str, int] | None = None
 
         #Download raw CSV only when explicitly requested.
         if download:
@@ -97,10 +112,41 @@ class CrystalDatasetWrapper(Dataset):
         #Processed cache path for the selected split.
         return self.processed_folder / self.split
 
+    @property
+    def required_properties(self) -> list[str]:
+        return [SPACE_GROUP_PROPERTY]
+
     @staticmethod
     def collate_fn(samples: list[ChemGraph]) -> Batch:
         #Convert a list of ChemGraph samples into one PyG Batch.
         return Batch.from_data_list(samples)
+
+    def _load_space_group_map(self) -> dict[str, int]:
+        mapping: dict[str, int] = {}
+        with self.raw_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                material_id = str(row["material_id"])
+                value = row.get(SPACE_GROUP_COLUMN)
+                if value is None or value == "":
+                    continue
+                mapping[material_id] = int(float(value))
+        return mapping
+
+    def _ensure_required_properties(self, builder: CrystalDatasetBuilder) -> None:
+        available = set(builder.list_available_properties())
+        if SPACE_GROUP_PROPERTY in available:
+            return
+
+        if not self.raw_csv.exists():
+            raise RuntimeError(
+                f"Raw split not found at {self.raw_csv}. Cannot backfill {SPACE_GROUP_PROPERTY!r}."
+            )
+
+        builder.add_property_to_cache(
+            SPACE_GROUP_PROPERTY,
+            data=self._load_space_group_map(),
+        )
 
     def _build(self) -> CrystalDataset:
         """Load processed cache or build it from raw CSV.
@@ -114,6 +160,7 @@ class CrystalDatasetWrapper(Dataset):
                 cache_path=str(self.processed_split_folder),
                 transforms=self.transforms,
             )
+            self._ensure_required_properties(builder)
         else:
             # Slow path: parse raw CSV and create processed cache.
             if not self.raw_csv.exists():
@@ -135,11 +182,25 @@ class CrystalDatasetWrapper(Dataset):
                 cache_path=str(self.processed_split_folder),
                 transforms=self.transforms,
             )
+            self._ensure_required_properties(builder)
 
         return builder.build(
             dataset_class=CrystalDataset,
             dataset_transforms=self.dataset_transforms,
         )
+
+    def _space_group_for_structure_id(self, structure_id: str) -> int:
+        if self._space_group_map is None:
+            if not self.raw_csv.exists():
+                raise RuntimeError(
+                    f"Raw split not found at {self.raw_csv}. Cannot attach {SPACE_GROUP_PROPERTY!r}."
+                )
+            self._space_group_map = self._load_space_group_map()
+
+        try:
+            return int(self._space_group_map[structure_id])
+        except KeyError as exc:
+            raise KeyError(f"Missing {SPACE_GROUP_PROPERTY!r} for structure_id={structure_id!r}.") from exc
 
     def download(self) -> None:
         """
@@ -186,7 +247,13 @@ class CrystalDatasetWrapper(Dataset):
             ChemGraph containing fields such as:
                 pos, cell, atomic_numbers, num_atoms, etc.
         """
-        return self.data[index]
+        sample = self.data[index]
+        structure_id = str(self.data.structure_id[index])
+        space_group = torch.tensor(
+            self._space_group_for_structure_id(structure_id),
+            dtype=torch.long,
+        )
+        return sample.replace(space_group=space_group)
 
     def __len__(self) -> int:
         """Return number of structures in the selected split."""
