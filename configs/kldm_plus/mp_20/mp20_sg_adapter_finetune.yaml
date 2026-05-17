@@ -44,8 +44,8 @@ model:
     num_space_groups: 230
 
 finetune:
-  freeze_base: true
-  train_sg_adapters_only: true
+  freeze_base: false
+  train_sg_adapters_only: false
 
 optimizer:
   lr: 5.0e-6
@@ -74,7 +74,7 @@ validation:
   subset_seed: 123
   sampling_max_graphs: 1024
   sg_conditioned_sampling: true
-  sg_guidance_scale: 1.0
+  sg_guidance_scale: 2.0
   debug_space_group: true
   debug_space_group_max_groups: 32
 

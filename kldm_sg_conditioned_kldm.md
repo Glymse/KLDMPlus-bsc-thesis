@@ -103,12 +103,12 @@ Important settings:
 - `checkpoint.load_optimizer_state: false`
 - `checkpoint.load_ema_state: false`
 - `checkpoint.load_time_sampler_state: false`
-- `finetune.freeze_base: true`
-- `finetune.train_sg_adapters_only: true`
+- `finetune.freeze_base: false`
+- `finetune.train_sg_adapters_only: false`
 - `model.sg_condition_dropout: 0.2`
 - `model.score_network.sg_conditional: true`
 
-The optimizer only sees:
+If you run in adapter-only mode, the optimizer only sees:
 
 - `score_network.sg_embedding.*`
 - `score_network.sg_adapters.*`
@@ -116,6 +116,13 @@ The optimizer only sees:
 
 This filtering is implemented in
 [src/kldmPlus/utils/model_loader.py](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/src/kldmPlus/utils/model_loader.py).
+
+The released MatterGen `space_group` checkpoint config is more aggressive:
+
+- `full_finetuning: true`
+
+so if SG adherence stays flat, the more faithful next step is to unfreeze the
+base model rather than staying in adapter-only mode.
 
 For WandB logging, the training runner already reads:
 
@@ -138,7 +145,7 @@ But the validation loop now also measures the actual SG-conditioned generation
 task directly by sampling with:
 
 - `validation.sg_conditioned_sampling: true`
-- `validation.sg_guidance_scale: 1.0`
+- `validation.sg_guidance_scale: 2.0`
 
 and logging:
 
@@ -158,6 +165,10 @@ For debug runs, the runner also prints per-requested-SG summaries such as:
 
 This makes it possible to see whether the adapter is actually learning the
 space-group task rather than only reducing denoising loss.
+
+Note that `sg_guidance_scale: 1.0` is only conditional sampling, not stronger
+classifier-free guidance. A value greater than `1.0` is needed to mirror the
+MatterGen-style guided sampling behavior used in practice.
 
 ## Sampling path
 
