@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
+import time
 import shutil
 from typing import Any
 
@@ -45,6 +47,9 @@ SPACE_GROUP_PROPERTY = "space_group"
 SPACE_GROUP_COLUMN = "spacegroup.number"
 CACHE_SCHEMA_VERSION = 1
 CACHE_META_FILENAME = "_kldm_cache_meta.json"
+BUILD_LOCK_DIRNAME = ".kldm_build_lock"
+BUILD_LOCK_STALE_SECONDS = 6 * 60 * 60
+BUILD_LOCK_POLL_SECONDS = 5.0
 
 
 def resolve_data_root(root: str | Path | None = None) -> Path:
@@ -121,6 +126,10 @@ class CrystalDatasetWrapper(Dataset):
     @property
     def cache_meta_path(self) -> Path:
         return self.processed_split_folder / CACHE_META_FILENAME
+
+    @property
+    def cache_lock_dir(self) -> Path:
+        return self.processed_folder / f"{self.split}_{BUILD_LOCK_DIRNAME}"
 
     @property
     def required_properties(self) -> list[str]:
@@ -249,6 +258,64 @@ class CrystalDatasetWrapper(Dataset):
         self._write_cache_meta()
         return builder
 
+    def _lock_is_stale(self) -> bool:
+        if not self.cache_lock_dir.exists():
+            return False
+        try:
+            age_seconds = time.time() - self.cache_lock_dir.stat().st_mtime
+        except OSError:
+            return False
+        return age_seconds > BUILD_LOCK_STALE_SECONDS
+
+    def _acquire_build_lock(self) -> bool:
+        self.processed_folder.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                self.cache_lock_dir.mkdir(parents=False, exist_ok=False)
+                marker = self.cache_lock_dir / "owner.txt"
+                marker.write_text(
+                    f"pid={os.getpid()}\ntime={time.time():.0f}\n",
+                    encoding="utf-8",
+                )
+                print(
+                    f"dataset_cache_lock action=acquired dataset={self.dataset_name} split={self.split} "
+                    f"path={self.cache_lock_dir}",
+                    flush=True,
+                )
+                return True
+            except FileExistsError:
+                cache_fresh, cache_reason = self._cache_status()
+                if cache_fresh:
+                    print(
+                        f"dataset_cache_lock action=skip_wait dataset={self.dataset_name} split={self.split} "
+                        f"reason={cache_reason}",
+                        flush=True,
+                    )
+                    return False
+                if self._lock_is_stale():
+                    print(
+                        f"dataset_cache_lock action=remove_stale dataset={self.dataset_name} split={self.split} "
+                        f"path={self.cache_lock_dir}",
+                        flush=True,
+                    )
+                    shutil.rmtree(self.cache_lock_dir, ignore_errors=True)
+                    continue
+                print(
+                    f"dataset_cache_lock action=wait dataset={self.dataset_name} split={self.split} "
+                    f"path={self.cache_lock_dir}",
+                    flush=True,
+                )
+                time.sleep(BUILD_LOCK_POLL_SECONDS)
+
+    def _release_build_lock(self) -> None:
+        if self.cache_lock_dir.exists():
+            shutil.rmtree(self.cache_lock_dir, ignore_errors=True)
+            print(
+                f"dataset_cache_lock action=released dataset={self.dataset_name} split={self.split} "
+                f"path={self.cache_lock_dir}",
+                flush=True,
+            )
+
     def _build(self) -> CrystalDataset:
         """Load processed cache or build it from raw CSV.
 
@@ -267,22 +334,39 @@ class CrystalDatasetWrapper(Dataset):
                 transforms=self.transforms,
             )
         else:
-            print(
-                f"dataset_cache action=stale dataset={self.dataset_name} split={self.split} "
-                f"reason={cache_reason} path={self.processed_split_folder}",
-                flush=True,
-            )
-            # Code segment inspired from mattergen
-            # (mattergen/common/data/dataset.py:528-556,
-            #  mattergen/common/data/dataset.py:354-360).
-            #
-            # Important preprocessing note:
-            # CrystalDatasetBuilder.from_csv(...) already parses CIFs, converts
-            # them to primitive structures, and applies `get_reduced_structure()`
-            # before writing the processed cache. We intentionally rely on that
-            # upstream full-structure reduction here instead of trying to reduce
-            # only the lattice matrix later in a transform.
-            builder = self._rebuild_cache()
+            acquired_lock = self._acquire_build_lock()
+            try:
+                cache_fresh, cache_reason = self._cache_status()
+                if cache_fresh:
+                    print(
+                        f"dataset_cache action=load dataset={self.dataset_name} split={self.split} "
+                        f"reason={cache_reason} path={self.processed_split_folder}",
+                        flush=True,
+                    )
+                    builder = CrystalDatasetBuilder.from_cache_path(
+                        cache_path=str(self.processed_split_folder),
+                        transforms=self.transforms,
+                    )
+                else:
+                    print(
+                        f"dataset_cache action=stale dataset={self.dataset_name} split={self.split} "
+                        f"reason={cache_reason} path={self.processed_split_folder}",
+                        flush=True,
+                    )
+                    # Code segment inspired from mattergen
+                    # (mattergen/common/data/dataset.py:528-556,
+                    #  mattergen/common/data/dataset.py:354-360).
+                    #
+                    # Important preprocessing note:
+                    # CrystalDatasetBuilder.from_csv(...) already parses CIFs, converts
+                    # them to primitive structures, and applies `get_reduced_structure()`
+                    # before writing the processed cache. We intentionally rely on that
+                    # upstream full-structure reduction here instead of trying to reduce
+                    # only the lattice matrix later in a transform.
+                    builder = self._rebuild_cache()
+            finally:
+                if acquired_lock:
+                    self._release_build_lock()
 
         return builder.build(
             dataset_class=CrystalDataset,
