@@ -84,7 +84,7 @@ validation:
   sampling_max_graphs: 1024
 
 checkpoint:
-  resume_from: ../../../artifacts/HPC/checkpoints/epoch_8900.pt
+  resume_from: "https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/mp20_lattice_eps_em/artifacts/model/mp20_lattice_eps_em_validation/v91/files/epoch_8900.pt"
   load_optimizer_state: false
   load_ema_state: false
   load_time_sampler_state: false
