@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -22,7 +23,13 @@ from kldmPlus.symmetry.k_basis import (
     k_to_free_vars,
     space_group_k_constraint,
 )
-from kldmPlus.symmetry.pcs_projection import validate_requested_space_group
+from kldmPlus.symmetry.frame_bridge import standardize_structure
+from kldmPlus.symmetry.pcs_projection import (
+    _species_orbit_mismatch_count,
+    _structure_species_orbit_signature_with_source,
+    _template_species_orbit_signature,
+    validate_requested_space_group,
+)
 from kldmPlus.symmetry.template_cache import get_cache_entry, load_template_cache
 from kldmPlus.symmetry.template_prior import TemplatePrior, template_prior_score
 from kldmPlus.symmetry.template_ranker import load_template_ranker, score_templates
@@ -70,7 +77,13 @@ class SGDPnPConfig:
     template_ranker_path: str | None = None
     template_ranker_weight: float = 0.0
     template_cache_path: str | None = None
-    template_cache_required: bool = True
+    template_cache_required: bool = False
+    beam_size: int = 8
+    beam_candidate_limit: int = 128
+    beam_score_restarts: int = 1
+    beam_quick_energy_weight: float = 1.0
+    oracle_template_orbit_rerank: bool = False
+    oracle_template_orbit_filter: bool = False
     dds_steps: int = 30
     dds_t_final: float = 5.0e-4
     symprec: float = 1.0e-2
@@ -102,6 +115,15 @@ class _Branch:
     reason: str
     ranker_score: float = 0.0
     final_energy: float | None = None
+
+
+@dataclass(frozen=True)
+class _BeamEntry:
+    template: WyckoffTemplate
+    prior_count: int
+    ranker_score: float
+    quick_energy: float
+    beam_score: float
 
 
 _TEMPLATE_CACHE: dict[tuple[int, tuple[int, ...], int, int, int, bool], list[WyckoffTemplate]] = {}
@@ -193,6 +215,13 @@ def _cached_templates(
     )
     cached = _TEMPLATE_CACHE.get(key)
     if cached is None:
+        if template_cache is not None:
+            print(
+                "kldm_dpnp_sg_template_cache_miss "
+                f"sg={int(space_group_number)} composition={list(atomic_key)} "
+                "fallback=live_enumeration",
+                flush=True,
+            )
         cached = extract_wyckoff_templates(
             space_group_number=int(space_group_number),
             atomic_numbers=list(atomic_key),
@@ -758,6 +787,8 @@ def _rank_templates(
     template_prior: TemplatePrior | None,
     template_ranker: torch.nn.Module | None = None,
     device: torch.device | None = None,
+    oracle_target_signature: tuple[tuple[int, str], ...] = (),
+    oracle_rank_first: bool = False,
 ) -> list[tuple[WyckoffTemplate, int, float]]:
     species_order, species_counts = composition_to_species_counts(template_atomic_numbers)
     key = (int(requested_sg), species_order, species_counts)
@@ -767,7 +798,7 @@ def _rank_templates(
         requested_sg=int(requested_sg),
         device=device or template_atomic_numbers.device,
     )
-    ranked: list[tuple[WyckoffTemplate, int, float, int]] = []
+    ranked: list[tuple[WyckoffTemplate, int, float, int, int]] = []
     for original_rank, template in enumerate(templates, start=1):
         count = template_prior_score(
             prior=template_prior,
@@ -775,10 +806,15 @@ def _rank_templates(
             signature=flatten_site_signature(template),
         )
         ranker_score = float(ranker_scores[original_rank - 1]) if original_rank - 1 < len(ranker_scores) else 0.0
-        ranked.append((template, int(count), ranker_score, int(original_rank)))
+        orbit_mismatch = _species_orbit_mismatch_count(
+            template_signature=_template_species_orbit_signature(template),
+            target_signature=oracle_target_signature,
+        )
+        ranked.append((template, int(count), ranker_score, int(original_rank), int(orbit_mismatch)))
     ranked.sort(
         key=lambda item: (
-            -float(item[1]),
+            float(item[4]) if bool(oracle_rank_first) else -float(item[1]),
+            -float(item[1]) if bool(oracle_rank_first) else float(item[4]),
             -float(item[2]),
             float(item[0].total_free_dims),
             float(item[0].total_sites),
@@ -786,7 +822,39 @@ def _rank_templates(
             float(item[3]),
         )
     )
-    return [(template, count, ranker_score) for template, count, ranker_score, _rank in ranked]
+    return [(template, count, ranker_score) for template, count, ranker_score, _rank, _mismatch in ranked]
+
+
+def _oracle_target_orbit_signature(
+    *,
+    target_frac: torch.Tensor,
+    target_l: torch.Tensor,
+    target_species: torch.Tensor,
+    lattice_transform: Any,
+    cfg: SGDPnPConfig,
+) -> tuple[tuple[tuple[int, str], ...], str]:
+    structure = _structure_from_tensors(
+        target_frac,
+        target_species,
+        _decode_lattice_matrix(
+            l=target_l,
+            num_atoms=int(target_frac.shape[0]),
+            lattice_transform=lattice_transform,
+        ).to(device=target_frac.device, dtype=target_frac.dtype),
+    )
+    _analyzer, standardized = standardize_structure(
+        structure,
+        standardization="conventional",
+        symprec=float(cfg.symprec),
+        angle_tolerance=float(cfg.angle_tolerance),
+    )
+    del _analyzer
+    signature, source = _structure_species_orbit_signature_with_source(
+        structure=standardized,
+        symprec=float(cfg.symprec),
+        angle_tolerance=float(cfg.angle_tolerance),
+    )
+    return signature, source
 
 def _branch_template_signature(branch: _Branch) -> tuple[tuple[int, str, int, int], ...]:
     """Species-labeled Wyckoff signature used for diversity-aware refinement."""
@@ -806,6 +874,195 @@ def _branch_template_signature(branch: _Branch) -> tuple[tuple[int, str, int, in
 def _branch_signature_labels(branch: _Branch) -> list[str]:
     return [f"{site.atomic_number}@{site.label}" for site in branch.template.site_templates]
 
+
+def _beam_entry_signature_labels(entry: _BeamEntry) -> list[str]:
+    return [f"{site.atomic_number}@{site.label}" for site in entry.template.site_templates]
+
+
+def _build_template_beam(
+    *,
+    graph_idx: int,
+    anchor_frac: torch.Tensor,
+    anchor_l: torch.Tensor,
+    anchor_species: torch.Tensor,
+    requested_sg: int,
+    lattice_transform: Any,
+    eta: float,
+    cfg: SGDPnPConfig,
+    template_prior: TemplatePrior | None = None,
+    template_ranker: torch.nn.Module | None = None,
+    template_cache: dict[str, Any] | None = None,
+    oracle_target_frac: torch.Tensor | None = None,
+    oracle_target_l: torch.Tensor | None = None,
+    oracle_target_species: torch.Tensor | None = None,
+) -> list[_BeamEntry]:
+    anchor_cell = _decode_lattice_matrix(
+        l=anchor_l,
+        num_atoms=int(anchor_frac.shape[0]),
+        lattice_transform=lattice_transform,
+    ).to(device=anchor_frac.device, dtype=anchor_frac.dtype)
+
+    template_atomic_numbers = requested_conventional_atomic_numbers(
+        anchor_species,
+        space_group_number=int(requested_sg),
+    ).to(device=anchor_species.device, dtype=torch.long)
+
+    templates = _cached_templates(
+        space_group_number=int(requested_sg),
+        atomic_numbers=template_atomic_numbers,
+        max_templates=int(cfg.max_templates),
+        num_sites=(cfg.template_num_sites_min, cfg.template_num_sites_max),
+        quick=bool(cfg.quick_templates),
+        template_cache=template_cache,
+        template_cache_required=bool(cfg.template_cache_required),
+    )
+    if not templates:
+        if cfg.debug:
+            print(
+                f"kldm_dpnp_sg_beam graph={graph_idx + 1} status=no_templates",
+                flush=True,
+            )
+        return []
+
+    group_symbol = templates[0].group_symbol if templates else "P"
+    centering_factor = _centering_factor(group_symbol)
+    energy_anchor_frac, energy_anchor_species = _expand_anchor_to_species_multiset(
+        anchor_frac=anchor_frac,
+        anchor_species=anchor_species,
+        target_species=template_atomic_numbers,
+        group_symbol=group_symbol,
+    )
+    energy_anchor_cell = anchor_cell * (float(centering_factor) ** (1.0 / 3.0))
+
+    oracle_target_signature: tuple[tuple[int, str], ...] = ()
+    oracle_signature_source = "disabled"
+    oracle_rank_first = bool(cfg.oracle_template_orbit_rerank or cfg.oracle_template_orbit_filter)
+    if oracle_rank_first and oracle_target_frac is not None and oracle_target_l is not None and oracle_target_species is not None:
+        try:
+            oracle_target_signature, oracle_signature_source = _oracle_target_orbit_signature(
+                target_frac=oracle_target_frac,
+                target_l=oracle_target_l,
+                target_species=oracle_target_species,
+                lattice_transform=lattice_transform,
+                cfg=cfg,
+            )
+        except Exception as exc:
+            oracle_signature_source = f"failed:{type(exc).__name__}"
+
+    ranked_templates = _rank_templates(
+        templates=templates,
+        requested_sg=int(requested_sg),
+        template_atomic_numbers=template_atomic_numbers,
+        template_prior=template_prior,
+        template_ranker=template_ranker,
+        device=anchor_frac.device,
+        oracle_target_signature=oracle_target_signature,
+        oracle_rank_first=oracle_rank_first,
+    )
+
+    candidate_limit = min(len(ranked_templates), max(1, int(cfg.beam_candidate_limit)))
+    ranked_templates = ranked_templates[:candidate_limit]
+
+    if bool(cfg.oracle_template_orbit_filter) and oracle_target_signature and ranked_templates:
+        orbit_mismatches = [
+            _species_orbit_mismatch_count(
+                template_signature=_template_species_orbit_signature(template),
+                target_signature=oracle_target_signature,
+            )
+            for template, _prior_count, _ranker_score in ranked_templates
+        ]
+        best_mismatch = min(orbit_mismatches)
+        ranked_templates = [
+            item
+            for item, mismatch in zip(ranked_templates, orbit_mismatches)
+            if int(mismatch) == int(best_mismatch)
+        ]
+
+    beam_entries: list[_BeamEntry] = []
+    for template, prior_count, ranker_score in ranked_templates:
+        best_quick_energy = float("inf")
+        num_restarts = max(1, int(cfg.beam_score_restarts))
+        for _ in range(num_restarts):
+            branch = _mala_template_branch(
+                template=template,
+                anchor_frac=energy_anchor_frac,
+                anchor_species=energy_anchor_species,
+                anchor_cell=energy_anchor_cell,
+                eta=eta,
+                cfg=cfg,
+                template_prior_count=prior_count,
+                mala_steps_override=0,
+                refine_steps_override=0,
+            )
+            branch = _branch_with_primitive_count(
+                branch,
+                anchor_count=int(anchor_frac.shape[0]),
+                symprec=float(cfg.symprec),
+                angle_tolerance=float(cfg.angle_tolerance),
+            )
+            if branch is None:
+                continue
+            quick_energy = _branch_model_energy(
+                branch=branch,
+                anchor_frac=anchor_frac,
+                anchor_species=anchor_species,
+                anchor_cell=anchor_cell,
+                requested_sg=int(requested_sg),
+                eta=eta,
+                cfg=cfg,
+                template_prior_count=prior_count,
+            )
+            if math.isfinite(float(quick_energy)):
+                best_quick_energy = min(best_quick_energy, float(quick_energy))
+
+        if not math.isfinite(best_quick_energy):
+            continue
+
+        prior_bonus = float(cfg.template_prior_weight) * math.log1p(max(int(prior_count), 0))
+        beam_score = (
+            float(prior_bonus)
+            + float(cfg.template_ranker_weight) * float(ranker_score)
+            - float(cfg.beam_quick_energy_weight) * float(best_quick_energy)
+        )
+        beam_entries.append(
+            _BeamEntry(
+                template=template,
+                prior_count=int(prior_count),
+                ranker_score=float(ranker_score),
+                quick_energy=float(best_quick_energy),
+                beam_score=float(beam_score),
+            )
+        )
+
+    beam_entries.sort(
+        key=lambda item: (
+            -float(item.beam_score),
+            float(item.quick_energy),
+            -float(item.ranker_score),
+            float(item.template.total_free_dims),
+            float(item.template.total_sites),
+            float(item.template.total_atoms),
+        )
+    )
+    beam_entries = beam_entries[: max(1, int(cfg.beam_size))]
+
+    if cfg.debug:
+        print(
+            f"kldm_dpnp_sg_beam graph={graph_idx + 1} templates={len(beam_entries)}/{len(ranked_templates)}/{len(templates)} "
+            f"oracle_source={oracle_signature_source}",
+            flush=True,
+        )
+        for rank, entry in enumerate(beam_entries[: min(8, len(beam_entries))], start=1):
+            print(
+                f"kldm_dpnp_sg_beam_item graph={graph_idx + 1} rank={rank} "
+                f"beam_score={entry.beam_score:.6f} quick_energy={entry.quick_energy:.6f} "
+                f"ranker={entry.ranker_score:.6f} prior={entry.prior_count} "
+                f"signature={_beam_entry_signature_labels(entry)}",
+                flush=True,
+            )
+
+    return beam_entries
+
 def _pcs_graph(
     *,
     graph_idx: int,
@@ -819,6 +1076,10 @@ def _pcs_graph(
     template_prior: TemplatePrior | None = None,
     template_ranker: torch.nn.Module | None = None,
     template_cache: dict[str, Any] | None = None,
+    beam_entries: list[_BeamEntry] | None = None,
+    oracle_target_frac: torch.Tensor | None = None,
+    oracle_target_l: torch.Tensor | None = None,
+    oracle_target_species: torch.Tensor | None = None,
 ) -> _Branch | None:
     anchor_cell = _decode_lattice_matrix(
         l=anchor_l,
@@ -853,14 +1114,53 @@ def _pcs_graph(
 
     energy_anchor_cell = anchor_cell * (float(centering_factor) ** (1.0 / 3.0))
 
-    ranked_templates = _rank_templates(
-        templates=templates,
-        requested_sg=int(requested_sg),
-        template_atomic_numbers=template_atomic_numbers,
-        template_prior=template_prior,
-        template_ranker=template_ranker,
-        device=anchor_frac.device,
-    )[: max(1, int(cfg.template_eval_limit))]
+    oracle_target_signature: tuple[tuple[int, str], ...] = ()
+    oracle_signature_source = "disabled"
+    oracle_rank_first = bool(cfg.oracle_template_orbit_rerank or cfg.oracle_template_orbit_filter)
+    if oracle_rank_first and oracle_target_frac is not None and oracle_target_l is not None and oracle_target_species is not None:
+        try:
+            oracle_target_signature, oracle_signature_source = _oracle_target_orbit_signature(
+                target_frac=oracle_target_frac,
+                target_l=oracle_target_l,
+                target_species=oracle_target_species,
+                lattice_transform=lattice_transform,
+                cfg=cfg,
+            )
+        except Exception as exc:
+            oracle_target_signature = ()
+            oracle_signature_source = f"failed:{type(exc).__name__}"
+
+    if beam_entries is None:
+        ranked_templates = _rank_templates(
+            templates=templates,
+            requested_sg=int(requested_sg),
+            template_atomic_numbers=template_atomic_numbers,
+            template_prior=template_prior,
+            template_ranker=template_ranker,
+            device=anchor_frac.device,
+            oracle_target_signature=oracle_target_signature,
+            oracle_rank_first=oracle_rank_first,
+        )[: max(1, int(cfg.template_eval_limit))]
+
+        if bool(cfg.oracle_template_orbit_filter) and oracle_target_signature and ranked_templates:
+            orbit_mismatches = [
+                _species_orbit_mismatch_count(
+                    template_signature=_template_species_orbit_signature(template),
+                    target_signature=oracle_target_signature,
+                )
+                for template, _prior_count, _ranker_score in ranked_templates
+            ]
+            best_mismatch = min(orbit_mismatches)
+            ranked_templates = [
+                item
+                for item, mismatch in zip(ranked_templates, orbit_mismatches)
+                if int(mismatch) == int(best_mismatch)
+            ]
+    else:
+        ranked_templates = [
+            (entry.template, int(entry.prior_count), float(entry.ranker_score))
+            for entry in beam_entries
+        ]
 
     raw_candidates: list[tuple[_Branch, int]] = []
     rejected = 0
@@ -926,7 +1226,8 @@ def _pcs_graph(
         if cfg.debug:
             print(
                 f"kldm_dpnp_sg_pcs graph={graph_idx + 1} status=no_raw_candidates "
-                f"templates={len(ranked_templates)}/{len(templates)} rejected={rejected}",
+                f"templates={len(ranked_templates)}/{len(templates)} rejected={rejected} "
+                f"oracle_source={oracle_signature_source}",
                 flush=True,
             )
         return None
@@ -1105,6 +1406,13 @@ def _pcs_graph(
         branch.valid = True
 
         if cfg.debug:
+            if oracle_target_signature:
+                signature_labels = [f"{atomic_number}@{label}" for atomic_number, label in oracle_target_signature]
+                print(
+                    f"kldm_dpnp_sg_oracle graph={graph_idx + 1} source={oracle_signature_source} "
+                    f"target_signature={signature_labels}",
+                    flush=True,
+                )
             print(
                 f"kldm_dpnp_sg_pcs graph={graph_idx + 1} status=selected "
                 f"templates={len(ranked_templates)}/{len(templates)} "
@@ -1124,7 +1432,7 @@ def _pcs_graph(
             f"kldm_dpnp_sg_pcs graph={graph_idx + 1} status=no_valid_branch "
             f"templates={len(ranked_templates)}/{len(templates)} "
             f"raw_candidates={len(raw_candidates)} candidates={len(candidates)} "
-            f"rejected={rejected}",
+            f"rejected={rejected} oracle_source={oracle_signature_source}",
             flush=True,
         )
 
@@ -1143,6 +1451,7 @@ def pcs_sample_batch(
     template_prior: TemplatePrior | None = None,
     template_ranker: torch.nn.Module | None = None,
     template_cache: dict[str, Any] | None = None,
+    beam_by_graph: list[list[_BeamEntry]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     ptr = batch.ptr.tolist()
     requested = torch.as_tensor(batch.space_group, device=h_t.device, dtype=torch.long).reshape(-1)
@@ -1163,6 +1472,22 @@ def pcs_sample_batch(
             template_prior=template_prior,
             template_ranker=template_ranker,
             template_cache=template_cache,
+            beam_entries=None if beam_by_graph is None else beam_by_graph[graph_idx],
+            oracle_target_frac=(
+                batch.pos[start:end]
+                if bool(cfg.oracle_template_orbit_rerank or cfg.oracle_template_orbit_filter)
+                else None
+            ),
+            oracle_target_l=(
+                batch.l[graph_idx]
+                if bool(cfg.oracle_template_orbit_rerank or cfg.oracle_template_orbit_filter)
+                else None
+            ),
+            oracle_target_species=(
+                batch.atomic_numbers[start:end]
+                if bool(cfg.oracle_template_orbit_rerank or cfg.oracle_template_orbit_filter)
+                else None
+            ),
         )
         if branch is None:
             pos_blocks.append(pos_t[start:end])
@@ -1251,6 +1576,38 @@ def sample_kldm_dpnp_sg(
         device=pos_t.device,
     )
     template_cache = _maybe_load_disk_template_cache(config.template_cache_path)
+    ptr = batch.ptr.tolist()
+    beam_by_graph: list[list[_BeamEntry]] = []
+    for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
+        beam_entries = _build_template_beam(
+            graph_idx=graph_idx,
+            anchor_frac=pos_t[start:end],
+            anchor_l=l_t[graph_idx],
+            anchor_species=h_t[start:end],
+            requested_sg=int(torch.as_tensor(batch.space_group, device=h_t.device, dtype=torch.long).reshape(-1)[graph_idx].item()),
+            lattice_transform=lattice_transform,
+            eta=float(schedule[0].item()),
+            cfg=config,
+            template_prior=template_prior,
+            template_ranker=template_ranker,
+            template_cache=template_cache,
+            oracle_target_frac=(
+                batch.pos[start:end]
+                if bool(config.oracle_template_orbit_rerank or config.oracle_template_orbit_filter)
+                else None
+            ),
+            oracle_target_l=(
+                batch.l[graph_idx]
+                if bool(config.oracle_template_orbit_rerank or config.oracle_template_orbit_filter)
+                else None
+            ),
+            oracle_target_species=(
+                batch.atomic_numbers[start:end]
+                if bool(config.oracle_template_orbit_rerank or config.oracle_template_orbit_filter)
+                else None
+            ),
+        )
+        beam_by_graph.append(beam_entries)
     pos_current, l_current, h_current = pos_t, l_t, h_t
     last_valid_pcs = (pos_current.clone(), l_current.clone(), h_current.clone())
     last_valid_success = torch.zeros(int(batch.num_graphs), device=pos_t.device, dtype=torch.bool)
@@ -1267,6 +1624,7 @@ def sample_kldm_dpnp_sg(
             template_prior=template_prior,
             template_ranker=template_ranker,
             template_cache=template_cache,
+            beam_by_graph=beam_by_graph,
         )
         last_valid_pcs = _replace_failed_graphs(
             batch=batch,
@@ -1296,6 +1654,7 @@ def sample_kldm_dpnp_sg(
             template_prior=template_prior,
             template_ranker=template_ranker,
             template_cache=template_cache,
+            beam_by_graph=beam_by_graph,
         )
         pcs_elapsed = time.perf_counter() - pcs_started
         last_valid_pcs = _replace_failed_graphs(
@@ -1355,6 +1714,7 @@ def sample_kldm_dpnp_sg(
             template_prior=template_prior,
             template_ranker=template_ranker,
             template_cache=template_cache,
+            beam_by_graph=beam_by_graph,
         )
         pos_out, l_out, h_out = _replace_failed_graphs(
             batch=batch,

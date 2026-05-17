@@ -197,6 +197,77 @@ class ContinuousVPDiffusion(ContinuousDiffusion):
         x_prev = x_prev + torch.sqrt(beta_t * dt_t) * noise
         return x_prev
 
+    @torch.no_grad()
+    def reverse_step_predictor(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+        dt: float,
+        num_atoms: torch.Tensor | None = None,
+        **_,
+    ) -> torch.Tensor:
+        """
+        FacitKLDM-style VP predictor step.
+
+        This is used only for facit ablation samplers, where the continuous
+        lattice branch participates in a predictor/corrector loop instead of
+        the Appendix-H EM-only lattice update.
+        """
+        del num_atoms
+        dt_t = torch.as_tensor(dt, device=x_t.device, dtype=x_t.dtype)
+        alpha_curr = self._match_dims(self.alpha(t), x_t)
+        sigma_curr = self._match_dims(self.sigma(t), x_t)
+        alpha_next = self._match_dims(self.alpha(t - dt_t), x_t)
+        sigma_next = self._match_dims(self.sigma(t - dt_t), x_t)
+
+        if self.parameterization == "eps":
+            score = -pred / sigma_curr.clamp_min(self.eps)
+        else:
+            score = (alpha_curr * pred - x_t) / sigma_curr.pow(2).clamp_min(self.eps)
+
+        alpha_ratio = alpha_next / alpha_curr.clamp_min(self.eps)
+        score_coeff = (alpha_ratio * sigma_curr - sigma_next) * sigma_curr
+        return alpha_ratio * x_t + score_coeff * score
+
+    @torch.no_grad()
+    def reverse_step_corrector(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+        tau: float,
+        index: torch.Tensor | None = None,
+        num_atoms: torch.Tensor | None = None,
+        **_,
+    ) -> torch.Tensor:
+        """
+        FacitKLDM-style VP corrector step.
+        """
+        del num_atoms
+        sigma_t = self._match_dims(self.sigma(t), x_t)
+        if self.parameterization == "eps":
+            score = -pred / sigma_t.clamp_min(self.eps)
+        else:
+            alpha_t = self._match_dims(self.alpha(t), x_t)
+            score = (alpha_t * pred - x_t) / sigma_t.pow(2).clamp_min(self.eps)
+
+        if index is None:
+            denominator = score.square().mean(dim=-1, keepdim=True)
+            delta = tau / denominator.clamp_min(self.eps)
+        else:
+            from torch_scatter import scatter_mean
+
+            denominator = scatter_mean(
+                score.square().mean(dim=-1, keepdim=True),
+                dim=0,
+                index=index,
+            )
+            delta = tau / denominator[index].clamp_min(self.eps)
+
+        eps = torch.randn_like(x_t)
+        return x_t + delta * score + torch.sqrt(2.0 * delta) * eps
+
 
 class ContinuousMattergenVPDiffusion(ContinuousVPDiffusion):
     """MatterGen-specific VP diffusion entrypoint for lattice experiments.

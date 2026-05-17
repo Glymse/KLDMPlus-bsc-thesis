@@ -6,6 +6,7 @@ import inspect
 import pickle
 from pathlib import Path
 import random
+from contextlib import redirect_stderr, redirect_stdout
 import sys
 import time
 from typing import Any
@@ -26,6 +27,20 @@ from kldmPlus.utils.device import get_default_device
 
 
 TEST_SPLIT = "test"
+
+
+class _TeeTextIO:
+    def __init__(self, *streams) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,7 +206,20 @@ class SamplingCompareRunner:
                 prior_cfgs.append(dict(cfg.get("pcs", {})))
             elif algorithm == 7:
                 prior_cfgs.append(dict(cfg.get("sgdpnp", {})))
+            elif algorithm == 8:
+                prior_cfgs.append(dict(cfg.get("dpnpsvd", {})))
         if not prior_cfgs:
+            return None
+        template_prior_modes = {
+            str(cfg.get("template_prior_mode", "dataset")).strip().lower() or "dataset"
+            for cfg in prior_cfgs
+        }
+        if template_prior_modes and template_prior_modes <= {"none", "oracle_surrogate"}:
+            print(
+                "template_prior_build skip "
+                f"modes={sorted(template_prior_modes)} source=non_dataset_prior",
+                flush=True,
+            )
             return None
         if not any(bool(cfg.get("template_prior_enabled", True)) and float(cfg.get("template_prior_weight", 1.0)) > 0.0 for cfg in prior_cfgs):
             return None
@@ -276,7 +304,16 @@ class SamplingCompareRunner:
             "t_final": float(sampler_cfg["t_final"]),
         }
 
-        if sampling_algorithm == 7:
+        if sampling_algorithm == 8:
+            if method != "em":
+                raise ValueError(
+                    "sampling_algorithm=8 currently extends the EM sampler, so sampling.method must be 'em'.",
+                )
+            kwargs["lattice_transform"] = self.lattice_transform
+            kwargs["dpnpsvd_config"] = dict(sampler_cfg.get("dpnpsvd", {}))
+            kwargs["template_prior"] = self._ensure_template_prior()
+            sample_fn = self.model.sample_CSP_algorithm8
+        elif sampling_algorithm == 7:
             if method != "em":
                 raise ValueError(
                     "sampling_algorithm=7 currently extends the EM sampler, so sampling.method must be 'em'.",
@@ -389,9 +426,15 @@ class SamplingCompareRunner:
         elif sampling_algorithm == 4:
             kwargs["tau"] = float(sampler_cfg["tau"])
             kwargs["n_correction_steps"] = int(sampler_cfg["n_correction_steps"])
-            sample_fn = self.model.sample_CSP_algorithm4
+            if method == "facit_pc":
+                sample_fn = self.model.sample_CSP_algorithm4_facit
+            else:
+                sample_fn = self.model.sample_CSP_algorithm4
         elif sampling_algorithm == 3:
-            sample_fn = self.model.sample_CSP_algorithm3
+            if method == "facit_em":
+                sample_fn = self.model.sample_CSP_algorithm3_facit
+            else:
+                sample_fn = self.model.sample_CSP_algorithm3
         else:
             raise ValueError(f"Unsupported sampling_algorithm={sampling_algorithm}.")
 
@@ -575,7 +618,14 @@ class SamplingCompareRunner:
 
 def main() -> None:
     args = parse_args()
-    SamplingCompareRunner(config_path=args.config).run()
+    config_path = Path(args.config).expanduser().resolve()
+    log_path = Path.cwd() / "dpnp-log"
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        tee_stdout = _TeeTextIO(sys.stdout, log_handle)
+        tee_stderr = _TeeTextIO(sys.stderr, log_handle)
+        with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
+            print(f"dpnp_log_path={log_path}", flush=True)
+            SamplingCompareRunner(config_path=config_path).run()
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover
     Element = Lattice = Structure = None
 
 from kldmPlus.data.transform import ContinuousIntervalLattice
+from kldmPlus.dpnpsvd import DPnPSVDConfig, sample_kldm_dpnp_svd
 from kldmPlus.diffusionModels.continuous import (
     ContinuousDiffusion,
     ContinuousMattergenVPDiffusion,
@@ -1310,6 +1311,149 @@ class ModelKLDM(nn.Module):
 
         return state["f_t"], state["v_t"], state["l_t"], state["a_t"]
 
+    def sample_CSP_algorithm3_facit(
+        self,
+        n_steps: int,
+        batch: Batch | Data,
+        t_start: float = 1.0,
+        t_final: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        FacitKLDM Algorithm 3 loop, preserved for ablation comparisons.
+
+        This intentionally follows the direct reverse loop used in
+        `src/kldm/kldm.py` instead of the newer KLDM++ helper wrappers.
+        """
+        state = self._prepare_csp_sampling(
+            batch=batch,
+            n_steps=n_steps,
+            t_start=t_start,
+            t_final=t_final,
+        )
+
+        with torch.no_grad():
+            for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
+                preds_curr = state["score_network"](
+                    t=times.now.graph,
+                    pos=state["f_t"],
+                    v=state["v_t"],
+                    h=state["a_t"],
+                    l=state["l_t"],
+                    node_index=state["node_index"],
+                    edge_node_index=state["edge_node_index"],
+                )
+
+                score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
+                    t=times.now.nodes,
+                    v_t=state["v_t"],
+                    pred_v=preds_curr["v"],
+                    index=state["node_index"],
+                )
+
+                state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_exp_step(
+                    f_t=state["f_t"],
+                    v_t=state["v_t"],
+                    score_v=score_v,
+                    index=state["node_index"],
+                    dt=times.dt,
+                )
+
+                state["l_t"] = state["sampling_diffusion_l"].reverse_step(
+                    t=times.now.lattice,
+                    x_t=state["l_t"],
+                    pred=preds_curr["l"],
+                    dt=times.dt,
+                )
+
+        if state["restore_training"]:
+            state["score_network"].train()
+
+        return state["f_t"], state["v_t"], state["l_t"], state["a_t"]
+
+    def sample_CSP_algorithm4_facit(
+        self,
+        n_steps: int,
+        batch: Batch | Data,
+        t_start: float = 1.0,
+        t_final: float = 1e-6,
+        tau: float = 0.25,
+        n_correction_steps: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        FacitKLDM Algorithm 4 loop, preserved for ablation comparisons.
+
+        `n_correction_steps` is accepted for config compatibility; the facit
+        sampler performs corrector step(s) before the predictor, and applies
+        predictor/corrector updates to the lattice branch as well.
+        """
+        state = self._prepare_csp_sampling(
+            batch=batch,
+            n_steps=n_steps,
+            t_start=t_start,
+            t_final=t_final,
+        )
+
+        with torch.no_grad():
+            for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
+                for _ in range(max(int(n_correction_steps), 1)):
+                    preds_corr = state["score_network"](
+                        t=times.now.graph,
+                        pos=state["f_t"],
+                        v=state["v_t"],
+                        h=state["a_t"],
+                        l=state["l_t"],
+                        node_index=state["node_index"],
+                        edge_node_index=state["edge_node_index"],
+                    )
+
+                    state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_corrector(
+                        t=times.now.nodes,
+                        f_t=state["f_t"],
+                        v_t=state["v_t"],
+                        pred_v=preds_corr["v"],
+                        dt=times.dt,
+                        index=state["node_index"],
+                        tau=tau,
+                    )
+
+                    state["l_t"] = state["sampling_diffusion_l"].reverse_step_corrector(
+                        t=times.now.lattice,
+                        x_t=state["l_t"],
+                        pred=preds_corr["l"],
+                        tau=tau,
+                    )
+
+                preds_pred = state["score_network"](
+                    t=times.now.graph,
+                    pos=state["f_t"],
+                    v=state["v_t"],
+                    h=state["a_t"],
+                    l=state["l_t"],
+                    node_index=state["node_index"],
+                    edge_node_index=state["edge_node_index"],
+                )
+
+                state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_predictor(
+                    t=times.now.nodes,
+                    f_t=state["f_t"],
+                    v_t=state["v_t"],
+                    pred_v=preds_pred["v"],
+                    index=state["node_index"],
+                    dt=times.dt,
+                )
+
+                state["l_t"] = state["sampling_diffusion_l"].reverse_step_predictor(
+                    t=times.now.lattice,
+                    x_t=state["l_t"],
+                    pred=preds_pred["l"],
+                    dt=times.dt,
+                )
+
+        if state["restore_training"]:
+            state["score_network"].train()
+
+        return state["f_t"], state["v_t"], state["l_t"], state["a_t"]
+
     def sample_CSP_algorithm6(
         self,
         n_steps: int,
@@ -1910,7 +2054,7 @@ class ModelKLDM(nn.Module):
         t_final: float = 1e-6,
         sgdpnp_config: dict[str, Any] | SGDPnPConfig | None = None,
         template_prior: Any | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.sample_CSP_kldm_dpnp_sg(
             n_steps=n_steps,
             batch=batch,
@@ -1918,6 +2062,32 @@ class ModelKLDM(nn.Module):
             t_start=t_start,
             t_final=t_final,
             sgdpnp_config=sgdpnp_config,
+            template_prior=template_prior,
+        )
+
+    def sample_CSP_algorithm8(
+        self,
+        n_steps: int,
+        batch: Batch | Data,
+        lattice_transform: ContinuousIntervalLattice | None = None,
+        t_start: float = 1.0,
+        t_final: float = 1e-6,
+        dpnpsvd_config: dict[str, Any] | DPnPSVDConfig | None = None,
+        template_prior: Any | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        config = (
+            dpnpsvd_config
+            if isinstance(dpnpsvd_config, DPnPSVDConfig)
+            else DPnPSVDConfig.from_mapping(dpnpsvd_config)
+        )
+        return sample_kldm_dpnp_svd(
+            model=self,
+            n_steps=n_steps,
+            batch=batch,
+            lattice_transform=lattice_transform,
+            t_start=t_start,
+            t_final=t_final,
+            config=config,
             template_prior=template_prior,
         )
 

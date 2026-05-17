@@ -1,11 +1,20 @@
-experiment_name: plus_mp20_wyckoff_template_sanity_small
+experiment_name: plus_mp20_lattice_eps_em_facit_eval
+
+sampling:
+  checkpoint_path: https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/mp20_lattice_eps_em/artifacts/model/mp20_lattice_eps_em_validation/v91/files/epoch_8900.pt
+  method: em
+  sampling_algorithm: 3
+  n_steps: 300
+  t_start: 1.0
+  t_final: 1.0e-3
+  n_samples: 1
 
 dataset:
   task: csp
   name: mp20
   lattice_representation: kldm
   root: null
-  batch_size: 1
+  batch_size: 16
   num_workers: 0
   pin_memory: false
 
@@ -15,7 +24,7 @@ model:
   lattice_diffusion_type: VP
   wrapped_normal_K: 3
   tdm_n_sigmas: 2000
-  tdm_compute_sigma_norm: false
+  tdm_compute_sigma_norm: true
   tdm_velocity_scale: 0.15915494309189535
   tdm_sigma_norm_estimator: quadrature
   tdm_sigma_norm_density_K: 40
@@ -35,17 +44,16 @@ model:
     pred_h: false
     zero_cog: true
 
-wyckoff_template_sanity:
+sampling_eval:
+  evaluation: true
   split: test
-  batch_size: 1
-  num_targets: 20
+  batch_size: 8
+  num_targets: 7236
   subset_seed: 123
-  sample_seed: 2026
-  symprec: 1.0e-2
-  pyxtal_tol: 1.0e-2
-  standardization: conventional
-  max_templates: 10000
-  quick: false
-  stol: 0.5
-  angle_tol: 10.0
-  ltol: 0.3
+  validity_cutoff: 0.5
+  n_seeds: 20
+  from_seed: 0
+  wandb_project: mp_20_sampling
+  wandb_run_name: EVAL_plus_mp20_lattice_eps_em_facit
+  wandb_resume_id: null
+  progress_dir: ../../../artifacts/HPC/sampling_eval

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import inspect
+import json
 from pathlib import Path
 import pickle
 import random
@@ -23,6 +24,7 @@ from kldmPlus.run_experiment import (
     load_experiment_config,
     make_fixed_subset,
     resolve_checkpoint_reference,
+    should_stop,
 )
 from kldmPlus.sample_evaluation import prepare_visualization_pair
 from kldmPlus.utils.device import get_default_device
@@ -35,6 +37,8 @@ except ImportError as exc:  # pragma: no cover
 
 TEST_SPLIT = "test"
 AT_K = 20
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+SAMPLING_PROGRESS_ROOT = WORKSPACE_ROOT / "artifacts" / "HPC" / "sampling_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +86,12 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _json_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 class SamplingRunner:
     def __init__(self, config_path: str | Path) -> None:
         from kldmPlus.utils.model_loader import build_model, load_checkpoint
@@ -93,6 +103,17 @@ class SamplingRunner:
         self.validity_cutoff = float(self.eval_cfg.get("validity_cutoff", 0.5))
         self.evaluation = bool(self.eval_cfg["evaluation"])
         self.sample_count = int(self.sampling_cfg["n_samples"])
+        self.eval_seed_count = int(self.eval_cfg.get("n_seeds", AT_K))
+        self.eval_from_seed = int(self.eval_cfg.get("from_seed", 0))
+        self.eval_progress_dir = self._progress_dir(self.eval_cfg.get("progress_dir"))
+        self.wandb_project = str(self.eval_cfg.get("wandb_project", "mp_20_sampling"))
+        self.wandb_run_name = str(
+            self.eval_cfg.get(
+                "wandb_run_name",
+                f"{'EVAL' if self.evaluation else 'SAMPLES'}_{self.experiment_name}",
+            )
+        )
+        self.wandb_resume_id = self.eval_cfg.get("wandb_resume_id")
         self.device = get_default_device()
         self.checkpoint_path = self._checkpoint_path(self.sampling_cfg["checkpoint_path"])
         self.loader, self.lattice_transform = self._build_loader()
@@ -110,6 +131,14 @@ class SamplingRunner:
     # Resolves the checkpoint path from the config file location and falls back to the latest file.
     def _checkpoint_path(self, checkpoint_path: str | Path) -> Path:
         return resolve_checkpoint_reference(checkpoint_path, config_path=self.config_path)
+
+    def _progress_dir(self, configured_path: str | Path | None) -> Path:
+        if configured_path is None:
+            return SAMPLING_PROGRESS_ROOT
+        candidate = Path(configured_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = (self.config_path.parent / candidate).expanduser()
+        return candidate.resolve()
 
     # Builds the fixed test-set loader used by both sample mode and @1/@20 evaluation mode.
     def _build_loader(self) -> tuple[DataLoader, Any]:
@@ -181,9 +210,14 @@ class SamplingRunner:
         from kldmPlus.symmetry.wyckoff_templates import requested_composition_key
 
         sampling_algorithm = int(self.sampling_cfg.get("sampling_algorithm", 4 if str(self.sampling_cfg["method"]) == "pc" else 3))
-        if sampling_algorithm not in {6, 7}:
+        if sampling_algorithm not in {6, 7, 8}:
             return None
-        prior_cfg = dict(self.sampling_cfg.get("pcs" if sampling_algorithm == 6 else "sgdpnp", {}))
+        if sampling_algorithm == 6:
+            prior_cfg = dict(self.sampling_cfg.get("pcs", {}))
+        elif sampling_algorithm == 7:
+            prior_cfg = dict(self.sampling_cfg.get("sgdpnp", {}))
+        else:
+            prior_cfg = dict(self.sampling_cfg.get("dpnpsvd", {}))
         if not bool(prior_cfg.get("template_prior_enabled", True)):
             return None
         if float(prior_cfg.get("template_prior_weight", 1.0)) <= 0.0:
@@ -268,7 +302,16 @@ class SamplingRunner:
             "t_start": float(self.sampling_cfg["t_start"]),
             "t_final": float(self.sampling_cfg["t_final"]),
         }
-        if sampling_algorithm == 7:
+        if sampling_algorithm == 8:
+            if method != "em":
+                raise ValueError(
+                    "sampling_algorithm=8 currently extends the EM sampler, so sampling.method must be 'em'.",
+                )
+            kwargs["lattice_transform"] = self.lattice_transform
+            kwargs["dpnpsvd_config"] = dict(self.sampling_cfg.get("dpnpsvd", {}))
+            kwargs["template_prior"] = self._ensure_template_prior()
+            sample_fn = self.model.sample_CSP_algorithm8
+        elif sampling_algorithm == 7:
             if method != "em":
                 raise ValueError(
                     "sampling_algorithm=7 currently extends the EM sampler, so sampling.method must be 'em'.",
@@ -490,15 +533,145 @@ class SamplingRunner:
             )
         return results
 
+    def _progress_paths(self, run_id: str) -> tuple[Path, Path]:
+        self.eval_progress_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            self.eval_progress_dir / f"{run_id}.json",
+            self.eval_progress_dir / f"{run_id}.log",
+        )
+
+    def _new_eval_state(self, run_id: str) -> dict[str, Any]:
+        target_count = len(self.loader.dataset)
+        return {
+            "version": 1,
+            "run_id": run_id,
+            "experiment_name": self.experiment_name,
+            "config_path": str(self.config_path),
+            "checkpoint_path": str(self.checkpoint_path),
+            "num_targets": target_count,
+            "subset_seed": int(self.eval_cfg["subset_seed"]),
+            "n_seeds": self.eval_seed_count,
+            "from_seed": self.eval_from_seed,
+            "completed_seeds": [],
+            "seed_summaries": [],
+            "target_hit_count": [0 for _ in range(target_count)],
+            "target_best_rmse": [None for _ in range(target_count)],
+            "first_seed_matches": None,
+        }
+
+    def _save_eval_state(self, state: dict[str, Any], path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+
+    def _load_eval_state(self, run_id: str) -> tuple[dict[str, Any], Path, Path]:
+        state_path, log_path = self._progress_paths(run_id)
+        if state_path.exists():
+            with state_path.open("r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            print(
+                f"evaluation_resume_state path={state_path} completed_seeds={state.get('completed_seeds', [])}",
+                flush=True,
+            )
+            return state, state_path, log_path
+
+        state = self._new_eval_state(run_id)
+        self._save_eval_state(state, state_path)
+        return state, state_path, log_path
+
+    def _append_eval_log(self, path: Path, line: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line.rstrip() + "\n")
+
+    def _update_eval_state(
+        self,
+        state: dict[str, Any],
+        *,
+        seed: int,
+        results: list[Any],
+        summary: dict[str, Any],
+    ) -> None:
+        completed = {int(value) for value in state.get("completed_seeds", [])}
+        if seed in completed:
+            return
+
+        target_hits = list(state.get("target_hit_count", []))
+        target_best_rmse = list(state.get("target_best_rmse", []))
+        if len(target_hits) != len(results) or len(target_best_rmse) != len(results):
+            raise ValueError(
+                "Evaluation state target count mismatch "
+                f"state_hits={len(target_hits)} state_rmse={len(target_best_rmse)} results={len(results)}"
+            )
+
+        for target_idx, result in enumerate(results):
+            if not result.match or result.rmse is None:
+                continue
+            target_hits[target_idx] = int(target_hits[target_idx]) + 1
+            best_rmse = target_best_rmse[target_idx]
+            current_rmse = float(result.rmse)
+            target_best_rmse[target_idx] = current_rmse if best_rmse is None else min(float(best_rmse), current_rmse)
+
+        if state.get("first_seed_matches") is None:
+            state["first_seed_matches"] = [int(result.match) for result in results]
+
+        state["target_hit_count"] = target_hits
+        state["target_best_rmse"] = target_best_rmse
+        state["completed_seeds"] = sorted([*completed, seed])
+        seed_summaries = [item for item in state.get("seed_summaries", []) if int(item["seed"]) != seed]
+        seed_summaries.append(
+            {
+                "seed": seed,
+                "valid": _json_float(summary.get("valid")),
+                "match_rate": _json_float(summary.get("match_rate")),
+                "rmse": _json_float(summary.get("rmse")),
+                "composition_match_rate": _json_float(summary.get("composition_match_rate")),
+                "requested_space_group_match_rate": _json_float(summary.get("requested_space_group_match_rate")),
+            }
+        )
+        state["seed_summaries"] = sorted(seed_summaries, key=lambda item: int(item["seed"]))
+
+    def _summary_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        seed_summaries = list(state.get("seed_summaries", []))
+        valid_values = [float(item["valid"]) for item in seed_summaries if item.get("valid") is not None]
+        match_values = [float(item["match_rate"]) for item in seed_summaries if item.get("match_rate") is not None]
+        rmse_values = [float(item["rmse"]) for item in seed_summaries if item.get("rmse") is not None]
+        target_hits = np.asarray(state.get("target_hit_count", []), dtype=int)
+        reached = target_hits > 0
+        best_rmse_values = [float(value) for value in state.get("target_best_rmse", []) if value is not None]
+
+        return {
+            "completed_seeds": [int(seed) for seed in state.get("completed_seeds", [])],
+            "at_1_summary": {
+                "valid_mean": None if not valid_values else float(np.mean(valid_values)),
+                "valid_std": None if not valid_values else float(np.std(valid_values)),
+                "match_rate_mean": None if not match_values else float(np.mean(match_values)),
+                "match_rate_std": None if not match_values else float(np.std(match_values)),
+                "rmse_mean": None if not rmse_values else float(np.mean(rmse_values)),
+                "rmse_std": None if not rmse_values else float(np.std(rmse_values)),
+            },
+            "at_k_summary": {
+                "match_rate": None if target_hits.size == 0 else float(np.mean(reached)),
+                "rmse": None if not best_rmse_values else float(np.mean(best_rmse_values)),
+            },
+            "at_1_matches": list(state.get("first_seed_matches") or []),
+            "at_k_matches": reached.astype(int).tolist(),
+            "at_1_rmses": rmse_values,
+            "at_k_rmses": best_rmse_values,
+        }
+
     # Runs repeated single-sample passes and aggregates them into @1/@20 summaries.
-    def _evaluate(self) -> dict[str, Any]:
+    def _evaluate(self, run) -> dict[str, Any]:
         from kldmPlus.sample_evaluation import aggregate_csp_reconstruction_metrics
 
-        pass_summaries = []
-        pass_results = []
+        state, state_path, log_path = self._load_eval_state(run.id)
+        completed = {int(seed) for seed in state.get("completed_seeds", [])}
 
-        for seed in range(AT_K):
-            print(f"evaluation_progress seed={seed + 1}/{AT_K}", flush=True)
+        for seed in range(self.eval_from_seed, self.eval_seed_count):
+            if seed in completed:
+                print(f"evaluation_skip seed={seed} reason=already_completed", flush=True)
+                continue
+            print(f"evaluation_progress seed={seed + 1}/{self.eval_seed_count}", flush=True)
             results = [graph_results[0] for graph_results in self._collect(samples_per_target=1, seed=seed)]
             summary = aggregate_csp_reconstruction_metrics(results)
             print(
@@ -510,40 +683,38 @@ class SamplingRunner:
                 f"requested_sg_match_rate={format_metric(summary.get('requested_space_group_match_rate'), '.4f')}",
                 flush=True,
             )
-            pass_summaries.append(summary)
-            pass_results.append(results)
+            self._update_eval_state(state, seed=seed, results=results, summary=summary)
+            self._save_eval_state(state, state_path)
+            self._append_eval_log(
+                log_path,
+                (
+                    f"seed={seed} valid={format_metric(summary['valid'], '.4f')} "
+                    f"match_rate={format_metric(summary['match_rate'], '.4f')} "
+                    f"rmse={format_metric(summary['rmse'], '.6f')}"
+                ),
+            )
+            wandb.log(
+                {
+                    "evaluation/latest_seed": seed,
+                    "evaluation/completed_seed_count": len(state["completed_seeds"]),
+                    "evaluation/latest_seed_valid": summary["valid"],
+                    "evaluation/latest_seed_match_rate": summary["match_rate"],
+                    "evaluation/latest_seed_rmse": summary["rmse"],
+                }
+            )
+            completed = {int(value) for value in state.get("completed_seeds", [])}
+            if should_stop(run):
+                print(
+                    f"evaluation_stop_requested completed_seeds={state['completed_seeds']} state_path={state_path}",
+                    flush=True,
+                )
+                break
 
-        first_results = pass_results[0] if pass_results else []
-        best_results = []
-        if pass_results:
-            for target_idx in range(len(pass_results[0])):
-                best_results.append(_best_result([one_pass[target_idx] for one_pass in pass_results]))
-
-        valid_values = [summary["valid"] for summary in pass_summaries if summary["valid"] is not None]
-        match_values = [summary["match_rate"] for summary in pass_summaries if summary["match_rate"] is not None]
-        rmse_values = [summary["rmse"] for summary in pass_summaries if summary["rmse"] is not None]
-        at_k_match_rate, at_k_rmse = _merge_pass_statistics(pass_results)
-
-        return {
-            "at_1_summary": {
-                "valid_mean": None if not valid_values else float(np.mean(valid_values)),
-                "valid_std": None if not valid_values else float(np.std(valid_values)),
-                "match_rate_mean": None if not match_values else float(np.mean(match_values)),
-                "match_rate_std": None if not match_values else float(np.std(match_values)),
-                "rmse_mean": None if not rmse_values else float(np.mean(rmse_values)),
-                "rmse_std": None if not rmse_values else float(np.std(rmse_values)),
-            },
-            "at_k_summary": {
-                "match_rate": at_k_match_rate,
-                "rmse": at_k_rmse,
-            },
-            "at_1_results": first_results,
-            "at_k_results": best_results,
-            "at_1_matches": [int(result.match) for result in first_results],
-            "at_k_matches": [int(result.match) for result in best_results],
-            "at_1_rmses": rmse_values,
-            "at_k_rmses": [float(result.rmse) for result in best_results if result.rmse is not None],
-        }
+        summary = self._summary_from_state(state)
+        summary["state_path"] = str(state_path)
+        summary["log_path"] = str(log_path)
+        summary["complete"] = len(summary["completed_seeds"]) >= self.eval_seed_count
+        return summary
 
     # Creates a compact artifact with a few representative evaluation structures.
     def _log_eval_examples(self, summary: dict[str, Any], temp_dir: Path) -> None:
@@ -617,10 +788,10 @@ class SamplingRunner:
 
     # Runs either sample-mode export or repeated-pass @1/@20 evaluation.
     def run(self) -> None:
-        wandb.init(
-            project="mp_20_sampling",
-            name=f"{'EVAL' if self.evaluation else 'SAMPLES'}_{self.experiment_name}",
-            config={
+        init_kwargs = {
+            "project": self.wandb_project,
+            "name": self.wandb_run_name,
+            "config": {
                 "experiment_name": self.experiment_name,
                 "config_path": str(self.config_path),
                 "checkpoint_path": str(self.checkpoint_path),
@@ -629,7 +800,11 @@ class SamplingRunner:
                 "sampling": self.sampling_cfg,
                 "sampling_eval": self.eval_cfg,
             },
-        )
+        }
+        if self.wandb_resume_id:
+            init_kwargs["id"] = str(self.wandb_resume_id)
+            init_kwargs["resume"] = "must"
+        run = wandb.init(**init_kwargs)
         print(f"data_split sample={TEST_SPLIT}", flush=True)
 
         with tempfile.TemporaryDirectory(prefix="kldm_sampling_") as tmp:
@@ -656,8 +831,7 @@ class SamplingRunner:
                     flush=True,
                 )
             else:
-                summary = self._evaluate()
-                self._log_eval_examples(summary, temp_dir)
+                summary = self._evaluate(run)
                 at_1 = summary["at_1_summary"]
                 at_k = summary["at_k_summary"]
                 log_data = {
@@ -676,6 +850,9 @@ class SamplingRunner:
                     log_data["@1/rmse_hist"] = wandb.Histogram(summary["at_1_rmses"])
                 if summary["at_k_rmses"]:
                     log_data["@20/rmse_hist"] = wandb.Histogram(summary["at_k_rmses"])
+                log_data["evaluation/completed_seed_count"] = len(summary["completed_seeds"])
+                log_data["evaluation/completed_seeds"] = ",".join(str(seed) for seed in summary["completed_seeds"])
+                log_data["evaluation/complete"] = int(bool(summary["complete"]))
                 wandb.log(log_data)
                 print(
                     f"@1 valid_mean={format_metric(at_1['valid_mean'], '.4f')} "
@@ -688,7 +865,10 @@ class SamplingRunner:
                 )
                 print(
                     f"@20 match_rate={format_metric(at_k['match_rate'], '.4f')} "
-                    f"rmse={format_metric(at_k['rmse'], '.6f')}",
+                    f"rmse={format_metric(at_k['rmse'], '.6f')} "
+                    f"completed_seeds={summary['completed_seeds']} "
+                    f"state_path={summary['state_path']} "
+                    f"log_path={summary['log_path']}",
                     flush=True,
                 )
 

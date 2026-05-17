@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         default=25,
         help="Process this many samples in a short-lived child process. Use 0 to run in-process.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of chunk workers to run concurrently.",
+    )
     return parser.parse_args()
 
 
@@ -273,14 +279,22 @@ def main() -> None:
         ctx_name = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
         ctx = mp.get_context(ctx_name)
         chunk_size = max(1, int(args.worker_chunk_size))
-        sample_idx = 0
-        while sample_idx < limit:
-            while sample_idx < limit and sample_idx in processed:
-                sample_idx += 1
-            if sample_idx >= limit:
-                break
-            chunk_start = sample_idx
+        num_workers = max(1, int(args.num_workers))
+        next_sample_idx = 0
+        active: list[dict[str, Any]] = []
+
+        def next_chunk() -> tuple[int, int] | None:
+            nonlocal next_sample_idx
+            while next_sample_idx < limit and next_sample_idx in processed:
+                next_sample_idx += 1
+            if next_sample_idx >= limit:
+                return None
+            chunk_start = next_sample_idx
             chunk_end = min(limit, chunk_start + chunk_size)
+            next_sample_idx = chunk_end
+            return chunk_start, chunk_end
+
+        def launch_chunk(chunk_start: int, chunk_end: int) -> None:
             payload = {
                 "config": str(Path(args.config).expanduser().resolve()),
                 "split": str(args.split),
@@ -300,56 +314,93 @@ def main() -> None:
             queue = ctx.Queue()
             process = ctx.Process(target=_process_chunk_worker, args=(payload, queue))
             process.start()
-            result = None
-            while process.is_alive() or not queue.empty():
-                try:
-                    message = queue.get(timeout=2.0)
-                except queue_module.Empty:
+            active.append(
+                {
+                    "start": int(chunk_start),
+                    "end": int(chunk_end),
+                    "started": float(chunk_started),
+                    "queue": queue,
+                    "process": process,
+                    "result": None,
+                }
+            )
+
+        while len(active) < num_workers:
+            chunk = next_chunk()
+            if chunk is None:
+                break
+            launch_chunk(*chunk)
+
+        while active:
+            made_progress = False
+            for record in active[:]:
+                chunk_start = int(record["start"])
+                chunk_end = int(record["end"])
+                queue = record["queue"]
+                process = record["process"]
+                while True:
+                    try:
+                        message = queue.get_nowait()
+                    except queue_module.Empty:
+                        break
+                    made_progress = True
+                    if message.get("type") == "sample":
+                        print(
+                            f"template_cache_worker_progress chunk={chunk_start}:{chunk_end} "
+                            f"sample={int(message['sample_idx']) + 1}/{limit} "
+                            f"status={message['status']} sample_elapsed_s={float(message['elapsed_s']):.1f} "
+                            f"chunk_entries={int(message['entries'])}",
+                            flush=True,
+                        )
+                        continue
+                    record["result"] = message
+
+                if process.is_alive() and record.get("result") is None:
                     continue
-                if message.get("type") == "sample":
+
+                process.join()
+                chunk_elapsed = time.perf_counter() - float(record["started"])
+                result = record.get("result")
+                if result is None:
+                    result = {
+                        "ok": False,
+                        "error": f"worker_exitcode={process.exitcode}",
+                    }
+                if not result.get("ok"):
                     print(
-                        f"template_cache_worker_progress chunk={chunk_start}:{chunk_end} "
-                        f"sample={int(message['sample_idx']) + 1}/{limit} "
-                        f"status={message['status']} sample_elapsed_s={float(message['elapsed_s']):.1f} "
-                        f"chunk_entries={int(message['entries'])}",
+                        f"template_cache_worker_failed chunk={chunk_start}:{chunk_end} "
+                        f"error={result.get('error', 'unknown')}",
                         flush=True,
                     )
-                    continue
-                result = message
-                break
-            process.join()
-            chunk_elapsed = time.perf_counter() - chunk_started
-            if result is None:
-                result = {
-                    "ok": False,
-                    "error": f"worker_exitcode={process.exitcode}",
-                }
-            if not result.get("ok"):
+                    skipped += chunk_end - chunk_start
+                    processed.update(range(chunk_start, chunk_end))
+                else:
+                    chunk_built, chunk_reused = _merge_chunk_cache(cache, result["cache"])
+                    built += chunk_built
+                    reused += chunk_reused
+                    skipped += int(result.get("skipped", 0))
+                    processed.update(int(v) for v in result.get("processed", []))
+
+                cache["metadata"]["processed_indices"] = sorted(processed)
+                save_template_cache(output, cache)
                 print(
-                    f"template_cache_worker_failed chunk={chunk_start}:{chunk_end} "
-                    f"error={result.get('error', 'unknown')}",
+                    f"template_cache_progress chunk={chunk_start}:{chunk_end} "
+                    f"chunk_elapsed_s={chunk_elapsed:.1f} samples={len(processed)}/{limit} "
+                    f"entries={len(cache.get('entries', {}))} built={built} reused={reused} "
+                    f"skipped={skipped} active_workers={len(active) - 1} "
+                    f"elapsed_s={time.perf_counter() - started:.1f}",
                     flush=True,
                 )
-                skipped += chunk_end - chunk_start
-                processed.update(range(chunk_start, chunk_end))
-            else:
-                chunk_built, chunk_reused = _merge_chunk_cache(cache, result["cache"])
-                built += chunk_built
-                reused += chunk_reused
-                skipped += int(result.get("skipped", 0))
-                processed.update(int(v) for v in result.get("processed", []))
+                trim_process_memory()
+                active.remove(record)
 
-            cache["metadata"]["processed_indices"] = sorted(processed)
-            save_template_cache(output, cache)
-            print(
-                f"template_cache_progress chunk={chunk_start}:{chunk_end} "
-                f"chunk_elapsed_s={chunk_elapsed:.1f} samples={min(chunk_end, limit)}/{limit} "
-                f"entries={len(cache.get('entries', {}))} built={built} reused={reused} "
-                f"skipped={skipped} elapsed_s={time.perf_counter() - started:.1f}",
-                flush=True,
-            )
-            trim_process_memory()
-            sample_idx = chunk_end
+                chunk = next_chunk()
+                if chunk is not None:
+                    launch_chunk(*chunk)
+                made_progress = True
+
+            if not made_progress:
+                time.sleep(0.5)
 
         cache["metadata"]["processed_indices"] = sorted(processed)
         cache["metadata"]["config"] = str(Path(args.config).expanduser().resolve())
@@ -357,6 +408,7 @@ def main() -> None:
         cache["metadata"]["max_templates"] = int(args.max_templates)
         cache["metadata"]["template_nmax"] = int(args.template_nmax)
         cache["metadata"]["worker_chunk_size"] = int(args.worker_chunk_size)
+        cache["metadata"]["num_workers"] = int(args.num_workers)
         save_template_cache(output, cache)
         print(
             f"template_cache_done path={output} samples={limit} entries={len(cache.get('entries', {}))} "

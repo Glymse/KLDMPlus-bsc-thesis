@@ -20,8 +20,8 @@ def wyckoff_letter_to_index(label: str, *, max_letter: int = 64) -> int:
     return max(0, min(int(max_letter) - 1, value - 1))
 
 
-class WyckoffTemplateRanker(torch.nn.Module):
-    """Small permutation-invariant ranker over species-labeled Wyckoff sites."""
+class WyckoffTemplateMLPRanker(torch.nn.Module):
+    """Permutation-invariant MLP ranker over species-labeled Wyckoff sites."""
 
     def __init__(
         self,
@@ -55,6 +55,7 @@ class WyckoffTemplateRanker(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(self.hidden, 1),
         )
+        self.model_name = "mlp"
 
     def forward(
         self,
@@ -82,6 +83,21 @@ class WyckoffTemplateRanker(torch.nn.Module):
         pooled = (site_feat * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         sg_feat = self.sg_emb(sg)
         return self.out(torch.cat([pooled, sg_feat], dim=-1)).squeeze(-1)
+
+
+class WyckoffTemplateRanker(WyckoffTemplateMLPRanker):
+    """Backward-compatible alias for the default MLP template ranker."""
+
+
+def build_template_ranker(
+    *,
+    model_name: str = "mlp",
+    **model_kwargs: Any,
+) -> torch.nn.Module:
+    normalized = str(model_name).strip().lower()
+    if normalized in {"mlp", "wyckofftemplatemlpranker", "wyckofftemplateranker"}:
+        return WyckoffTemplateMLPRanker(**model_kwargs)
+    raise ValueError(f"Unknown Wyckoff template ranker model: {model_name!r}")
 
 
 def templates_to_ranker_batch(
@@ -152,20 +168,22 @@ def score_templates(
 def save_template_ranker(
     *,
     path: str | Path,
-    model: WyckoffTemplateRanker,
+    model: torch.nn.Module,
     metadata: dict[str, Any] | None = None,
 ) -> None:
     target = Path(path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+    model_name = str(getattr(model, "model_name", model.__class__.__name__)).lower()
     torch.save(
         {
             "state_dict": model.state_dict(),
+            "model_name": model_name,
             "model_kwargs": {
-                "num_elements": int(model.num_elements),
-                "max_sg": int(model.max_sg),
-                "max_mult": int(model.max_mult),
-                "max_letter": int(model.max_letter),
-                "hidden": int(model.hidden),
+                "num_elements": int(getattr(model, "num_elements")),
+                "max_sg": int(getattr(model, "max_sg")),
+                "max_mult": int(getattr(model, "max_mult")),
+                "max_letter": int(getattr(model, "max_letter")),
+                "hidden": int(getattr(model, "hidden")),
             },
             "metadata": dict(metadata or {}),
         },
@@ -186,7 +204,8 @@ def load_template_ranker(
     except TypeError:  # pragma: no cover - older torch
         payload = torch.load(source, map_location=device)
     model_kwargs = dict(payload.get("model_kwargs", {}))
-    model = WyckoffTemplateRanker(**model_kwargs).to(device)
+    model_name = str(payload.get("model_name", "mlp"))
+    model = build_template_ranker(model_name=model_name, **model_kwargs).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
     return model
