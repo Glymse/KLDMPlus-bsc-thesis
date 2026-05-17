@@ -170,10 +170,9 @@ class CSPVNet(nn.Module):
             self.sg_adapters = nn.ModuleList(
                 [
                     nn.Sequential(
-                        nn.Linear(self.sg_emb_dim, hidden_dim),
+                        nn.Linear(hidden_dim + self.sg_emb_dim, hidden_dim),
                         self.act_fn,
                         nn.Linear(hidden_dim, hidden_dim),
-                        self.act_fn,
                     )
                     for _ in range(num_layers)
                 ]
@@ -265,11 +264,13 @@ class CSPVNet(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             if self.sg_conditional:
+                sg_emb_per_atom = sg_emb[node_index]
                 delta_graph = self.sg_mixins[layer_idx](
-                    self.sg_adapters[layer_idx](sg_emb)
+                    self.sg_adapters[layer_idx](
+                        torch.cat([node_features, sg_emb_per_atom], dim=1)
+                    )
                 )
-                delta_graph = delta_graph * sg_mask
-                node_features = node_features + delta_graph[node_index]
+                node_features = node_features + delta_graph * sg_mask[node_index]
             node_features = layer.forward(
                 pos_diff=pos_diff,
                 v=v,

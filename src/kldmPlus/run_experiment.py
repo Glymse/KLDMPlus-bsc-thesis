@@ -263,6 +263,72 @@ def isolated_rng_seed(seed: int):
         yield
 
 
+def summarize_requested_space_groups(results: list[Any]) -> list[dict[str, Any]]:
+    grouped: dict[int, dict[str, Any]] = {}
+    for result in results:
+        requested_sg = getattr(result, "requested_space_group", None)
+        if requested_sg is None:
+            continue
+        requested_sg = int(requested_sg)
+        bucket = grouped.setdefault(
+            requested_sg,
+            {
+                "requested_sg": requested_sg,
+                "count": 0,
+                "valid": [],
+                "match": [],
+                "composition_match": [],
+                "requested_sg_match": [],
+                "detected_counts": {},
+            },
+        )
+        bucket["count"] += 1
+        bucket["valid"].append(float(bool(getattr(result, "valid", False))))
+        bucket["match"].append(float(bool(getattr(result, "match", False))))
+        composition_match = getattr(result, "composition_match", None)
+        if composition_match is not None:
+            bucket["composition_match"].append(float(bool(composition_match)))
+        requested_match = getattr(result, "requested_space_group_match", None)
+        if requested_match is not None:
+            bucket["requested_sg_match"].append(float(bool(requested_match)))
+        detected_sg = getattr(result, "detected_space_group", None)
+        if detected_sg is not None:
+            detected_sg = int(detected_sg)
+            bucket["detected_counts"][detected_sg] = bucket["detected_counts"].get(detected_sg, 0) + 1
+
+    summaries: list[dict[str, Any]] = []
+    for requested_sg in sorted(grouped):
+        bucket = grouped[requested_sg]
+        detected_counts = bucket["detected_counts"]
+        detected_top = ",".join(
+            f"{sg}:{count}"
+            for sg, count in sorted(
+                detected_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:5]
+        )
+        summaries.append(
+            {
+                "requested_sg": requested_sg,
+                "count": int(bucket["count"]),
+                "valid": float(np.mean(bucket["valid"])) if bucket["valid"] else None,
+                "match_rate": float(np.mean(bucket["match"])) if bucket["match"] else None,
+                "composition_match_rate": (
+                    float(np.mean(bucket["composition_match"]))
+                    if bucket["composition_match"]
+                    else None
+                ),
+                "requested_space_group_match_rate": (
+                    float(np.mean(bucket["requested_sg_match"]))
+                    if bucket["requested_sg_match"]
+                    else None
+                ),
+                "top_detected_space_groups": detected_top or "none",
+            }
+        )
+    return summaries
+
+
 def epoch_from_checkpoint_name(path: Path) -> int | None:
     match = re.search(r"(?:^|[_-])epoch[_-](\d+)(?:\D|$)", path.name)
     if match is None:
@@ -372,6 +438,10 @@ class ExperimentRunner:
             "match_rate_std": [],
             "valid_mean": [],
             "valid_std": [],
+            "composition_match_rate_mean": [],
+            "composition_match_rate_std": [],
+            "requested_space_group_match_rate_mean": [],
+            "requested_space_group_match_rate_std": [],
         }
 
         # Optional resume path for continuing training from a saved checkpoint.
@@ -414,8 +484,21 @@ class ExperimentRunner:
             )
             if load_time_sampler_state and checkpoint.get("time_sampler_state_dict") is not None:
                 self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
-            if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
-                prune_wandb_artifact_cache(resolved_checkpoint_path)
+        if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
+            prune_wandb_artifact_cache(resolved_checkpoint_path)
+
+        sg_conditional = bool(getattr(self.model.score_network, "sg_conditional", False))
+        sg_dropout = float(getattr(self.model, "sg_condition_dropout", 0.0))
+        validation_sg_conditioned = bool(self.validation_cfg.get("sg_conditioned_sampling", sg_conditional))
+        validation_sg_guidance_scale = float(self.validation_cfg.get("sg_guidance_scale", 1.0))
+        print(
+            "space_group_training "
+            f"sg_conditional={int(sg_conditional)} "
+            f"sg_condition_dropout={sg_dropout:.3f} "
+            f"validation_sg_conditioned={int(validation_sg_conditioned)} "
+            f"validation_sg_guidance_scale={validation_sg_guidance_scale:.3f}",
+            flush=True,
+        )
 
     def build_time_sampler(self):
         cfg = dict(self.config.get("time_sampler", {}))
@@ -699,10 +782,25 @@ class ExperimentRunner:
         )
 
         self.model.eval()
+        sg_conditioned_sampling = bool(
+            self.validation_cfg.get(
+                "sg_conditioned_sampling",
+                bool(getattr(self.model.score_network, "sg_conditional", False)),
+            )
+        )
+        sg_guidance_scale = float(self.validation_cfg.get("sg_guidance_scale", 1.0))
+        debug_space_group = bool(self.validation_cfg.get("debug_space_group", True))
+        debug_space_group_max_groups = int(self.validation_cfg.get("debug_space_group_max_groups", 32))
 
         def collect_one_pass(*, seed: int | None = None) -> dict[str, Any]:
             if seed is not None:
                 print(f"validation_sampling_seed={seed} pass_start", flush=True)
+            print(
+                "validation_sampling_mode "
+                f"sg_conditioned={int(sg_conditioned_sampling)} "
+                f"sg_guidance_scale={sg_guidance_scale:.3f}",
+                flush=True,
+            )
 
             seed_context = isolated_rng_seed(seed) if seed is not None else preserve_rng_state()
             with seed_context:
@@ -725,6 +823,13 @@ class ExperimentRunner:
                             "t_start": float(self.sampler_cfg["t_start"]),
                             "t_final": float(self.sampler_cfg["t_final"]),
                         }
+                        if sg_conditioned_sampling and hasattr(batch, "space_group"):
+                            sample_kwargs["space_group"] = torch.as_tensor(
+                                batch.space_group,
+                                device=self.device,
+                                dtype=torch.long,
+                            ).reshape(-1)
+                            sample_kwargs["sg_guidance_scale"] = sg_guidance_scale
                         if str(self.sampler_cfg["method"]) == "pc":
                             sample_kwargs["tau"] = float(self.sampler_cfg["tau"])
                             sample_kwargs["n_correction_steps"] = int(self.sampler_cfg["n_correction_steps"])
@@ -733,6 +838,11 @@ class ExperimentRunner:
 
                     ptr = batch.ptr.tolist()
                     for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr[:-1], ptr[1:])):
+                        requested_space_group = None
+                        if hasattr(batch, "space_group"):
+                            requested_space_group = int(
+                                torch.as_tensor(batch.space_group).reshape(-1)[graph_idx].item()
+                            )
                         results.append(
                             evaluate_csp_reconstruction(
                                 pred_f=pos_t[start_idx:end_idx],
@@ -742,6 +852,7 @@ class ExperimentRunner:
                                 target_l=batch.l[graph_idx],
                                 target_a=batch.atomic_numbers[start_idx:end_idx],
                                 lattice_transform=self.lattice_transform,
+                                requested_space_group=requested_space_group,
                             )
                         )
                         num_graphs_seen += 1
@@ -765,11 +876,28 @@ class ExperimentRunner:
                 )
 
             summary = aggregate_csp_reconstruction_metrics(results)
+            requested_sg_summaries = summarize_requested_space_groups(results)
+            if debug_space_group:
+                for sg_summary in requested_sg_summaries[:debug_space_group_max_groups]:
+                    print(
+                        "validation_requested_sg "
+                        f"requested_sg={sg_summary['requested_sg']} "
+                        f"count={sg_summary['count']} "
+                        f"requested_sg_match_rate={format_metric(sg_summary['requested_space_group_match_rate'], '.4f')} "
+                        f"valid={format_metric(sg_summary['valid'], '.4f')} "
+                        f"match_rate={format_metric(sg_summary['match_rate'], '.4f')} "
+                        f"composition_match_rate={format_metric(sg_summary['composition_match_rate'], '.4f')} "
+                        f"top_detected={sg_summary['top_detected_space_groups']}",
+                        flush=True,
+                    )
             return {
                 "valid": summary.get("valid"),
                 "match_rate": summary.get("match_rate"),
                 "rmse": summary.get("rmse"),
+                "composition_match_rate": summary.get("composition_match_rate"),
+                "requested_space_group_match_rate": summary.get("requested_space_group_match_rate"),
                 "num_samples": summary.get("num_samples"),
+                "requested_sg_summaries": requested_sg_summaries,
             }
 
         if not bool(self.validation_cfg.get("ablation", False)):
@@ -796,7 +924,9 @@ class ExperimentRunner:
                 f"validation_ablation_seed_summary seed={seed} "
                 f"valid={format_metric(one_pass['valid'], '.4f')} "
                 f"match_rate={format_metric(one_pass['match_rate'], '.4f')} "
-                f"rmse={format_metric(one_pass['rmse'], '.6f')}",
+                f"rmse={format_metric(one_pass['rmse'], '.6f')} "
+                f"composition_match_rate={format_metric(one_pass.get('composition_match_rate'), '.4f')} "
+                f"requested_sg_match_rate={format_metric(one_pass.get('requested_space_group_match_rate'), '.4f')}",
                 flush=True,
             )
             pass_summaries.append(one_pass)
@@ -817,6 +947,10 @@ class ExperimentRunner:
         valid_mean, valid_std = aggregate_scalar("valid")
         match_rate_mean, match_rate_std = aggregate_scalar("match_rate")
         rmse_mean, rmse_std = aggregate_scalar("rmse")
+        composition_match_rate_mean, composition_match_rate_std = aggregate_scalar("composition_match_rate")
+        requested_sg_match_rate_mean, requested_sg_match_rate_std = aggregate_scalar(
+            "requested_space_group_match_rate"
+        )
 
         return {
             "valid": valid_mean,
@@ -825,6 +959,10 @@ class ExperimentRunner:
             "match_rate_std": match_rate_std,
             "rmse": rmse_mean,
             "rmse_std": rmse_std,
+            "composition_match_rate": composition_match_rate_mean,
+            "composition_match_rate_std": composition_match_rate_std,
+            "requested_space_group_match_rate": requested_sg_match_rate_mean,
+            "requested_space_group_match_rate_std": requested_sg_match_rate_std,
             "num_samples": pass_summaries[0].get("num_samples") if pass_summaries else 0,
             "ablation_num_seeds": num_seeds,
             "seed_summaries": seed_summaries,
@@ -977,6 +1115,24 @@ class ExperimentRunner:
         history["match_rate_std"].append(float(match_rate_std))
         history["valid_mean"].append(float(val_sample_metrics["valid"]))
         history["valid_std"].append(float(valid_std))
+        composition_std = val_sample_metrics.get("composition_match_rate_std")
+        requested_sg_std = val_sample_metrics.get("requested_space_group_match_rate_std")
+        if (
+            val_sample_metrics.get("composition_match_rate") is not None
+            and composition_std is not None
+        ):
+            history["composition_match_rate_mean"].append(
+                float(val_sample_metrics["composition_match_rate"])
+            )
+            history["composition_match_rate_std"].append(float(composition_std))
+        if (
+            val_sample_metrics.get("requested_space_group_match_rate") is not None
+            and requested_sg_std is not None
+        ):
+            history["requested_space_group_match_rate_mean"].append(
+                float(val_sample_metrics["requested_space_group_match_rate"])
+            )
+            history["requested_space_group_match_rate_std"].append(float(requested_sg_std))
 
         rmse_fig = self._build_validation_ablation_band_figure(
             metric="rmse",
@@ -993,6 +1149,28 @@ class ExperimentRunner:
             title="Validation validity across sampling seeds",
             y_label="Validity",
         )
+        extra_payload = {}
+        extra_figures = []
+        if history["requested_space_group_match_rate_mean"]:
+            requested_sg_fig = self._build_validation_ablation_band_figure(
+                metric="requested_space_group_match_rate",
+                title="Validation requested SG match rate across sampling seeds",
+                y_label="Requested SG match rate",
+            )
+            extra_payload["val_sampling/requested_sg_match_rate_mean_std_plot"] = wandb.Image(
+                requested_sg_fig
+            )
+            extra_figures.append(requested_sg_fig)
+        if history["composition_match_rate_mean"]:
+            composition_fig = self._build_validation_ablation_band_figure(
+                metric="composition_match_rate",
+                title="Validation composition match rate across sampling seeds",
+                y_label="Composition match rate",
+            )
+            extra_payload["val_sampling/composition_match_rate_mean_std_plot"] = wandb.Image(
+                composition_fig
+            )
+            extra_figures.append(composition_fig)
 
         self.run.log(
             {
@@ -1000,6 +1178,7 @@ class ExperimentRunner:
                 "val_sampling/rmse_mean_std_plot": wandb.Image(rmse_fig),
                 "val_sampling/match_rate_mean_std_plot": wandb.Image(match_rate_fig),
                 "val_sampling/valid_mean_std_plot": wandb.Image(valid_fig),
+                **extra_payload,
             },
             step=epoch,
         )
@@ -1007,6 +1186,8 @@ class ExperimentRunner:
         plt.close(rmse_fig)
         plt.close(match_rate_fig)
         plt.close(valid_fig)
+        for fig in extra_figures:
+            plt.close(fig)
 
     def validate_epoch(self, epoch: int) -> None:
         # Match facitKLDM semantics:
@@ -1038,6 +1219,10 @@ class ExperimentRunner:
             "valid": val_sample_metrics["valid"],
             "match_rate": val_sample_metrics["match_rate"],
             "rmse": val_sample_metrics["rmse"],
+            "composition_match_rate": val_sample_metrics.get("composition_match_rate"),
+            "requested_space_group_match_rate": val_sample_metrics.get(
+                "requested_space_group_match_rate"
+            ),
         }
         if "valid_std" in val_sample_metrics:
             merged_metrics["valid_std"] = val_sample_metrics["valid_std"]
@@ -1045,6 +1230,14 @@ class ExperimentRunner:
             merged_metrics["match_rate_std"] = val_sample_metrics["match_rate_std"]
         if "rmse_std" in val_sample_metrics:
             merged_metrics["rmse_std"] = val_sample_metrics["rmse_std"]
+        if "composition_match_rate_std" in val_sample_metrics:
+            merged_metrics["composition_match_rate_std"] = val_sample_metrics[
+                "composition_match_rate_std"
+            ]
+        if "requested_space_group_match_rate_std" in val_sample_metrics:
+            merged_metrics["requested_space_group_match_rate_std"] = val_sample_metrics[
+                "requested_space_group_match_rate_std"
+            ]
         log_data = {
             "epoch": epoch,
             "val/loss_v": merged_metrics["loss_v"],
@@ -1055,7 +1248,21 @@ class ExperimentRunner:
             "val/valid": merged_metrics["valid"],
             "val/match_rate": merged_metrics["match_rate"],
             "val/rmse": merged_metrics["rmse"],
+            "val/composition_match_rate": merged_metrics["composition_match_rate"],
+            "val/requested_space_group_match_rate": merged_metrics["requested_space_group_match_rate"],
         }
+        if "valid_std" in merged_metrics:
+            log_data["val/valid_std"] = merged_metrics["valid_std"]
+        if "match_rate_std" in merged_metrics:
+            log_data["val/match_rate_std"] = merged_metrics["match_rate_std"]
+        if "rmse_std" in merged_metrics:
+            log_data["val/rmse_std"] = merged_metrics["rmse_std"]
+        if "composition_match_rate_std" in merged_metrics:
+            log_data["val/composition_match_rate_std"] = merged_metrics["composition_match_rate_std"]
+        if "requested_space_group_match_rate_std" in merged_metrics:
+            log_data["val/requested_space_group_match_rate_std"] = merged_metrics[
+                "requested_space_group_match_rate_std"
+            ]
         self.run.log(log_data, step=epoch)
         self._log_validation_ablation_band_plots(
             epoch=epoch,
@@ -1071,15 +1278,25 @@ class ExperimentRunner:
             f"loss_l_weighted={merged_metrics['loss_l_weighted']:.6f}) "
             f"valid={format_metric(merged_metrics['valid'], '.4f')} "
             f"match_rate={format_metric(merged_metrics['match_rate'], '.4f')} "
-            f"rmse={format_metric(merged_metrics['rmse'], '.6f')}",
+            f"rmse={format_metric(merged_metrics['rmse'], '.6f')} "
+            f"composition_match_rate={format_metric(merged_metrics.get('composition_match_rate'), '.4f')} "
+            f"requested_sg_match_rate={format_metric(merged_metrics.get('requested_space_group_match_rate'), '.4f')}",
             flush=True,
         )
-        if "valid_std" in merged_metrics or "match_rate_std" in merged_metrics or "rmse_std" in merged_metrics:
+        if (
+            "valid_std" in merged_metrics
+            or "match_rate_std" in merged_metrics
+            or "rmse_std" in merged_metrics
+            or "composition_match_rate_std" in merged_metrics
+            or "requested_space_group_match_rate_std" in merged_metrics
+        ):
             print(
                 f"validation_epoch_std={epoch:04d} "
                 f"valid_std={format_metric(merged_metrics.get('valid_std'), '.4f')} "
                 f"match_rate_std={format_metric(merged_metrics.get('match_rate_std'), '.4f')} "
-                f"rmse_std={format_metric(merged_metrics.get('rmse_std'), '.6f')}",
+                f"rmse_std={format_metric(merged_metrics.get('rmse_std'), '.6f')} "
+                f"composition_match_rate_std={format_metric(merged_metrics.get('composition_match_rate_std'), '.4f')} "
+                f"requested_sg_match_rate_std={format_metric(merged_metrics.get('requested_space_group_match_rate_std'), '.4f')}",
                 flush=True,
             )
         seed_summaries = val_sample_metrics.get("seed_summaries", [])
@@ -1097,9 +1314,29 @@ class ExperimentRunner:
                 "rmse_values": [summary.get("rmse") for summary in seed_summaries],
                 "rmse_mean": merged_metrics.get("rmse"),
                 "rmse_std": merged_metrics.get("rmse_std"),
+                "composition_match_rate_values": [
+                    summary.get("composition_match_rate") for summary in seed_summaries
+                ],
+                "composition_match_rate_mean": merged_metrics.get("composition_match_rate"),
+                "composition_match_rate_std": merged_metrics.get("composition_match_rate_std"),
+                "requested_space_group_match_rate_values": [
+                    summary.get("requested_space_group_match_rate") for summary in seed_summaries
+                ],
+                "requested_space_group_match_rate_mean": merged_metrics.get(
+                    "requested_space_group_match_rate"
+                ),
+                "requested_space_group_match_rate_std": merged_metrics.get(
+                    "requested_space_group_match_rate_std"
+                ),
             }
             print(
                 f"validation_ablation_backup={json.dumps(backup_payload, sort_keys=True)}",
+                flush=True,
+            )
+        requested_sg_summaries = val_sample_metrics.get("requested_sg_summaries", [])
+        if requested_sg_summaries:
+            print(
+                f"validation_requested_sg_backup={json.dumps(requested_sg_summaries, sort_keys=True)}",
                 flush=True,
             )
         if checkpoint_uploaded:

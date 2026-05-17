@@ -35,7 +35,7 @@ model:
     pred_h: false
     zero_cog: true
     sg_conditional: true
-    sg_emb_dim: 128
+    sg_emb_dim: 512
     num_space_groups: 230
 
 sampling_compare:

@@ -249,13 +249,37 @@ class CrystalDatasetWrapper(Dataset):
             f"path={self.processed_split_folder}",
             flush=True,
         )
+        print(
+            f"dataset_cache action=from_csv:start dataset={self.dataset_name} split={self.split}",
+            flush=True,
+        )
         builder = CrystalDatasetBuilder.from_csv(
             csv_path=str(self.raw_csv),
             cache_path=str(self.processed_split_folder),
             transforms=self.transforms,
         )
+        print(
+            f"dataset_cache action=from_csv:done dataset={self.dataset_name} split={self.split}",
+            flush=True,
+        )
+        print(
+            f"dataset_cache action=ensure_required_properties:start dataset={self.dataset_name} split={self.split}",
+            flush=True,
+        )
         self._ensure_required_properties(builder)
+        print(
+            f"dataset_cache action=ensure_required_properties:done dataset={self.dataset_name} split={self.split}",
+            flush=True,
+        )
+        print(
+            f"dataset_cache action=write_meta:start dataset={self.dataset_name} split={self.split}",
+            flush=True,
+        )
         self._write_cache_meta()
+        print(
+            f"dataset_cache action=write_meta:done dataset={self.dataset_name} split={self.split}",
+            flush=True,
+        )
         return builder
 
     def _lock_is_stale(self) -> bool:
@@ -323,55 +347,88 @@ class CrystalDatasetWrapper(Dataset):
             MatterGen CrystalDataset.
         """
         cache_fresh, cache_reason = self._cache_status()
-        if cache_fresh:
+        try:
+            if cache_fresh:
+                print(
+                    f"dataset_cache action=load dataset={self.dataset_name} split={self.split} "
+                    f"reason={cache_reason} path={self.processed_split_folder}",
+                    flush=True,
+                )
+                print(
+                    f"dataset_cache action=from_cache_path:start dataset={self.dataset_name} split={self.split}",
+                    flush=True,
+                )
+                builder = CrystalDatasetBuilder.from_cache_path(
+                    cache_path=str(self.processed_split_folder),
+                    transforms=self.transforms,
+                )
+                print(
+                    f"dataset_cache action=from_cache_path:done dataset={self.dataset_name} split={self.split}",
+                    flush=True,
+                )
+            else:
+                acquired_lock = self._acquire_build_lock()
+                try:
+                    cache_fresh, cache_reason = self._cache_status()
+                    if cache_fresh:
+                        print(
+                            f"dataset_cache action=load dataset={self.dataset_name} split={self.split} "
+                            f"reason={cache_reason} path={self.processed_split_folder}",
+                            flush=True,
+                        )
+                        print(
+                            f"dataset_cache action=from_cache_path:start dataset={self.dataset_name} split={self.split}",
+                            flush=True,
+                        )
+                        builder = CrystalDatasetBuilder.from_cache_path(
+                            cache_path=str(self.processed_split_folder),
+                            transforms=self.transforms,
+                        )
+                        print(
+                            f"dataset_cache action=from_cache_path:done dataset={self.dataset_name} split={self.split}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"dataset_cache action=stale dataset={self.dataset_name} split={self.split} "
+                            f"reason={cache_reason} path={self.processed_split_folder}",
+                            flush=True,
+                        )
+                        # Code segment inspired from mattergen
+                        # (mattergen/common/data/dataset.py:528-556,
+                        #  mattergen/common/data/dataset.py:354-360).
+                        #
+                        # Important preprocessing note:
+                        # CrystalDatasetBuilder.from_csv(...) already parses CIFs, converts
+                        # them to primitive structures, and applies `get_reduced_structure()`
+                        # before writing the processed cache. We intentionally rely on that
+                        # upstream full-structure reduction here instead of trying to reduce
+                        # only the lattice matrix later in a transform.
+                        builder = self._rebuild_cache()
+                finally:
+                    if acquired_lock:
+                        self._release_build_lock()
+
             print(
-                f"dataset_cache action=load dataset={self.dataset_name} split={self.split} "
-                f"reason={cache_reason} path={self.processed_split_folder}",
+                f"dataset_cache action=builder_build:start dataset={self.dataset_name} split={self.split}",
                 flush=True,
             )
-            builder = CrystalDatasetBuilder.from_cache_path(
-                cache_path=str(self.processed_split_folder),
-                transforms=self.transforms,
+            dataset = builder.build(
+                dataset_class=CrystalDataset,
+                dataset_transforms=self.dataset_transforms,
             )
-        else:
-            acquired_lock = self._acquire_build_lock()
-            try:
-                cache_fresh, cache_reason = self._cache_status()
-                if cache_fresh:
-                    print(
-                        f"dataset_cache action=load dataset={self.dataset_name} split={self.split} "
-                        f"reason={cache_reason} path={self.processed_split_folder}",
-                        flush=True,
-                    )
-                    builder = CrystalDatasetBuilder.from_cache_path(
-                        cache_path=str(self.processed_split_folder),
-                        transforms=self.transforms,
-                    )
-                else:
-                    print(
-                        f"dataset_cache action=stale dataset={self.dataset_name} split={self.split} "
-                        f"reason={cache_reason} path={self.processed_split_folder}",
-                        flush=True,
-                    )
-                    # Code segment inspired from mattergen
-                    # (mattergen/common/data/dataset.py:528-556,
-                    #  mattergen/common/data/dataset.py:354-360).
-                    #
-                    # Important preprocessing note:
-                    # CrystalDatasetBuilder.from_csv(...) already parses CIFs, converts
-                    # them to primitive structures, and applies `get_reduced_structure()`
-                    # before writing the processed cache. We intentionally rely on that
-                    # upstream full-structure reduction here instead of trying to reduce
-                    # only the lattice matrix later in a transform.
-                    builder = self._rebuild_cache()
-            finally:
-                if acquired_lock:
-                    self._release_build_lock()
-
-        return builder.build(
-            dataset_class=CrystalDataset,
-            dataset_transforms=self.dataset_transforms,
-        )
+            print(
+                f"dataset_cache action=builder_build:done dataset={self.dataset_name} split={self.split}",
+                flush=True,
+            )
+            return dataset
+        except Exception as exc:
+            print(
+                f"dataset_cache action=error dataset={self.dataset_name} split={self.split} "
+                f"error_type={type(exc).__name__} error={exc}",
+                flush=True,
+            )
+            raise
 
     def _space_group_for_structure_id(self, structure_id: str) -> int:
         if self._space_group_number_map is None:

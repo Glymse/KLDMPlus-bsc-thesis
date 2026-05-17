@@ -40,7 +40,7 @@ model:
     pred_h: false
     zero_cog: true
     sg_conditional: true
-    sg_emb_dim: 128
+    sg_emb_dim: 512
     num_space_groups: 230
 
 finetune:
@@ -65,7 +65,7 @@ logging:
   wandb_run_name: mp20_sg_adapter_finetune_from_8900
 
 validation:
-  every_n_epochs: 100
+  every_n_epochs: 20
   ablation: true
   ablation_num_seeds: 4
   ablation_seed_offset: 0
@@ -73,6 +73,10 @@ validation:
   subset_size: 1024
   subset_seed: 123
   sampling_max_graphs: 1024
+  sg_conditioned_sampling: true
+  sg_guidance_scale: 1.0
+  debug_space_group: true
+  debug_space_group_max_groups: 32
 
 checkpoint:
   # Accepts local paths or full WandB artifact file URLs.

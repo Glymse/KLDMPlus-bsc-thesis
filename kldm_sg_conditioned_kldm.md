@@ -57,12 +57,15 @@ Per message-passing layer, the conditional update is:
 
 \[
 H^{(\ell)} \leftarrow H^{(\ell)} + f_{\text{mixin}}^{(\ell)}\!\left(
-f_{\text{adapter}}^{(\ell)}(e_G)
+f_{\text{adapter}}^{(\ell)}([H^{(\ell)}, e_G])
 \right)\mathbf{1}[G \neq 0].
 \]
 
 All mix-in layers are zero-initialized, so loading `epoch_8900.pt` with
 `strict=False` starts from the unconditional model exactly.
+
+The default finetune config now uses `sg_emb_dim: 512`, which matches the
+hidden size and is closer to the released MatterGen `space_group` setup.
 
 ## Training path
 
@@ -121,6 +124,40 @@ For WandB logging, the training runner already reads:
 - `checkpoint.wandb_resume_id`
 
 from the YAML config.
+
+## Validation and debug logging
+
+The finetune still optimizes the same KLDM denoising loss, so the training loss
+curves are:
+
+- `loss_v`
+- `loss_l`
+- `loss_weighted`
+
+But the validation loop now also measures the actual SG-conditioned generation
+task directly by sampling with:
+
+- `validation.sg_conditioned_sampling: true`
+- `validation.sg_guidance_scale: 1.0`
+
+and logging:
+
+- `val/requested_space_group_match_rate`
+- `val/composition_match_rate`
+- `val/valid`
+- `val/match_rate`
+- `val/rmse`
+
+For debug runs, the runner also prints per-requested-SG summaries such as:
+
+- requested SG count
+- requested-SG match rate
+- composition match rate
+- overall matcher match rate
+- top detected SGs for that requested SG
+
+This makes it possible to see whether the adapter is actually learning the
+space-group task rather than only reducing denoising loss.
 
 ## Sampling path
 
