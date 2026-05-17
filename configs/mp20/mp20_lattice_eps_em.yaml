@@ -52,6 +52,9 @@ validation:
   sampling_max_graphs: 1024
 
 checkpoint:
+  # Local-path resume only for the legacy src/kldm/run_experiment.py runner.
+  # If you want to resume from a full WandB artifact URL, use the kldm_plus
+  # runner and the matching config in configs/kldm_plus/mp_20/.
   resume_from: null #../../artifacts/HPC/checkpoints/experiments/mp20_lattice_eps_em/mp20_lattice_eps_em_final.pt
   wandb_resume_id: null #utrhzdr8  # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
 
