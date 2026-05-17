@@ -96,6 +96,7 @@ The repo config for this is:
 Important settings:
 
 - `checkpoint.resume_from: ../../../artifacts/HPC/checkpoints/epoch_8900.pt`
+- `checkpoint.resume_from` may also be a full WandB artifact file URL
 - `checkpoint.load_optimizer_state: false`
 - `checkpoint.load_ema_state: false`
 - `checkpoint.load_time_sampler_state: false`
@@ -112,6 +113,14 @@ The optimizer only sees:
 
 This filtering is implemented in
 [src/kldmPlus/utils/model_loader.py](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/src/kldmPlus/utils/model_loader.py).
+
+For WandB logging, the training runner already reads:
+
+- `logging.wandb_project`
+- `logging.wandb_run_name`
+- `checkpoint.wandb_resume_id`
+
+from the YAML config.
 
 ## Sampling path
 

@@ -11,18 +11,7 @@ dataset:
   pin_memory: true
 
 time_sampler:
-  type: loss_second_moment
-  n_bins: 64
-  history_per_bin: 10
-  alpha: 0.5
-  min_prob: 0.002
-  max_prob: 0.10
-  velocity_weight: 0.7
-  lattice_weight: 0.3
-  use_importance_weights: false
-  clip_importance_weights: true
-  weight_clip_min: 0.5
-  weight_clip_max: 2.0
+  type: uniform
 
 model:
   eps: 1.0e-6
@@ -72,6 +61,8 @@ ema:
 logging:
   train_every_epochs: 1
   wandb_checkpoints: true
+  wandb_project: mp20_sg_adapter_finetune
+  wandb_run_name: mp20_sg_adapter_finetune_from_8900
 
 validation:
   every_n_epochs: 100
@@ -84,10 +75,12 @@ validation:
   sampling_max_graphs: 1024
 
 checkpoint:
+  # Accepts local paths or full WandB artifact file URLs.
   resume_from: "https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/mp20_lattice_eps_em/artifacts/model/mp20_lattice_eps_em_validation/v91/files/epoch_8900.pt"
   load_optimizer_state: false
   load_ema_state: false
   load_time_sampler_state: false
+  # Set this only if you want to resume logging into an existing WandB run.
   wandb_resume_id: null
 
 sampling_eval:
