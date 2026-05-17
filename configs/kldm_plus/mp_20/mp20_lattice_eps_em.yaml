@@ -65,8 +65,8 @@ validation:
 checkpoint:
   # Accepts either a local checkpoint path or a full WandB artifact file URL
   # when used with src/kldmPlus/run_experiment.py via train_plus.lsf.
-  resume_from: null
-  wandb_resume_id: null # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
+  resume_from: "https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/mp20_lattice_eps_em/artifacts/model/mp20_lattice_eps_em_validation/v91/files/epoch_8900.pt"
+  wandb_resume_id: 28qx3aok # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
 
 sampling_eval:
   split: test
