@@ -19,6 +19,7 @@ try:
     from mattergen.common.data.chemgraph import ChemGraph
     from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
     from mattergen.common.data.transform import Transform
+    from pymatgen.symmetry.groups import SpaceGroup
     MATTERGEN_AVAILABLE = True
     MATTERGEN_IMPORT_ERROR: Exception | None = None
 except ImportError as exc:  # pragma: no cover
@@ -26,6 +27,7 @@ except ImportError as exc:  # pragma: no cover
     CrystalDataset = Any
     CrystalDatasetBuilder = Any
     DatasetTransform = Any
+    SpaceGroup = Any
     MATTERGEN_AVAILABLE = False
     MATTERGEN_IMPORT_ERROR = exc
 
@@ -83,7 +85,7 @@ class CrystalDatasetWrapper(Dataset):
         self.split = split
         self.transforms = transforms or []
         self.dataset_transforms = dataset_transforms or []
-        self._space_group_map: dict[str, int] | None = None
+        self._space_group_number_map: dict[str, int] | None = None
 
         #Download raw CSV only when explicitly requested.
         if download:
@@ -121,7 +123,11 @@ class CrystalDatasetWrapper(Dataset):
         #Convert a list of ChemGraph samples into one PyG Batch.
         return Batch.from_data_list(samples)
 
-    def _load_space_group_map(self) -> dict[str, int]:
+    @staticmethod
+    def _space_group_symbol(number: int) -> str:
+        return str(SpaceGroup.from_int_number(int(number)).symbol)
+
+    def _load_space_group_number_map(self) -> dict[str, int]:
         mapping: dict[str, int] = {}
         with self.raw_csv.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -133,19 +139,26 @@ class CrystalDatasetWrapper(Dataset):
                 mapping[material_id] = int(float(value))
         return mapping
 
-    def _ensure_required_properties(self, builder: CrystalDatasetBuilder) -> None:
-        available = set(builder.list_available_properties())
-        if SPACE_GROUP_PROPERTY in available:
-            return
+    def _load_space_group_symbol_map(self) -> dict[str, str]:
+        number_map = self._load_space_group_number_map()
+        return {
+            material_id: self._space_group_symbol(number)
+            for material_id, number in number_map.items()
+        }
 
+    def _ensure_required_properties(self, builder: CrystalDatasetBuilder) -> None:
         if not self.raw_csv.exists():
             raise RuntimeError(
                 f"Raw split not found at {self.raw_csv}. Cannot backfill {SPACE_GROUP_PROPERTY!r}."
             )
 
+        # Always overwrite the cached space-group property from the raw CSV.
+        # Older caches may contain numeric values, but MatterGen expects the
+        # cached property in Hermann-Mauguin symbol form and will normalize it
+        # back to an int internally.
         builder.add_property_to_cache(
             SPACE_GROUP_PROPERTY,
-            data=self._load_space_group_map(),
+            data=self._load_space_group_symbol_map(),
         )
 
     def _build(self) -> CrystalDataset:
@@ -190,15 +203,15 @@ class CrystalDatasetWrapper(Dataset):
         )
 
     def _space_group_for_structure_id(self, structure_id: str) -> int:
-        if self._space_group_map is None:
+        if self._space_group_number_map is None:
             if not self.raw_csv.exists():
                 raise RuntimeError(
                     f"Raw split not found at {self.raw_csv}. Cannot attach {SPACE_GROUP_PROPERTY!r}."
                 )
-            self._space_group_map = self._load_space_group_map()
+            self._space_group_number_map = self._load_space_group_number_map()
 
         try:
-            return int(self._space_group_map[structure_id])
+            return int(self._space_group_number_map[structure_id])
         except KeyError as exc:
             raise KeyError(f"Missing {SPACE_GROUP_PROPERTY!r} for structure_id={structure_id!r}.") from exc
 
