@@ -127,6 +127,9 @@ class CSPVNet(nn.Module):
             pred_v: bool = True,
             zero_cog: bool = True,
             time_emb: nn.Module = None,
+            sg_conditional: bool = False,
+            sg_emb_dim: int = 128,
+            num_space_groups: int = 230,
     ):
         super(CSPVNet, self).__init__()
 
@@ -157,6 +160,32 @@ class CSPVNet(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+
+        self.sg_conditional = bool(sg_conditional)
+        self.sg_emb_dim = int(sg_emb_dim)
+        self.num_space_groups = int(num_space_groups)
+        self.null_space_group = 0
+        if self.sg_conditional:
+            self.sg_embedding = nn.Embedding(self.num_space_groups + 1, self.sg_emb_dim)
+            self.sg_adapters = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(self.sg_emb_dim, hidden_dim),
+                        self.act_fn,
+                        nn.Linear(hidden_dim, hidden_dim),
+                        self.act_fn,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+            self.sg_mixins = nn.ModuleList(
+                [
+                    nn.Linear(hidden_dim, hidden_dim, bias=False)
+                    for _ in range(num_layers)
+                ]
+            )
+            for mixin in self.sg_mixins:
+                nn.init.zeros_(mixin.weight)
 
         # Readout layers
         if ln:
@@ -191,6 +220,7 @@ class CSPVNet(nn.Module):
             l: torch.Tensor,
             node_index: torch.Tensor,
             edge_node_index: torch.Tensor,
+            space_group: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
 
         t = self.time_emb(t)
@@ -203,7 +233,43 @@ class CSPVNet(nn.Module):
         pos_diff = pos[edge_node_index[1]] - pos[edge_node_index[0]]
         edge_graph_index = node_index[edge_node_index[0]]
 
-        for layer in self.layers:
+        if self.sg_conditional:
+            if node_index.numel() == 0:
+                num_graphs = 0
+            else:
+                num_graphs = int(node_index.max().item()) + 1
+
+            if space_group is None:
+                space_group = torch.zeros(
+                    (num_graphs,),
+                    device=node_index.device,
+                    dtype=torch.long,
+                )
+            else:
+                space_group = space_group.to(
+                    device=node_index.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+
+            if space_group.numel() != num_graphs:
+                raise ValueError(
+                    f"space_group must have shape [num_graphs], got {tuple(space_group.shape)} "
+                    f"for num_graphs={num_graphs}.",
+                )
+
+            sg_emb = self.sg_embedding(space_group)
+            sg_mask = (space_group != self.null_space_group).to(
+                dtype=node_features.dtype,
+                device=node_features.device,
+            ).view(-1, 1)
+
+        for layer_idx, layer in enumerate(self.layers):
+            if self.sg_conditional:
+                delta_graph = self.sg_mixins[layer_idx](
+                    self.sg_adapters[layer_idx](sg_emb)
+                )
+                delta_graph = delta_graph * sg_mask
+                node_features = node_features + delta_graph[node_index]
             node_features = layer.forward(
                 pos_diff=pos_diff,
                 v=v,

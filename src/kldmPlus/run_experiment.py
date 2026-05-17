@@ -375,11 +375,14 @@ class ExperimentRunner:
                 resume_from,
                 config_path=self.config_path,
             )
+            load_optimizer_state = bool(self.checkpoint_cfg.get("load_optimizer_state", True))
+            load_ema_state = bool(self.checkpoint_cfg.get("load_ema_state", True))
+            load_time_sampler_state = bool(self.checkpoint_cfg.get("load_time_sampler_state", True))
             checkpoint = load_checkpoint(
                 checkpoint_path=resolved_checkpoint_path,
                 model=self.model,
-                optimizer=self.optimizer,
-                ema=self.ema,
+                optimizer=self.optimizer if load_optimizer_state else None,
+                ema=self.ema if load_ema_state else None,
                 device=self.device,
                 prefer_ema_weights=False,
             )
@@ -396,7 +399,8 @@ class ExperimentRunner:
                 f"checkpoint_loaded path={resolved_checkpoint_path} epoch={self.start_epoch}",
                 flush=True,
             )
-            self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
+            if load_time_sampler_state and checkpoint.get("time_sampler_state_dict") is not None:
+                self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
             if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
                 prune_wandb_artifact_cache(resolved_checkpoint_path)
 

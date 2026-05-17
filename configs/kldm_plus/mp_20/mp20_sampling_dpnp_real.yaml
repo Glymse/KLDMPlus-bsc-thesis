@@ -34,6 +34,9 @@ model:
     pred_l: true
     pred_h: false
     zero_cog: true
+    sg_conditional: true
+    sg_emb_dim: 128
+    num_space_groups: 230
 
 sampling_compare:
   checkpoint_path: ../../../artifacts/HPC/checkpoints/epoch_8900.pt
@@ -92,6 +95,8 @@ sampling_compare:
         ambient_dds_t_final: 1.0e-3
         ambient_dds_velocity_steps: 50
         ambient_dds_velocity_step_size: 5.0e-5
+        sg_conditioned_dds: false
+        sg_guidance_scale: 1.0
 
         steric_softplus_tau: 0.1
         template_init_restarts: 12

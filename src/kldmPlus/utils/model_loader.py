@@ -50,15 +50,57 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         mattergen_pos_loss_weight=cfg.get("mattergen_pos_loss_weight"),
         mattergen_cell_loss_weight=cfg.get("mattergen_cell_loss_weight"),
         mattergen_pos_loss_reduce=cfg.get("mattergen_pos_loss_reduce"),
+        sg_condition_dropout=float(cfg.get("sg_condition_dropout", 0.0)),
         score_network_kwargs=score_network,
     ).to(device)
+
+
+def configure_trainable_parameters(model: ModelKLDM, config: dict[str, Any]) -> None:
+    cfg = _section(config, "finetune")
+    if not cfg:
+        return
+
+    train_sg_adapters_only = bool(cfg.get("train_sg_adapters_only", False))
+    freeze_base = bool(cfg.get("freeze_base", False))
+    if not train_sg_adapters_only and not freeze_base:
+        return
+
+    if not bool(getattr(model.score_network, "sg_conditional", False)):
+        raise ValueError("finetune.train_sg_adapters_only requires score_network.sg_conditional=true.")
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    enabled_prefixes = (
+        "score_network.sg_embedding",
+        "score_network.sg_adapters",
+        "score_network.sg_mixins",
+    )
+    enabled = 0
+    total = 0
+    for name, parameter in model.named_parameters():
+        total += parameter.numel()
+        if any(name.startswith(prefix) for prefix in enabled_prefixes):
+            parameter.requires_grad_(True)
+            enabled += parameter.numel()
+
+    if enabled == 0:
+        raise ValueError("No SG adapter parameters were enabled for fine-tuning.")
+
+    print(
+        f"finetune_trainable mode=sg_adapters_only enabled_params={enabled} total_params={total}",
+        flush=True,
+    )
 
 
 def build_optimizer(model: ModelKLDM, config: dict[str, Any]) -> torch.optim.Optimizer:
     cfg = _section(config, "optimizer")
     foreach = cfg.get("foreach", model.device.type == "cuda")
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found when building optimizer.")
     return torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=float(cfg.get("lr", 1e-3)),
         weight_decay=float(cfg.get("weight_decay", 1e-12)),
         amsgrad=bool(cfg.get("amsgrad", True)),
@@ -93,6 +135,7 @@ def build_training_components(
     device: torch.device,
 ) -> tuple[ModelKLDM, torch.optim.Optimizer, EMA | None]:
     model = build_model(config=config, device=device)
+    configure_trainable_parameters(model=model, config=config)
     return (
         model,
         build_optimizer(model=model, config=config),

@@ -113,6 +113,8 @@ class DPnPSVDConfig:
     ambient_dds_t_final: float = 1.0e-3
     ambient_dds_velocity_steps: int = 4
     ambient_dds_velocity_step_size: float = 1.0e-4
+    sg_conditioned_dds: bool = False
+    sg_guidance_scale: float = 1.0
     chart_dds_steps: int = 0
     chart_dds_projection_steps: int = 8
     chart_dds_kldm_steps: int = 1
@@ -2074,12 +2076,17 @@ def _sample_conditional_velocity(
     cfg: DPnPSVDConfig,
 ) -> torch.Tensor:
     node_index = batch.batch
-    times_graph = torch.tensor([float(t_graph)], device=f_t.device, dtype=f_t.dtype)
     times = model._prepare_csp_sampling(
         batch=batch,
         n_steps=1,
         t_start=max(float(t_graph), float(cfg.ambient_dds_t_final) + 1.0e-6),
         t_final=float(cfg.ambient_dds_t_final),
+        space_group=(
+            torch.as_tensor(batch.space_group, device=f_t.device, dtype=torch.long).reshape(-1)
+            if bool(cfg.sg_conditioned_dds) and hasattr(batch, "space_group")
+            else None
+        ),
+        sg_guidance_scale=float(cfg.sg_guidance_scale),
     )
     score_network = times["score_network"]
     restore_training = bool(times["restore_training"])
@@ -2091,7 +2098,7 @@ def _sample_conditional_velocity(
             graph_times = torch.full((int(batch.num_graphs), 1), float(t_graph), device=f_t.device, dtype=f_t.dtype)
             node_times = graph_times[node_index].squeeze(-1)
             for _ in range(max(int(cfg.ambient_dds_velocity_steps), 0)):
-                preds = score_network(
+                preds = model._score_network_forward(
                     t=graph_times,
                     pos=f_t,
                     v=v_t,
@@ -2099,6 +2106,8 @@ def _sample_conditional_velocity(
                     l=l_t,
                     node_index=node_index,
                     edge_node_index=batch.edge_node_index,
+                    space_group=times.get("space_group"),
+                    sg_guidance_scale=float(times.get("sg_guidance_scale", 1.0)),
                 )
                 score_v = model.tdm.reconstruct_full_reverse_velocity_score(
                     t=node_times,
@@ -2239,6 +2248,12 @@ def _dds_kldm_ambient_kernel(
         n_steps=max(1, int(cfg.ambient_dds_steps)),
         t_start=t_k,
         t_final=float(cfg.ambient_dds_t_final),
+        space_group=(
+            torch.as_tensor(prior_batch.space_group, device=l_half.device, dtype=torch.long).reshape(-1)
+            if bool(cfg.sg_conditioned_dds) and hasattr(prior_batch, "space_group")
+            else None
+        ),
+        sg_guidance_scale=float(cfg.sg_guidance_scale),
     )
     state["f_t"] = f_anchor.to(device=state["device"], dtype=state["dtype"])
     state["v_t"] = v_anchor.to(device=state["device"], dtype=state["dtype"])
@@ -2517,6 +2532,12 @@ def _chart_dds_prior_direction(
             n_steps=max(1, int(cfg.chart_dds_kldm_steps)),
             t_start=t_start,
             t_final=t_final,
+            space_group=(
+                torch.as_tensor(prior_batch.space_group, device=pos_current.device, dtype=torch.long).reshape(-1)
+                if bool(cfg.sg_conditioned_dds) and hasattr(prior_batch, "space_group")
+                else None
+            ),
+            sg_guidance_scale=float(cfg.sg_guidance_scale),
         )
     except ValueError as exc:
         if "initialize_from_clean_state received" not in str(exc):
@@ -2777,6 +2798,8 @@ def _kldm_dds_step(
     n_steps: int,
     t_start: float,
     t_final: float,
+    space_group: torch.Tensor | None = None,
+    sg_guidance_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # DPnPSVD uses this as a tiny ambient KLDM prior proposal inside chart-DDS.
     # The chart kernel itself stays in theta-space; this helper only supplies a
@@ -2786,6 +2809,8 @@ def _kldm_dds_step(
         n_steps=n_steps,
         t_start=t_start,
         t_final=t_final,
+        space_group=space_group,
+        sg_guidance_scale=sg_guidance_scale,
         initial_f=pos_clean,
         initial_l=l_clean,
         initial_a=h_clean,
@@ -3886,7 +3911,9 @@ def sample_kldm_dpnp_svd(
             f"pcs_templates={'union' if float(config.template_move_probability) > 0.0 else 'fixed'} "
             f"template_prior_mode={str(config.template_prior_mode)} "
             f"oracle_orbit_filter={int(bool(config.oracle_template_orbit_filter))} "
-            f"ambient_dds={'off' if int(config.ambient_dds_steps) <= 0 else 'kldm_reverse'}",
+            f"ambient_dds={'off' if int(config.ambient_dds_steps) <= 0 else 'kldm_reverse'} "
+            f"sg_conditioned_dds={int(bool(config.sg_conditioned_dds))} "
+            f"sg_guidance_scale={float(config.sg_guidance_scale):.3f}",
             flush=True,
         )
         if bool(config.faithful_dpnp):
@@ -3901,6 +3928,12 @@ def sample_kldm_dpnp_svd(
         batch=batch,
         t_start=t_start,
         t_final=t_final,
+        space_group=(
+            torch.as_tensor(batch.space_group, device=batch.pos.device, dtype=torch.long).reshape(-1)
+            if bool(config.sg_conditioned_dds) and hasattr(batch, "space_group")
+            else None
+        ),
+        sg_guidance_scale=float(config.sg_guidance_scale),
     )
     print(
         f"kldm_dpnpsvd_progress phase=prior graphs={int(batch.num_graphs)} "

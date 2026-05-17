@@ -3,13 +3,17 @@
 This note records the current intent and implementation shape for
 `sampling_algorithm: 8` in
 [src/kldmPlus/dpnpsvd.py](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/src/kldmPlus/dpnpsvd.py),
-paired with the active config
-[configs/kldm_plus/mp_20/mp20_sampling_dpnp.yaml](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/configs/kldm_plus/mp_20/mp20_sampling_dpnp.yaml).
+paired with the faithful sampling configs
+[configs/kldm_plus/mp_20/mp20_sampling_dpnp_debug_oracle.yaml](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/configs/kldm_plus/mp_20/mp20_sampling_dpnp_debug_oracle.yaml)
+and
+[configs/kldm_plus/mp_20/mp20_sampling_dpnp_real.yaml](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/configs/kldm_plus/mp_20/mp20_sampling_dpnp_real.yaml).
 
 The important split is:
 
 - PCS lives on the Wyckoff-chart union and enforces requested-SG structure.
 - DDS is an ambient KLDM reverse chain initialized from the PCS materialization.
+- DDS can now optionally use an SG-conditioned KLDM prior instead of the
+  unconditional prior.
 - In faithful mode, extra post-hoc refinement and anchor pair-distance
   heuristics are disabled.
 - Because the learned \(P(a, W \mid G)\) MLP is not trained yet, the active
@@ -51,6 +55,9 @@ The active config still uses a temporary oracle-surrogate for template prior
 selection because the learned \(P(a,W \mid G)\) MLP is not trained yet. This
 surrogate only affects the discrete template proposal/initialization path. It
 does not alter the PCS energy or the DDS kernel.
+
+The SG-conditioned KLDM training path is documented separately in
+[kldm_sg_conditioned_kldm.md](/Users/glymov/DTU/6%20Semester/Bachelor/Github/Main/kldm/kldm_sg_conditioned_kldm.md).
 
 ## Active config values
 
@@ -112,6 +119,8 @@ Ambient DDS parameters:
 - `ambient_dds_t_final: 1.0e-3`
 - `ambient_dds_velocity_steps: 50`
 - `ambient_dds_velocity_step_size: 5.0e-5`
+- `sg_conditioned_dds: false`
+- `sg_guidance_scale: 1.0`
 
 Fixed-template debug diagnostics:
 
@@ -138,7 +147,7 @@ posterior is
 \[
 \pi_G(x_0 \mid a)
 \propto
-p_{\mathrm{KLDM}}(x_0 \mid a)\,
+p_{\theta,G}(x_0 \mid a, G)\,
 \mathbf{1}\{\operatorname{SG}(x_0)=G\}\,
 \mathbf{1}\{d_{\min}(x_0)\ge d_0\}\,
 \exp\!\left(-E_{\mathrm{phys}}(x_0)\right).
@@ -159,13 +168,13 @@ Then
 \[
 \pi_G(x_0 \mid a)
 \propto
-p_{\mathrm{KLDM}}(x_0\mid a)\,\psi_G(x_0).
+p_{\theta,G}(x_0\mid a,G)\,\psi_G(x_0).
 \]
 
 DPnP splits this into two kernels:
 
 - PCS: enforce \(\psi_G\),
-- DDS: inject \(p_{\mathrm{KLDM}}(x\mid a)\).
+- DDS: inject the learned conditional prior \(p_{\theta,G}(x\mid a,G)\).
 
 ## State representation
 
@@ -191,13 +200,14 @@ with \(\epsilon\)-prediction.
 
 ## Initialization
 
-The sampler starts by drawing an unconstrained KLDM sample:
+The sampler starts by drawing a KLDM prior sample:
 
 \[
 x^{\mathrm{prior}} = (f^{\mathrm{prior}}, l^{\mathrm{prior}})
-\sim p_{\mathrm{KLDM}}(x\mid a).
+\sim p_{\theta,G}(x\mid a,G),
 \]
 
+when `sg_conditioned_dds: true`, and otherwise from the unconditional prior.
 In the code this comes from the ambient KLDM sampling path before any PCS step.
 
 This initial sample is not yet forced to satisfy the requested space group.

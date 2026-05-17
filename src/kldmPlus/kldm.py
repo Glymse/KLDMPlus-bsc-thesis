@@ -76,6 +76,7 @@ class PreparedTrainingBatch:
     edge_node_index: torch.Tensor
     num_graphs: int
     lattice_representation: str
+    space_group: torch.Tensor | None = None
 
 
 def _lengths_angles_to_cell_matrix(
@@ -537,6 +538,7 @@ class ModelKLDM(nn.Module):
         mattergen_pos_loss_weight: float | None = None,
         mattergen_cell_loss_weight: float | None = None,
         mattergen_pos_loss_reduce: str | None = None,
+        sg_condition_dropout: float = 0.0,
         *,
         score_network_kwargs: dict[str, Any],
     ) -> None:
@@ -581,6 +583,9 @@ class ModelKLDM(nn.Module):
         )
         if self.mattergen_pos_loss_reduce not in {"sum", "mean"}:
             raise ValueError("mattergen_pos_loss_reduce must be 'sum' or 'mean'.")
+        self.sg_condition_dropout = float(sg_condition_dropout)
+        if not 0.0 <= self.sg_condition_dropout <= 1.0:
+            raise ValueError("sg_condition_dropout must be in [0, 1].")
 
     @staticmethod
     def _build_lattice_diffusion(
@@ -747,6 +752,11 @@ class ModelKLDM(nn.Module):
             index=index,
         )
 
+        space_group = self._space_group_condition(
+            batch=batch,
+            training_dropout=True,
+        )
+
         return PreparedTrainingBatch(
             times=times,
             v_t=v_t,
@@ -759,6 +769,7 @@ class ModelKLDM(nn.Module):
             edge_node_index=batch.edge_node_index,
             num_graphs=int(batch.num_graphs),
             lattice_representation=self.lattice_representation,
+            space_group=space_group,
         )
 
     def loss_from_prepared(
@@ -782,6 +793,7 @@ class ModelKLDM(nn.Module):
             l=prepared.l_t,
             node_index=prepared.node_index,
             edge_node_index=prepared.edge_node_index,
+            space_group=prepared.space_group,
         )
 
         out_v = preds["v"]
@@ -846,6 +858,92 @@ class ModelKLDM(nn.Module):
             "loss_l_weighted_graph": loss_l_weighted_graph.detach(),
         }
         return total_loss, metrics
+
+    def _space_group_condition(
+        self,
+        *,
+        batch: Data | Batch,
+        training_dropout: bool,
+    ) -> torch.Tensor | None:
+        if not bool(getattr(self.score_network, "sg_conditional", False)):
+            return None
+        if not hasattr(batch, "space_group"):
+            raise ValueError("SG-conditioned KLDM requires batch.space_group.")
+        device = next(self.parameters()).device
+        space_group = torch.as_tensor(
+            batch.space_group,
+            device=device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if training_dropout and self.sg_condition_dropout > 0.0:
+            drop_mask = torch.rand(space_group.shape, device=device) < self.sg_condition_dropout
+            space_group = space_group.clone()
+            space_group[drop_mask] = 0
+        return space_group
+
+    def _score_network_forward(
+        self,
+        *,
+        t: torch.Tensor,
+        pos: torch.Tensor,
+        v: torch.Tensor,
+        h: torch.Tensor,
+        l: torch.Tensor,
+        node_index: torch.Tensor,
+        edge_node_index: torch.Tensor,
+        space_group: torch.Tensor | None = None,
+        sg_guidance_scale: float = 1.0,
+    ) -> dict[str, torch.Tensor]:
+        if not bool(getattr(self.score_network, "sg_conditional", False)):
+            return self.score_network(
+                t=t,
+                pos=pos,
+                v=v,
+                h=h,
+                l=l,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+            )
+
+        if space_group is None:
+            return self.score_network(
+                t=t,
+                pos=pos,
+                v=v,
+                h=h,
+                l=l,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                space_group=None,
+            )
+
+        pred_cond = self.score_network(
+            t=t,
+            pos=pos,
+            v=v,
+            h=h,
+            l=l,
+            node_index=node_index,
+            edge_node_index=edge_node_index,
+            space_group=space_group,
+        )
+        if float(sg_guidance_scale) == 1.0:
+            return pred_cond
+
+        pred_uncond = self.score_network(
+            t=t,
+            pos=pos,
+            v=v,
+            h=h,
+            l=l,
+            node_index=node_index,
+            edge_node_index=edge_node_index,
+            space_group=torch.zeros_like(space_group),
+        )
+        guided: dict[str, torch.Tensor] = {}
+        for key, value in pred_cond.items():
+            guided[key] = pred_uncond[key] + float(sg_guidance_scale) * (value - pred_uncond[key])
+        return guided
 
     def algorithm2_loss(
         self,
@@ -1081,6 +1179,8 @@ class ModelKLDM(nn.Module):
         batch: Batch | Data,
         t_start: float = 1.0,
         t_final: float = 1e-6,
+        space_group: torch.Tensor | None = None,
+        sg_guidance_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Algorithm 3 from Appendix H: EM sampling for the CSP model.
@@ -1096,6 +1196,8 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
+            space_group=space_group,
+            sg_guidance_scale=sg_guidance_scale,
         )
         state = self._run_csp_em_reverse_chain(state)
 
@@ -1141,6 +1243,7 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
+            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
 
         for step_idx, times in enumerate(
@@ -1148,7 +1251,7 @@ class ModelKLDM(nn.Module):
             start=1,
         ):
             with torch.no_grad():
-                preds_curr = state["score_network"](
+                preds_curr = self._score_network_forward(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1156,6 +1259,8 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
+                    space_group=state.get("space_group"),
+                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
@@ -1238,6 +1343,7 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
+            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
 
         with torch.no_grad():
@@ -1246,7 +1352,7 @@ class ModelKLDM(nn.Module):
                 # times.now is the current/noisier time, and times.next is the
                 # predicted/cleaner time used for the second network evaluation.
                 # 1. Evaluate the network at the current time level t_n.
-                preds_curr = state["score_network"](
+                preds_curr = self._score_network_forward(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1254,6 +1360,8 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
+                    space_group=state.get("space_group"),
+                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 # 2. Predictor from t_n to t_{n+1}. The TDM helper uses the
@@ -1275,7 +1383,7 @@ class ModelKLDM(nn.Module):
                 if times.t_next_float < 1e-3:
                     continue
 
-                preds_next = state["score_network"](
+                preds_next = self._score_network_forward(
                     t=times.next.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1283,6 +1391,8 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
+                    space_group=state.get("space_group"),
+                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 # 4. Single corrector step at t_{n+1}.
@@ -1329,11 +1439,12 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
+            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
 
         with torch.no_grad():
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
-                preds_curr = state["score_network"](
+                preds_curr = self._score_network_forward(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1341,6 +1452,8 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
+                    space_group=state.get("space_group"),
+                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
@@ -1391,12 +1504,13 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
+            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
 
         with torch.no_grad():
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
                 for _ in range(max(int(n_correction_steps), 1)):
-                    preds_corr = state["score_network"](
+                    preds_corr = self._score_network_forward(
                         t=times.now.graph,
                         pos=state["f_t"],
                         v=state["v_t"],
@@ -1404,6 +1518,8 @@ class ModelKLDM(nn.Module):
                         l=state["l_t"],
                         node_index=state["node_index"],
                         edge_node_index=state["edge_node_index"],
+                        space_group=state.get("space_group"),
+                        sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                     )
 
                     state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_corrector(
@@ -1423,7 +1539,7 @@ class ModelKLDM(nn.Module):
                         tau=tau,
                     )
 
-                preds_pred = state["score_network"](
+                preds_pred = self._score_network_forward(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1431,6 +1547,8 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
+                    space_group=state.get("space_group"),
+                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_predictor(
@@ -2097,6 +2215,8 @@ class ModelKLDM(nn.Module):
         n_steps: int,
         t_start: float,
         t_final: float,
+        space_group: torch.Tensor | None = None,
+        sg_guidance_scale: float = 1.0,
         initial_f: torch.Tensor | None = None,
         initial_v: torch.Tensor | None = None,
         initial_l: torch.Tensor | None = None,
@@ -2186,6 +2306,18 @@ class ModelKLDM(nn.Module):
         restore_training = score_network.training
         score_network.eval()
 
+        if bool(getattr(score_network, "sg_conditional", False)):
+            if space_group is None and hasattr(batch, "space_group"):
+                space_group = torch.as_tensor(
+                    batch.space_group,
+                    device=device,
+                    dtype=torch.long,
+                ).reshape(-1)
+            elif space_group is not None:
+                space_group = space_group.to(device=device, dtype=torch.long).reshape(-1)
+        else:
+            space_group = None
+
         sampling_time_grid = sampling_grid(
             batch=batch,
             n_steps=n_steps,
@@ -2209,6 +2341,8 @@ class ModelKLDM(nn.Module):
             "v_t": v_t,
             "l_t": l_t,
             "a_t": a_t,
+            "space_group": space_group,
+            "sg_guidance_scale": float(sg_guidance_scale),
             "sampling_time_grid": sampling_time_grid,
         }
 
@@ -2219,7 +2353,7 @@ class ModelKLDM(nn.Module):
             different sign than the appendix algorithms.
             """
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
-                preds_curr = state["score_network"](
+                preds_curr = self._score_network_forward(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -2227,6 +2361,8 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
+                    space_group=state.get("space_group"),
+                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
