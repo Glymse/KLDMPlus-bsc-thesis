@@ -344,14 +344,20 @@ class ExperimentRunner:
         # Runtime objects: device, data, model, optimizer, EMA
         # -------------------------------------------------
         self.device = get_default_device()
+        print("startup phase=create_loaders:start", flush=True)
         self.train_loader, self.val_loader, self.lattice_transform = self.create_loaders()
+        print("startup phase=create_loaders:done", flush=True)
+        print("startup phase=build_time_sampler:start", flush=True)
         self.time_sampler = self.build_time_sampler()
+        print("startup phase=build_time_sampler:done", flush=True)
         self._inject_mattergen_lattice_stats()
 
+        print("startup phase=build_training_components:start", flush=True)
         self.model, self.optimizer, self.ema = build_training_components(
             config=self.config,
             device=self.device,
         )
+        print("startup phase=build_training_components:done", flush=True)
 
         self.start_epoch = 0
         self.run = None
@@ -371,13 +377,19 @@ class ExperimentRunner:
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
         if resume_from:
+            print("startup phase=resolve_checkpoint:start", flush=True)
             resolved_checkpoint_path = resolve_checkpoint_reference(
                 resume_from,
                 config_path=self.config_path,
             )
+            print(
+                f"startup phase=resolve_checkpoint:done path={resolved_checkpoint_path}",
+                flush=True,
+            )
             load_optimizer_state = bool(self.checkpoint_cfg.get("load_optimizer_state", True))
             load_ema_state = bool(self.checkpoint_cfg.get("load_ema_state", True))
             load_time_sampler_state = bool(self.checkpoint_cfg.get("load_time_sampler_state", True))
+            print("startup phase=load_checkpoint:start", flush=True)
             checkpoint = load_checkpoint(
                 checkpoint_path=resolved_checkpoint_path,
                 model=self.model,
@@ -386,6 +398,7 @@ class ExperimentRunner:
                 device=self.device,
                 prefer_ema_weights=False,
             )
+            print("startup phase=load_checkpoint:done", flush=True)
             self.start_epoch = int(checkpoint["epoch"])
             filename_epoch = epoch_from_checkpoint_name(resolved_checkpoint_path)
             if filename_epoch is not None and filename_epoch != self.start_epoch:

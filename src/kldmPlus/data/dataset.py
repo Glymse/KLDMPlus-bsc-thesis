@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 import requests
@@ -41,6 +43,8 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_ROOT = WORKSPACE_ROOT / "data"
 SPACE_GROUP_PROPERTY = "space_group"
 SPACE_GROUP_COLUMN = "spacegroup.number"
+CACHE_SCHEMA_VERSION = 1
+CACHE_META_FILENAME = "_kldm_cache_meta.json"
 
 
 def resolve_data_root(root: str | Path | None = None) -> Path:
@@ -115,6 +119,10 @@ class CrystalDatasetWrapper(Dataset):
         return self.processed_folder / self.split
 
     @property
+    def cache_meta_path(self) -> Path:
+        return self.processed_split_folder / CACHE_META_FILENAME
+
+    @property
     def required_properties(self) -> list[str]:
         return [SPACE_GROUP_PROPERTY]
 
@@ -161,25 +169,109 @@ class CrystalDatasetWrapper(Dataset):
             data=self._load_space_group_symbol_map(),
         )
 
+    def _raw_signature(self) -> dict[str, int] | None:
+        if not self.raw_csv.exists():
+            return None
+        stat = self.raw_csv.stat()
+        return {
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    def _cache_meta_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "dataset_name": self.dataset_name,
+            "split": self.split,
+            "required_properties": sorted(self.required_properties),
+            "raw_csv": str(self.raw_csv),
+            "raw_signature": self._raw_signature(),
+        }
+
+    def _read_cache_meta(self) -> dict[str, Any] | None:
+        if not self.cache_meta_path.exists():
+            return None
+        try:
+            with self.cache_meta_path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return None
+
+    def _write_cache_meta(self) -> None:
+        self.processed_split_folder.mkdir(parents=True, exist_ok=True)
+        payload = self._cache_meta_payload()
+        with self.cache_meta_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    def _cache_status(self) -> tuple[bool, str]:
+        if not self.processed_split_folder.exists():
+            return False, "missing_processed_split"
+
+        meta = self._read_cache_meta()
+        if meta is None:
+            if self.raw_csv.exists():
+                return False, "missing_or_invalid_meta"
+            return True, "using_legacy_cache_without_raw_csv"
+
+        if int(meta.get("schema_version", -1)) != CACHE_SCHEMA_VERSION:
+            return False, "schema_version_mismatch"
+        if str(meta.get("dataset_name")) != str(self.dataset_name):
+            return False, "dataset_name_mismatch"
+        if str(meta.get("split")) != str(self.split):
+            return False, "split_mismatch"
+        if sorted(meta.get("required_properties", [])) != sorted(self.required_properties):
+            return False, "required_properties_mismatch"
+        if str(meta.get("raw_csv")) != str(self.raw_csv):
+            return False, "raw_csv_path_mismatch"
+        if meta.get("raw_signature") != self._raw_signature():
+            return False, "raw_signature_mismatch"
+        return True, "fresh"
+
+    def _rebuild_cache(self) -> CrystalDatasetBuilder:
+        if not self.raw_csv.exists():
+            raise RuntimeError(
+                f"Raw split not found at {self.raw_csv}. Pass download=True to fetch it first."
+            )
+        if self.processed_split_folder.exists():
+            shutil.rmtree(self.processed_split_folder, ignore_errors=True)
+        print(
+            f"dataset_cache action=rebuild dataset={self.dataset_name} split={self.split} "
+            f"path={self.processed_split_folder}",
+            flush=True,
+        )
+        builder = CrystalDatasetBuilder.from_csv(
+            csv_path=str(self.raw_csv),
+            cache_path=str(self.processed_split_folder),
+            transforms=self.transforms,
+        )
+        self._ensure_required_properties(builder)
+        self._write_cache_meta()
+        return builder
+
     def _build(self) -> CrystalDataset:
         """Load processed cache or build it from raw CSV.
 
         Output:
             MatterGen CrystalDataset.
         """
-        if self.processed_split_folder.exists():
-            # Fast path: load cached arrays.
+        cache_fresh, cache_reason = self._cache_status()
+        if cache_fresh:
+            print(
+                f"dataset_cache action=load dataset={self.dataset_name} split={self.split} "
+                f"reason={cache_reason} path={self.processed_split_folder}",
+                flush=True,
+            )
             builder = CrystalDatasetBuilder.from_cache_path(
                 cache_path=str(self.processed_split_folder),
                 transforms=self.transforms,
             )
-            self._ensure_required_properties(builder)
         else:
-            # Slow path: parse raw CSV and create processed cache.
-            if not self.raw_csv.exists():
-                raise RuntimeError(
-                    f"Raw split not found at {self.raw_csv}. Pass download=True to fetch it first."
-                )
+            print(
+                f"dataset_cache action=stale dataset={self.dataset_name} split={self.split} "
+                f"reason={cache_reason} path={self.processed_split_folder}",
+                flush=True,
+            )
             # Code segment inspired from mattergen
             # (mattergen/common/data/dataset.py:528-556,
             #  mattergen/common/data/dataset.py:354-360).
@@ -190,12 +282,7 @@ class CrystalDatasetWrapper(Dataset):
             # before writing the processed cache. We intentionally rely on that
             # upstream full-structure reduction here instead of trying to reduce
             # only the lattice matrix later in a transform.
-            builder = CrystalDatasetBuilder.from_csv(
-                csv_path=str(self.raw_csv),
-                cache_path=str(self.processed_split_folder),
-                transforms=self.transforms,
-            )
-            self._ensure_required_properties(builder)
+            builder = self._rebuild_cache()
 
         return builder.build(
             dataset_class=CrystalDataset,
