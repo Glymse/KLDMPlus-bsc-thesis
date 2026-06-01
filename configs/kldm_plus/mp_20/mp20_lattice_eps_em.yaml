@@ -4,7 +4,7 @@ sampler_config: ../../samplers/euler_maruyama.yaml
 dataset:
   task: csp
   name: mp20
-  lattice_representation: kldm # alternatives: kldm, mattergen. Use mattergen together with model.lattice_parameterization=eps; pair mattergen diffusion with model.lattice_diffusion_type=mattergenVP.
+  lattice_representation: kldm # fixed KLDMPlus lattice representation
   root: null
   batch_size: 256
   num_workers: 1
@@ -15,8 +15,8 @@ time_sampler:
 
 model:
   eps: 1.0e-6
-  lattice_parameterization: eps # alternatives: eps, x0. mattergen representation/diffusion currently only supports eps.
-  lattice_diffusion_type: VP # alternatives: VP, mattergenVP. mattergenVP requires dataset.lattice_representation=mattergen.
+  lattice_parameterization: eps # alternatives: eps, x0
+  lattice_diffusion_type: VP # fixed KLDMPlus lattice diffusion
   wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: true

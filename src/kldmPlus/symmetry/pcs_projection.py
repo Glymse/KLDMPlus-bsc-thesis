@@ -9,9 +9,7 @@ import torch
 
 from kldmPlus.data.transform import (
     KLDMContinuousIntervalLattice,
-    MatterGenContinuousIntervalLattice,
     lattice_feature_components,
-    mattergen_lattice_feature_vector,
 )
 from kldmPlus.symmetry.frame_bridge import (
     SymmetryFrameBridge,
@@ -627,9 +625,6 @@ def _encode_cell_to_lattice_features(
     num_atoms: int,
     lattice_transform,
 ) -> torch.Tensor:
-    if isinstance(lattice_transform, MatterGenContinuousIntervalLattice):
-        return mattergen_lattice_feature_vector(cell_matrix).view(1, 6)
-
     if not isinstance(lattice_transform, KLDMContinuousIntervalLattice):
         transform = KLDMContinuousIntervalLattice(standardize=False)
     else:
@@ -2080,6 +2075,8 @@ def initialize_constrained_template_states(
     debug_template_candidates: bool = False,
     debug_label: str | None = None,
     freeze_lattice_free_vars: bool = False,
+    oracle_reference_structure=None,
+    oracle_fit_structure=None,
 ) -> list[PCSTemplateState]:
     """Initialize DiffCSP++ chart branches without fitting an unconstrained sample.
 
@@ -2101,12 +2098,33 @@ def initialize_constrained_template_states(
         atomic_numbers=atomic_numbers,
         cell_matrix=cell_matrix,
     )
-    bridge = build_symmetry_frame_bridge(
-        vanilla_structure=vanilla_structure,
-        standardization=standardization,
-        symprec=symprec,
-        angle_tolerance=angle_tolerance,
-    )
+    bridge_source = "sample"
+    try:
+        bridge = build_symmetry_frame_bridge(
+            vanilla_structure=vanilla_structure,
+            standardization=standardization,
+            symprec=symprec,
+            angle_tolerance=angle_tolerance,
+        )
+    except Exception as sample_bridge_exc:
+        oracle_bridge_structure = oracle_fit_structure or oracle_reference_structure
+        if oracle_bridge_structure is None:
+            raise
+        try:
+            bridge = build_symmetry_frame_bridge(
+                vanilla_structure=oracle_bridge_structure,
+                standardization=standardization,
+                symprec=symprec,
+                angle_tolerance=angle_tolerance,
+            )
+        except Exception as oracle_bridge_exc:
+            raise RuntimeError(
+                "symmetry_frame_bridge_failed "
+                f"requested_sg={requested_sg} atoms={int(atomic_numbers.numel())} "
+                f"sample_error={type(sample_bridge_exc).__name__}:{sample_bridge_exc} "
+                f"oracle_error={type(oracle_bridge_exc).__name__}:{oracle_bridge_exc}"
+            ) from oracle_bridge_exc
+        bridge_source = "oracle"
 
     target_centering = _requested_centering_symbol(requested_sg)
     target_centering_translations = _centering_translations(target_centering, device=device, dtype=dtype)
@@ -2182,6 +2200,7 @@ def initialize_constrained_template_states(
             [
                 "target_signature_source=csppp_constrained",
                 "fit_target_source=none",
+                f"bridge_source={bridge_source}",
                 f"raw_requested_volume={float(_cell_volume(raw_requested_cell).detach().item()):.6f}",
                 f"projected_reference_volume={projected_reference_volume:.6f}",
                 f"chart_volume={chart_reference_volume:.6f}",
@@ -2339,12 +2358,33 @@ def select_requested_template_states(
         atomic_numbers=atomic_numbers,
         cell_matrix=cell_matrix,
     )
-    bridge = build_symmetry_frame_bridge(
-        vanilla_structure=vanilla_structure,
-        standardization=standardization,
-        symprec=symprec,
-        angle_tolerance=angle_tolerance,
-    )
+    bridge_source = "sample"
+    try:
+        bridge = build_symmetry_frame_bridge(
+            vanilla_structure=vanilla_structure,
+            standardization=standardization,
+            symprec=symprec,
+            angle_tolerance=angle_tolerance,
+        )
+    except Exception as sample_bridge_exc:
+        oracle_bridge_structure = oracle_fit_structure or oracle_reference_structure
+        if oracle_bridge_structure is None:
+            raise
+        try:
+            bridge = build_symmetry_frame_bridge(
+                vanilla_structure=oracle_bridge_structure,
+                standardization=standardization,
+                symprec=symprec,
+                angle_tolerance=angle_tolerance,
+            )
+        except Exception as oracle_bridge_exc:
+            raise RuntimeError(
+                "symmetry_frame_bridge_failed "
+                f"requested_sg={int(space_group_number)} atoms={int(atomic_numbers.numel())} "
+                f"sample_error={type(sample_bridge_exc).__name__}:{sample_bridge_exc} "
+                f"oracle_error={type(oracle_bridge_exc).__name__}:{oracle_bridge_exc}"
+            ) from oracle_bridge_exc
+        bridge_source = "oracle"
     standardized_frac, standardized_atomic_numbers, _standardized_cell, current_k = _standardized_target_tensors(
         bridge,
         device=device,

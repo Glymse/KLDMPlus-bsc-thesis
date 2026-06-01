@@ -22,6 +22,7 @@ from kldmPlus.symmetry import (
     extract_wyckoff_templates,
     flatten_site_signature,
     map_standardized_structure_to_vanilla_frame,
+    transport_standardized_structure_to_vanilla_frame,
 )
 
 try:
@@ -182,7 +183,6 @@ class WyckoffTemplateSanityRunner:
         self.lattice_transform = task.make_lattice_transform(
             root=root,
             download=True,
-            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
         )
 
     def run(self) -> None:
@@ -278,14 +278,20 @@ class WyckoffTemplateSanityRunner:
                     expansion=expansion,
                     lattice_parameters=gt_result.lattice_parameters,
                 )
-                predicted_vanilla_like = map_standardized_structure_to_vanilla_frame(
-                    standardized_structure=predicted_structure,
-                    vanilla_reference_structure=bridge.vanilla_structure,
-                    symprec=symprec,
-                    angle_tolerance=angle_tol,
-                    stol=stol,
-                    ltol=ltol,
-                )
+                try:
+                    predicted_vanilla_like = transport_standardized_structure_to_vanilla_frame(
+                        standardized_structure=predicted_structure,
+                        bridge=bridge,
+                    )
+                except Exception:
+                    predicted_vanilla_like = map_standardized_structure_to_vanilla_frame(
+                        standardized_structure=predicted_structure,
+                        vanilla_reference_structure=bridge.vanilla_structure,
+                        symprec=symprec,
+                        angle_tolerance=angle_tol,
+                        stol=stol,
+                        ltol=ltol,
+                    )
                 matcher_ok, matcher_rms = _matcher_rms(
                     predicted_vanilla_like,
                     bridge.vanilla_structure,

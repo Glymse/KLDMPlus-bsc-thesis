@@ -94,7 +94,6 @@ def build_dataset_and_lattice_transform(config: dict[str, Any], *, split: str):
     lattice_transform = task.make_lattice_transform(
         root=root,
         download=True,
-        mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
     )
     return dataset, lattice_transform
 

@@ -40,6 +40,10 @@ dependencies = [
   "smact>=3.2.0",
   "matminer>=0.9.3",
   "mattersim>=1.1.2",
+  "jax>=0.6.2",
+  "dm-haiku>=0.0.16",
+  "optax>=0.2.8",
+  "gdown>=6.1.0",
 ]
 
 [project.scripts]

@@ -92,7 +92,6 @@ class SymmetryBasisSanityRunner:
         self.device = get_default_device()
 
         self.loader, self.lattice_transform = self._build_loader()
-        self._inject_mattergen_lattice_stats()
         self.model = build_model(config=self.config, device=self.device)
         self.model.eval()
 
@@ -139,19 +138,8 @@ class SymmetryBasisSanityRunner:
         lattice_transform = task.make_lattice_transform(
             root=root,
             download=True,
-            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
         )
         return loader, lattice_transform
-
-    def _inject_mattergen_lattice_stats(self) -> None:
-        if getattr(self.lattice_transform, "representation", None) != "mattergen":
-            return
-        if not hasattr(self.lattice_transform, "stats"):
-            return
-        c, nu = self.lattice_transform.stats()
-        self.config.setdefault("model", {})
-        self.config["model"]["mattergen_lattice_c"] = float(c)
-        self.config["model"]["mattergen_lattice_nu"] = float(nu)
 
     def _perturb_batch(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
         pos_noise_scale = float(self.sanity_cfg.get("pos_noise_scale", 0.02))

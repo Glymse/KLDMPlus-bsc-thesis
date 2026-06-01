@@ -11,7 +11,10 @@ møde.txt
 /workspace/src/kldm/diffusionModels/trivialized_diffusion.py
 # test cache
 manual_test/
-
+src/CSPML
+src/PPR
+src/cascal
+src/CrystaLFormer
 src/torsional
 src/TDM
 src/mattergen
@@ -23,6 +26,10 @@ src/diffCSPpp
 src/papers
 # other local dev info
 .vscode/
+
+
+
+notebooks/*
 
 # Mac OS-specific storage files
 .DS_Store

@@ -4,7 +4,7 @@ sampler_config: ../../samplers/euler_maruyama.yaml
 dataset:
   task: csp
   name: mp20
-  lattice_representation: mattergen # alternatives: kldm, mattergen. Use mattergen together with model.lattice_parameterization=eps; pair mattergen diffusion with model.lattice_diffusion_type=mattergenVP.
+  lattice_representation: kldm # fixed KLDMPlus lattice representation
   root: null
   batch_size: 256
   num_workers: 1
@@ -15,8 +15,8 @@ time_sampler:
 
 model:
   eps: 1.0e-6
-  lattice_parameterization: eps # alternatives: eps, x0. mattergen representation/diffusion currently only supports eps.
-  lattice_diffusion_type: mattergenVP # alternatives: VP, mattergenVP. mattergenVP requires dataset.lattice_representation=mattergen.
+  lattice_parameterization: eps # alternatives: eps, x0
+  lattice_diffusion_type: VP # fixed KLDMPlus lattice diffusion
   wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: true
@@ -26,9 +26,6 @@ model:
   tdm_sigma_norm_grid_points: 8193
   tdm_sigma_norm_mc_samples: 20000
   tdm_centered_sigma_norm_correction: false
-  mattergen_pos_loss_weight: 0.1 # Official MatterGen MaterialsLoss weights pos by 0.1 relative to cell.
-  mattergen_cell_loss_weight: 1.0
-  mattergen_pos_loss_reduce: sum # Official MatterGen uses reduce=sum for the position field across nodes.
   score_network:
     hidden_dim: 512
     time_dim: 256

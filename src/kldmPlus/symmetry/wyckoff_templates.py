@@ -283,6 +283,60 @@ def flatten_site_signature(template: WyckoffTemplate) -> tuple[tuple[int, str], 
     return tuple(sorted(pairs, key=lambda item: (item[0], item[1])))
 
 
+def recover_template_free_vars_from_anchor_entries(
+    template: WyckoffTemplate,
+    anchor_entries: list[dict[str, Any]],
+) -> torch.Tensor:
+    """Recover the flattened free vars that reproduce known PyXtal anchor coords.
+
+    The entries are matched by `(atomic_number, label)` and then stably ordered
+    by anchor coordinate within each signature bucket. This mirrors the
+    roundtrip logic used in the Wyckoff sanity runner.
+    """
+    if len(anchor_entries) != len(template.site_templates):
+        raise ValueError("Template / anchor entry count mismatch.")
+
+    grouped_entries: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for entry in anchor_entries:
+        key = (int(entry["atomic_number"]), str(entry["label"]))
+        grouped_entries.setdefault(key, []).append(entry)
+    for value in grouped_entries.values():
+        value.sort(key=lambda item: tuple(np.round(np.asarray(item["anchor_frac"], dtype=float), 8).tolist()))
+
+    recovered: list[float] = []
+    for template_site in template.site_templates:
+        key = (int(template_site.atomic_number), str(template_site.label))
+        if key not in grouped_entries or not grouped_entries[key]:
+            raise ValueError("Template / anchor site signature mismatch.")
+        gt_site = grouped_entries[key].pop(0)
+        if template_site.dof == 0:
+            continue
+
+        basis = np.asarray(template_site.anchor_basis, dtype=float)
+        offset = np.asarray(template_site.anchor_offset, dtype=float)
+        anchor = np.asarray(gt_site["anchor_frac"], dtype=float)
+        solution, *_ = np.linalg.lstsq(basis, anchor - offset, rcond=None)
+        recovered.extend(solution.tolist())
+
+    return torch.as_tensor(recovered, dtype=torch.get_default_dtype())
+
+
+def recover_template_free_vars_from_pyxtal_result(
+    template: WyckoffTemplate,
+    result: Any,
+) -> torch.Tensor:
+    """Recover chart free vars from a `PyXtalWyckoffResult`-like object."""
+    anchor_entries = [
+        {
+            "atomic_number": int(result.anchor_atomic_numbers[site_idx]),
+            "label": str(result.site_labels[site_idx]),
+            "anchor_frac": np.asarray(result.anchor_frac_coords[site_idx], dtype=float),
+        }
+        for site_idx in range(int(len(result.site_labels)))
+    ]
+    return recover_template_free_vars_from_anchor_entries(template, anchor_entries)
+
+
 def sample_random_free_vars(
     template: WyckoffTemplate,
     *,

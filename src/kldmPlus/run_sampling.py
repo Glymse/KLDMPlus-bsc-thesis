@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import inspect
 import json
 from pathlib import Path
 import pickle
@@ -119,7 +118,6 @@ class SamplingRunner:
         self.loader, self.lattice_transform = self._build_loader()
         self.template_prior = None
         self._template_prior_initialized = False
-        self._inject_mattergen_lattice_stats()
         self.model = build_model(config=self.config, device=self.device)
         load_checkpoint(
             checkpoint_path=self.checkpoint_path,
@@ -184,18 +182,7 @@ class SamplingRunner:
         return loader, task.make_lattice_transform(
             root=root,
             download=True,
-            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
         )
-
-    def _inject_mattergen_lattice_stats(self) -> None:
-        if getattr(self.lattice_transform, "representation", None) != "mattergen":
-            return
-        if not hasattr(self.lattice_transform, "stats"):
-            return
-        c, nu = self.lattice_transform.stats()
-        self.config.setdefault("model", {})
-        self.config["model"]["mattergen_lattice_c"] = float(c)
-        self.config["model"]["mattergen_lattice_nu"] = float(nu)
 
     def _ensure_template_prior(self):
         if not self._template_prior_initialized:
@@ -210,14 +197,9 @@ class SamplingRunner:
         from kldmPlus.symmetry.wyckoff_templates import requested_composition_key
 
         sampling_algorithm = int(self.sampling_cfg.get("sampling_algorithm", 4 if str(self.sampling_cfg["method"]) == "pc" else 3))
-        if sampling_algorithm not in {6, 7, 8}:
+        if sampling_algorithm != 10:
             return None
-        if sampling_algorithm == 6:
-            prior_cfg = dict(self.sampling_cfg.get("pcs", {}))
-        elif sampling_algorithm == 7:
-            prior_cfg = dict(self.sampling_cfg.get("sgdpnp", {}))
-        else:
-            prior_cfg = dict(self.sampling_cfg.get("dpnpsvd", {}))
+        prior_cfg = dict(self.sampling_cfg.get("algorithm10", {}))
         if not bool(prior_cfg.get("template_prior_enabled", True)):
             return None
         if float(prior_cfg.get("template_prior_weight", 1.0)) <= 0.0:
@@ -302,124 +284,15 @@ class SamplingRunner:
             "t_start": float(self.sampling_cfg["t_start"]),
             "t_final": float(self.sampling_cfg["t_final"]),
         }
-        if sampling_algorithm == 8:
-            if method != "em":
+        if sampling_algorithm == 10:
+            if method not in {"casal", "em"}:
                 raise ValueError(
-                    "sampling_algorithm=8 currently extends the EM sampler, so sampling.method must be 'em'.",
+                    "sampling_algorithm=10 expects sampling.method in {'casal', 'em'} for KLDM reverse-step compatibility.",
                 )
             kwargs["lattice_transform"] = self.lattice_transform
-            kwargs["dpnpsvd_config"] = dict(self.sampling_cfg.get("dpnpsvd", {}))
+            kwargs["algorithm10_config"] = dict(self.sampling_cfg.get("algorithm10", {}))
             kwargs["template_prior"] = self._ensure_template_prior()
-            sample_fn = self.model.sample_CSP_algorithm8
-        elif sampling_algorithm == 7:
-            if method != "em":
-                raise ValueError(
-                    "sampling_algorithm=7 currently extends the EM sampler, so sampling.method must be 'em'.",
-                )
-            kwargs["lattice_transform"] = self.lattice_transform
-            kwargs["sgdpnp_config"] = dict(self.sampling_cfg.get("sgdpnp", {}))
-            kwargs["template_prior"] = self._ensure_template_prior()
-            sample_fn = self.model.sample_CSP_algorithm7
-        elif sampling_algorithm == 6:
-            if method != "em":
-                raise ValueError(
-                    "sampling_algorithm=6 currently extends the EM sampler, so sampling.method must be 'em'.",
-                )
-            pcs_cfg = dict(self.sampling_cfg.get("pcs", {}))
-            kwargs["lattice_transform"] = self.lattice_transform
-            kwargs["pcs_standardization"] = str(pcs_cfg.get("standardization", "conventional"))
-            kwargs["pcs_symprec"] = float(pcs_cfg.get("symprec", 1e-2))
-            kwargs["pcs_angle_tolerance"] = float(pcs_cfg.get("angle_tolerance", 5.0))
-            kwargs["pcs_max_templates"] = int(pcs_cfg.get("max_templates", 256))
-            kwargs["pcs_template_eval_limit"] = int(pcs_cfg.get("template_eval_limit", 32))
-            kwargs["pcs_optimization_steps"] = int(pcs_cfg.get("optimization_steps", 150))
-            kwargs["pcs_learning_rate"] = float(pcs_cfg.get("learning_rate", 5e-2))
-            kwargs["pcs_coord_weight"] = float(pcs_cfg.get("coord_weight", 1.0))
-            kwargs["pcs_lattice_weight"] = float(pcs_cfg.get("lattice_weight", 0.25))
-            kwargs["pcs_pairdist_weight"] = float(pcs_cfg.get("pairdist_weight", 0.0))
-            kwargs["pcs_template_init_pairdist_weight"] = (
-                None
-                if "template_init_pairdist_weight" not in pcs_cfg
-                else float(pcs_cfg["template_init_pairdist_weight"])
-            )
-            kwargs["pcs_pairdist_bins"] = int(pcs_cfg.get("pairdist_bins", 32))
-            kwargs["pcs_pairdist_max_distance"] = float(pcs_cfg.get("pairdist_max_distance", 8.0))
-            kwargs["pcs_pairdist_bandwidth"] = float(pcs_cfg.get("pairdist_bandwidth", 0.25))
-            kwargs["pcs_steric_weight"] = float(pcs_cfg.get("steric_weight", 0.0))
-            kwargs["pcs_steric_min_distance"] = float(pcs_cfg.get("steric_min_distance", 0.8))
-            kwargs["pcs_volume_weight"] = float(pcs_cfg.get("volume_weight", 0.0))
-            kwargs["pcs_volume_ratio_min"] = float(pcs_cfg.get("volume_ratio_min", 0.0))
-            kwargs["pcs_volume_ratio_max"] = float(pcs_cfg.get("volume_ratio_max", 0.0))
-            kwargs["pcs_k6_weight"] = float(pcs_cfg.get("k6_weight", 0.0))
-            kwargs["pcs_hard_min_distance"] = float(pcs_cfg.get("hard_min_distance", 0.0))
-            kwargs["pcs_hard_volume_ratio_min"] = float(pcs_cfg.get("hard_volume_ratio_min", 0.0))
-            kwargs["pcs_hard_volume_ratio_max"] = float(pcs_cfg.get("hard_volume_ratio_max", 0.0))
-            kwargs["pcs_freeze_lattice"] = bool(pcs_cfg.get("freeze_lattice", False))
-            kwargs["pcs_initialization"] = str(pcs_cfg.get("initialization", "repair"))
-            kwargs["pcs_quick_templates"] = bool(pcs_cfg.get("quick_templates", False))
-            kwargs["pcs_top_k_templates"] = int(pcs_cfg.get("top_k_templates", 1))
-            kwargs["pcs_mala_steps"] = int(pcs_cfg.get("mala_steps", 8))
-            kwargs["pcs_mala_step_size"] = float(pcs_cfg.get("mala_step_size", 5e-2))
-            kwargs["pcs_debug_template_candidates"] = bool(pcs_cfg.get("debug_template_candidates", False))
-            if "pcs_debug_high_prior_templates" in inspect.signature(
-                self.model.sample_CSP_algorithm6
-            ).parameters:
-                kwargs["pcs_debug_high_prior_templates"] = bool(
-                    pcs_cfg.get("debug_high_prior_templates", False)
-                )
-                kwargs["pcs_debug_high_prior_min_score"] = int(
-                    pcs_cfg.get("debug_high_prior_min_score", 1)
-                )
-            if "pcs_allow_soft_physics_fallback" in inspect.signature(
-                self.model.sample_CSP_algorithm6
-            ).parameters:
-                kwargs["pcs_allow_soft_physics_fallback"] = bool(
-                    pcs_cfg.get("allow_soft_physics_fallback", True)
-                )
-            if "pcs_branch_selection_temperature" in inspect.signature(
-                self.model.sample_CSP_algorithm6
-            ).parameters:
-                kwargs["pcs_branch_selection_temperature"] = float(
-                    pcs_cfg.get("branch_selection_temperature", 1.0)
-                )
-            kwargs["pcs_oracle_template_orbit_rerank"] = bool(
-                pcs_cfg.get("oracle_template_orbit_rerank", False)
-            )
-            kwargs["pcs_oracle_template_fit_target"] = bool(
-                pcs_cfg.get("oracle_template_fit_target", False)
-            )
-            kwargs["pcs_dds_repair"] = bool(pcs_cfg.get("dds_repair", True))
-            kwargs["pcs_dds_n_steps"] = int(pcs_cfg.get("dds_n_steps", 60))
-            kwargs["pcs_dds_t_final"] = float(pcs_cfg.get("dds_t_final", kwargs["t_final"]))
-            kwargs["pcs_outer_steps"] = int(pcs_cfg.get("outer_steps", 1))
-            kwargs["pcs_outer_eta_start"] = float(pcs_cfg.get("outer_eta_start", pcs_cfg.get("dds_t_start", 0.2)))
-            kwargs["pcs_outer_eta_end"] = float(pcs_cfg.get("outer_eta_end", pcs_cfg.get("dds_t_start", 0.2)))
-            kwargs["pcs_outer_eta_k_start"] = int(pcs_cfg.get("outer_eta_k_start", 0))
-            kwargs["pcs_outer_eta_rho"] = float(pcs_cfg.get("outer_eta_rho", 1.0))
-            kwargs["pcs_final_projection"] = bool(pcs_cfg.get("final_projection", True))
-            kwargs["pcs_validate_requested_space_group"] = bool(pcs_cfg.get("validate_requested_space_group", True))
-            kwargs["pcs_return_last_pcs_on_validation_failure"] = bool(
-                pcs_cfg.get("return_last_pcs_on_validation_failure", False)
-            )
-            kwargs["pcs_template_prior"] = self._ensure_template_prior()
-            kwargs["pcs_template_prior_weight"] = float(pcs_cfg.get("template_prior_weight", 1.0))
-            sample_fn = self.model.sample_CSP_algorithm6
-        elif sampling_algorithm == 5:
-            if method != "em":
-                raise ValueError(
-                    "sampling_algorithm=5 currently extends the EM sampler, so sampling.method must be 'em'.",
-                )
-            guidance_cfg = dict(self.sampling_cfg.get("symmetry_guidance", {}))
-            kwargs["lattice_transform"] = self.lattice_transform
-            kwargs["coord_scale"] = float(guidance_cfg.get("coord_scale", 2e-3))
-            kwargs["lattice_scale"] = float(guidance_cfg.get("lattice_scale", 1e-5))
-            kwargs["guidance_interval"] = int(guidance_cfg.get("guidance_interval", 5))
-            kwargs["guidance_start_fraction"] = float(guidance_cfg.get("guidance_start_fraction", 0.5))
-            kwargs["coord_grad_clip"] = guidance_cfg.get("coord_grad_clip", 5.0)
-            kwargs["lattice_grad_clip"] = guidance_cfg.get("lattice_grad_clip", 0.5)
-            kwargs["coord_max_step"] = guidance_cfg.get("coord_max_step", 2e-2)
-            kwargs["lattice_max_step"] = guidance_cfg.get("lattice_max_step", 2e-3)
-            sample_fn = self.model.sample_CSP_algorithm5
+            sample_fn = self.model.sample_CSP_algorithm10
         elif sampling_algorithm == 4:
             kwargs["tau"] = float(self.sampling_cfg["tau"])
             kwargs["n_correction_steps"] = int(self.sampling_cfg["n_correction_steps"])
@@ -427,7 +300,10 @@ class SamplingRunner:
         elif sampling_algorithm == 3:
             sample_fn = self.model.sample_CSP_algorithm3
         else:
-            raise ValueError(f"Unsupported sampling_algorithm={sampling_algorithm}.")
+            raise ValueError(
+                f"Unsupported sampling_algorithm={sampling_algorithm}. "
+                "Supported sampler paths are original KLDMplus (3/4) and CASAL/CASCAL (10)."
+            )
 
         return sample_fn(**kwargs)
 

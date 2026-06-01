@@ -44,6 +44,9 @@ class CSPReconstructionResult:
     frac_rmse_status: str | None = None
     lattice_lengths_mae: float | None = None
     lattice_angles_mae: float | None = None
+    lattice_lengths_rmse: float | None = None
+    lattice_angles_rmse: float | None = None
+    volume_rel_error: float | None = None
     matcher_diagnostics: Any | None = None
 
 
@@ -115,6 +118,24 @@ def _torus_pairwise_distance_sq(source: np.ndarray, target: np.ndarray) -> np.nd
     return np.sum(delta * delta, axis=-1)
 
 
+def _coerce_frac_coords_local(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 1:
+        if arr.size % 3 != 0:
+            raise ValueError(f"Expected flat fractional coordinates with size multiple of 3, got shape {arr.shape}.")
+        arr = arr.reshape(-1, 3)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Expected fractional coordinates with shape [N, 3], got {arr.shape}.")
+    return np.array(arr, dtype=float, copy=False)
+
+
+def _coerce_atomic_numbers_local(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=int)
+    return np.array(arr, dtype=int, copy=False).reshape(-1)
+
+
 def _match_cost_matrix_np(cost_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     try:
         from scipy.optimize import linear_sum_assignment
@@ -150,6 +171,11 @@ def _species_aware_torus_rmse_local(
     target_frac_coords: np.ndarray,
     target_atomic_numbers: np.ndarray,
 ) -> tuple[float | None, str | None]:
+    source_frac_coords = _coerce_frac_coords_local(source_frac_coords)
+    target_frac_coords = _coerce_frac_coords_local(target_frac_coords)
+    source_atomic_numbers = _coerce_atomic_numbers_local(source_atomic_numbers)
+    target_atomic_numbers = _coerce_atomic_numbers_local(target_atomic_numbers)
+
     if len(source_frac_coords) != len(target_frac_coords):
         return None, "num_atoms_mismatch"
 
@@ -189,6 +215,11 @@ def _species_aware_torus_diagnostics_local(
     target_frac_coords: np.ndarray,
     target_atomic_numbers: np.ndarray,
 ) -> tuple[float | None, str | None, list[SpeciesMatchDiagnostics]]:
+    source_frac_coords = _coerce_frac_coords_local(source_frac_coords)
+    target_frac_coords = _coerce_frac_coords_local(target_frac_coords)
+    source_atomic_numbers = _coerce_atomic_numbers_local(source_atomic_numbers)
+    target_atomic_numbers = _coerce_atomic_numbers_local(target_atomic_numbers)
+
     if len(source_frac_coords) != len(target_frac_coords):
         return None, "num_atoms_mismatch", []
 
@@ -577,6 +608,27 @@ def detect_space_group_number(
 ) -> int | None:
     if SpacegroupAnalyzer is None:
         return None
+
+
+def _space_group_to_family(space_group_number: int | None) -> str | None:
+    if space_group_number is None:
+        return None
+    sg = int(space_group_number)
+    if not 1 <= sg <= 230:
+        return None
+    if sg <= 2:
+        return "triclinic"
+    if sg <= 15:
+        return "monoclinic"
+    if sg <= 74:
+        return "orthorhombic"
+    if sg <= 142:
+        return "tetragonal"
+    if sg <= 167:
+        return "trigonal"
+    if sg <= 194:
+        return "hexagonal"
+    return "cubic"
     try:
         return int(
             SpacegroupAnalyzer(
@@ -597,6 +649,24 @@ def _lattice_mae(predicted: Structure, target: Structure) -> tuple[float, float]
     lengths_mae = float(np.mean(np.abs(pred_lengths - target_lengths)))
     angles_mae = float(np.mean(np.abs(pred_angles - target_angles)))
     return lengths_mae, angles_mae
+
+
+def _lattice_rmse(predicted: Structure, target: Structure) -> tuple[float, float]:
+    pred_lengths = np.asarray(predicted.lattice.abc, dtype=float)
+    target_lengths = np.asarray(target.lattice.abc, dtype=float)
+    pred_angles = np.asarray(predicted.lattice.angles, dtype=float)
+    target_angles = np.asarray(target.lattice.angles, dtype=float)
+    lengths_rmse = float(np.sqrt(np.mean(np.square(pred_lengths - target_lengths))))
+    angles_rmse = float(np.sqrt(np.mean(np.square(pred_angles - target_angles))))
+    return lengths_rmse, angles_rmse
+
+
+def _volume_rel_error(predicted: Structure, target: Structure) -> float | None:
+    target_volume = float(target.lattice.volume)
+    if abs(target_volume) <= 1.0e-12:
+        return None
+    predicted_volume = float(predicted.lattice.volume)
+    return float(abs(predicted_volume - target_volume) / abs(target_volume))
 
 
 # Aligns and optionally standardizes structures for easier visualization.
@@ -729,6 +799,8 @@ def evaluate_csp_reconstruction(
         target_atomic_numbers=np.asarray(target.atomic_numbers, dtype=int),
     )
     lattice_lengths_mae, lattice_angles_mae = _lattice_mae(predicted, target)
+    lattice_lengths_rmse, lattice_angles_rmse = _lattice_rmse(predicted, target)
+    volume_rel_error = _volume_rel_error(predicted, target)
     matcher_diagnostics = None
 
     if is_valid:
@@ -775,6 +847,9 @@ def evaluate_csp_reconstruction(
         frac_rmse_status=frac_rmse_status,
         lattice_lengths_mae=lattice_lengths_mae,
         lattice_angles_mae=lattice_angles_mae,
+        lattice_lengths_rmse=lattice_lengths_rmse,
+        lattice_angles_rmse=lattice_angles_rmse,
+        volume_rel_error=volume_rel_error,
         matcher_diagnostics=matcher_diagnostics,
     )
 
@@ -789,6 +864,13 @@ def aggregate_csp_reconstruction_metrics(
     valid = [float(result.valid) for result in results]
     match = [float(result.match) for result in results]
     rmse = [float(result.rmse) for result in results if result.rmse is not None]
+    frac_rmse = [float(result.frac_rmse) for result in results if result.frac_rmse is not None]
+    standardized_frac_rmse = [
+        float(result.matcher_diagnostics.standardized_frac_rmse)
+        for result in results
+        if result.matcher_diagnostics is not None
+        and result.matcher_diagnostics.standardized_frac_rmse is not None
+    ]
     composition_matches = [
         float(result.composition_match)
         for result in results
@@ -799,18 +881,77 @@ def aggregate_csp_reconstruction_metrics(
         for result in results
         if result.requested_space_group_match is not None
     ]
+    matcher_diagnosis_counts: dict[str, int] = {}
+    for result in results:
+        diagnosis = None
+        if result.matcher_diagnostics is not None:
+            diagnosis = result.matcher_diagnostics.diagnosis
+        if diagnosis and not result.match:
+            matcher_diagnosis_counts[str(diagnosis)] = matcher_diagnosis_counts.get(str(diagnosis), 0) + 1
+
+    detected_sg_agreement = [
+        float(result.requested_space_group_match)
+        for result in results
+        if result.requested_space_group_match is not None
+    ]
+    detected_family_agreement = []
+    lattice_lengths_rmse = []
+    lattice_angles_rmse = []
+    volume_rel_error = []
+    for result in results:
+        requested_family = _space_group_to_family(result.requested_space_group)
+        detected_family = _space_group_to_family(result.detected_space_group)
+        if requested_family is not None and detected_family is not None:
+            detected_family_agreement.append(float(requested_family == detected_family))
+        if result.lattice_lengths_rmse is not None:
+            lattice_lengths_rmse.append(float(result.lattice_lengths_rmse))
+        if result.lattice_angles_rmse is not None:
+            lattice_angles_rmse.append(float(result.lattice_angles_rmse))
+        if result.volume_rel_error is not None:
+            volume_rel_error.append(float(result.volume_rel_error))
 
     return {
         "num_samples": len(results),
         "valid": float(sum(valid) / len(valid)),
         "match_rate": float(sum(match) / len(match)),
         "rmse": None if not rmse else float(sum(rmse) / len(rmse)),
+        "rmse_defined_count": len(rmse),
+        "frac_rmse": None if not frac_rmse else float(sum(frac_rmse) / len(frac_rmse)),
+        "frac_rmse_defined_count": len(frac_rmse),
+        "standardized_frac_rmse": (
+            None
+            if not standardized_frac_rmse
+            else float(sum(standardized_frac_rmse) / len(standardized_frac_rmse))
+        ),
+        "standardized_frac_rmse_defined_count": len(standardized_frac_rmse),
         "composition_match_rate": (
             None if not composition_matches else float(sum(composition_matches) / len(composition_matches))
         ),
         "requested_space_group_match_rate": (
             None if not space_group_matches else float(sum(space_group_matches) / len(space_group_matches))
         ),
+        "detected_sg_agreement": (
+            None if not detected_sg_agreement else float(sum(detected_sg_agreement) / len(detected_sg_agreement))
+        ),
+        "detected_family_agreement": (
+            None
+            if not detected_family_agreement
+            else float(sum(detected_family_agreement) / len(detected_family_agreement))
+        ),
+        "lattice_lengths_rmse": (
+            None
+            if not lattice_lengths_rmse
+            else float(np.mean(np.asarray(lattice_lengths_rmse, dtype=float)))
+        ),
+        "lattice_angles_rmse": (
+            None
+            if not lattice_angles_rmse
+            else float(np.mean(np.asarray(lattice_angles_rmse, dtype=float)))
+        ),
+        "volume_rel_error": (
+            None if not volume_rel_error else float(sum(volume_rel_error) / len(volume_rel_error))
+        ),
+        "matcher_diagnosis_counts": matcher_diagnosis_counts,
     }
 
 

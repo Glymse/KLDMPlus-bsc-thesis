@@ -44,13 +44,9 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         tdm_centered_sigma_norm_correction=bool(cfg.get("tdm_centered_sigma_norm_correction", False)),
         lattice_parameterization=str(cfg.get("lattice_parameterization", "eps")),
         lattice_diffusion_type=str(cfg.get("lattice_diffusion_type", "VP")),
-        lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
-        mattergen_lattice_c=cfg.get("mattergen_lattice_c"),
-        mattergen_lattice_nu=cfg.get("mattergen_lattice_nu"),
-        mattergen_pos_loss_weight=cfg.get("mattergen_pos_loss_weight"),
-        mattergen_cell_loss_weight=cfg.get("mattergen_cell_loss_weight"),
-        mattergen_pos_loss_reduce=cfg.get("mattergen_pos_loss_reduce"),
-        sg_condition_dropout=float(cfg.get("sg_condition_dropout", 0.0)),
+        lattice_representation=str(cfg.get("lattice_representation", dataset_cfg.get("lattice_representation", "kldm"))),
+        lattice_sg_lambda=float(cfg.get("lattice_sg_lambda", 0.0)),
+        lattice_sg_normalize=bool(cfg.get("lattice_sg_normalize", True)),
         score_network_kwargs=score_network,
     ).to(device)
 
@@ -59,38 +55,12 @@ def configure_trainable_parameters(model: ModelKLDM, config: dict[str, Any]) -> 
     cfg = _section(config, "finetune")
     if not cfg:
         return
-
-    train_sg_adapters_only = bool(cfg.get("train_sg_adapters_only", False))
     freeze_base = bool(cfg.get("freeze_base", False))
-    if not train_sg_adapters_only and not freeze_base:
+    if not freeze_base:
         return
-
-    if not bool(getattr(model.score_network, "sg_conditional", False)):
-        raise ValueError("finetune.train_sg_adapters_only requires score_network.sg_conditional=true.")
-
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-
-    enabled_prefixes = (
-        "score_network.sg_embedding",
-        "score_network.sg_adapters",
-        "score_network.sg_mixins",
-    )
-    enabled = 0
-    total = 0
-    for name, parameter in model.named_parameters():
-        total += parameter.numel()
-        if any(name.startswith(prefix) for prefix in enabled_prefixes):
-            parameter.requires_grad_(True)
-            enabled += parameter.numel()
-
-    if enabled == 0:
-        raise ValueError("No SG adapter parameters were enabled for fine-tuning.")
-
-    print(
-        f"finetune_trainable mode=sg_adapters_only enabled_params={enabled} total_params={total}",
-        flush=True,
-    )
+    raise ValueError("finetune.freeze_base is no longer supported without explicit trainable parameter overrides.")
 
 
 def build_optimizer(model: ModelKLDM, config: dict[str, Any]) -> torch.optim.Optimizer:

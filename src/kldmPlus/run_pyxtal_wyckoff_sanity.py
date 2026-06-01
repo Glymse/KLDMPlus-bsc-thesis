@@ -163,7 +163,6 @@ class PyXtalWyckoffSanityRunner:
         self.lattice_transform = task.make_lattice_transform(
             root=root,
             download=True,
-            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
         )
 
     def run(self) -> None:

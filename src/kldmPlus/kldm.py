@@ -29,15 +29,13 @@ except ImportError:  # pragma: no cover
     Element = Lattice = Structure = None
 
 from kldmPlus.data.transform import ContinuousIntervalLattice
-from kldmPlus.dpnpsvd import DPnPSVDConfig, sample_kldm_dpnp_svd
+from kldmPlus.algorithm10_casal_chart import Algorithm10Config, sample_kldm_casal_chart
 from kldmPlus.diffusionModels.continuous import (
     ContinuousDiffusion,
-    ContinuousMattergenVPDiffusion,
     ContinuousVPDiffusion,
 )
 from kldmPlus.diffusionModels.tdm import TrivialisedDiffusion as TDM
 from kldmPlus.scoreNetwork.scoreNetwork import CSPVNet
-from kldmPlus.sgdpnp import SGDPnPConfig, sample_kldm_dpnp_sg
 from kldmPlus.symmetry import (
     _pcs_state_rank_key,
     build_pyxtal_wyckoff_result,
@@ -50,6 +48,7 @@ from kldmPlus.symmetry import (
     validate_requested_space_group,
     vanilla_structure_to_model_tensors,
 )
+from kldmPlus.latticeSymmetry import LatticeSymmetry
 from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import BatchTimes, iter_sampling_times, make_times, sampling_grid
 
@@ -74,9 +73,9 @@ class PreparedTrainingBatch:
     atomic_numbers: torch.Tensor
     node_index: torch.Tensor
     edge_node_index: torch.Tensor
+    space_group: torch.Tensor | None
     num_graphs: int
     lattice_representation: str
-    space_group: torch.Tensor | None = None
 
 
 def _lengths_angles_to_cell_matrix(
@@ -533,12 +532,8 @@ class ModelKLDM(nn.Module):
         lattice_parameterization: str = "eps",
         lattice_diffusion_type: str = "VP",
         lattice_representation: str = "kldm",
-        mattergen_lattice_c: float | None = None,
-        mattergen_lattice_nu: float | None = None,
-        mattergen_pos_loss_weight: float | None = None,
-        mattergen_cell_loss_weight: float | None = None,
-        mattergen_pos_loss_reduce: str | None = None,
-        sg_condition_dropout: float = 0.0,
+        lattice_sg_lambda: float = 0.0,
+        lattice_sg_normalize: bool = True,
         *,
         score_network_kwargs: dict[str, Any],
     ) -> None:
@@ -565,27 +560,21 @@ class ModelKLDM(nn.Module):
             lattice_diffusion_type=lattice_diffusion_type,
             eps=eps,
             lattice_parameterization=lattice_parameterization,
-            mattergen_lattice_c=mattergen_lattice_c,
-            mattergen_lattice_nu=mattergen_lattice_nu,
         )
         self.eps = eps
         self.lattice_parameterization = lattice_parameterization
         self.lattice_diffusion_type = lattice_diffusion_type
         self.lattice_representation = lattice_representation
-        self.mattergen_pos_loss_weight = (
-            0.1 if mattergen_pos_loss_weight is None else float(mattergen_pos_loss_weight)
-        )
-        self.mattergen_cell_loss_weight = (
-            1.0 if mattergen_cell_loss_weight is None else float(mattergen_cell_loss_weight)
-        )
-        self.mattergen_pos_loss_reduce = (
-            "sum" if mattergen_pos_loss_reduce is None else str(mattergen_pos_loss_reduce)
-        )
-        if self.mattergen_pos_loss_reduce not in {"sum", "mean"}:
-            raise ValueError("mattergen_pos_loss_reduce must be 'sum' or 'mean'.")
-        self.sg_condition_dropout = float(sg_condition_dropout)
-        if not 0.0 <= self.sg_condition_dropout <= 1.0:
-            raise ValueError("sg_condition_dropout must be in [0, 1].")
+        self.lattice_sg_lambda = float(lattice_sg_lambda)
+        self.lattice_sg_normalize = bool(lattice_sg_normalize)
+        self.lattice_symmetry = LatticeSymmetry(eps=eps)
+
+        if self.lattice_representation not in {"kldm", "diffcsp_k"}:
+            raise ValueError("lattice_representation must be 'kldm' or 'diffcsp_k'.")
+        if self.lattice_representation == "diffcsp_k" and self.lattice_parameterization != "x0":
+            raise ValueError("lattice_representation='diffcsp_k' requires lattice_parameterization='x0'.")
+        if self.lattice_sg_lambda > 0.0 and self.lattice_representation != "diffcsp_k":
+            raise ValueError("lattice_sg_lambda > 0 requires lattice_representation='diffcsp_k'.")
 
     @staticmethod
     def _build_lattice_diffusion(
@@ -593,31 +582,12 @@ class ModelKLDM(nn.Module):
         lattice_diffusion_type: str,
         eps: float,
         lattice_parameterization: str,
-        mattergen_lattice_c: float | None,
-        mattergen_lattice_nu: float | None,
     ) -> ContinuousDiffusion:
-        if lattice_diffusion_type == "VP":
-            diffusion_cls = ContinuousVPDiffusion
-            diffusion_kwargs: dict[str, Any] = {}
-        elif lattice_diffusion_type == "mattergenVP":
-            diffusion_cls = ContinuousMattergenVPDiffusion
-            if mattergen_lattice_c is None or mattergen_lattice_nu is None:
-                raise ValueError(
-                    "mattergenVP requires mattergen_lattice_c and mattergen_lattice_nu.",
-                )
-            diffusion_kwargs = {
-                "c": float(mattergen_lattice_c),
-                "nu": float(mattergen_lattice_nu),
-            }
-        else:
-            raise ValueError(
-                "lattice_diffusion_type must be 'VP' or 'mattergenVP'.",
-            )
-
-        return diffusion_cls(
+        if lattice_diffusion_type != "VP":
+            raise ValueError("lattice_diffusion_type must be 'VP'.")
+        return ContinuousVPDiffusion(
             eps=eps,
             parameterization=lattice_parameterization,
-            **diffusion_kwargs,
         )
 
     # ============================================================================
@@ -680,30 +650,6 @@ class ModelKLDM(nn.Module):
         loss = F.mse_loss(pred, target, reduction="none")
         return loss.reshape(loss.shape[0], -1).mean(dim=1)
 
-    def mattergen_lattice_mse_6d_per_sample(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Weighted 6D MSE that matches averaging over the full symmetric 3x3 cell.
-        """
-        # Code segment inspired from mattergen
-        # (mattergen/diffusion/training/field_loss.py:118-152,
-        #  mattergen/common/loss.py:35-40).
-        #
-        # Official MatterGen computes denoising loss on the full `cell` tensor and
-        # then averages over all matrix entries. In the KLDM port we store only the
-        # six unique entries of the symmetric matrix, so off-diagonal terms need a
-        # factor of 2 to match the full 3x3 averaging.
-        weights = pred.new_tensor([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
-        loss = (pred - target).square() * weights
-        return loss.sum(dim=-1) / 9.0
-
-    # ============================================================================
-    # ALGORITHM 2
-    # ============================================================================
-
     def prepare_training_batch(
         self,
         batch: Data | Batch,
@@ -752,11 +698,6 @@ class ModelKLDM(nn.Module):
             index=index,
         )
 
-        space_group = self._space_group_condition(
-            batch=batch,
-            training_dropout=True,
-        )
-
         return PreparedTrainingBatch(
             times=times,
             v_t=v_t,
@@ -767,9 +708,9 @@ class ModelKLDM(nn.Module):
             atomic_numbers=batch.atomic_numbers,
             node_index=index,
             edge_node_index=batch.edge_node_index,
+            space_group=getattr(batch, "space_group", None),
             num_graphs=int(batch.num_graphs),
             lattice_representation=self.lattice_representation,
-            space_group=space_group,
         )
 
     def loss_from_prepared(
@@ -793,17 +734,13 @@ class ModelKLDM(nn.Module):
             l=prepared.l_t,
             node_index=prepared.node_index,
             edge_node_index=prepared.edge_node_index,
-            space_group=prepared.space_group,
         )
 
         out_v = preds["v"]
         out_l = preds["l"]
 
         loss_v_node = self.mse_loss_per_sample(out_v, prepared.target_v)
-        if prepared.lattice_representation == "mattergen":
-            loss_l_graph = self.mattergen_lattice_mse_6d_per_sample(out_l, prepared.target_l)
-        else:
-            loss_l_graph = self.mse_loss_per_sample(out_l, prepared.target_l)
+        loss_l_graph = self.mse_loss_per_sample(out_l, prepared.target_l)
 
         loss_v_sum = torch.zeros(
             prepared.num_graphs,
@@ -817,133 +754,62 @@ class ModelKLDM(nn.Module):
             dtype=loss_v_node.dtype,
         ).clamp_min(1.0)
 
-        if prepared.lattice_representation == "mattergen":
-            # Official MatterGen uses a weighted summed-field objective:
-            # `cell: 1.0`, `pos: 0.1`, with `reduce=sum` over nodes for the
-            # position field. The KLDM port still trains the TDM velocity head,
-            # but matching the graph-level reduction and branch weighting keeps
-            # the overall objective aligned with the MatterGen implementation.
-            if self.mattergen_pos_loss_reduce == "sum":
-                loss_v_graph = loss_v_sum
-            else:
-                loss_v_graph = loss_v_sum / counts
-            loss_v_weighted_graph = self.mattergen_pos_loss_weight * loss_v_graph
-            loss_l_weighted_graph = self.mattergen_cell_loss_weight * loss_l_graph
-            loss_graph = (
-                loss_v_weighted_graph
-                + loss_l_weighted_graph
+        loss_v_graph = loss_v_sum / counts
+        loss_v_weighted_graph = loss_v_graph
+        loss_l_weighted_graph = loss_l_graph
+
+        loss_sg_lattice_graph = torch.zeros_like(loss_l_graph)
+        projection_error_pred = out_l.new_tensor(0.0)
+        projection_error_gt = out_l.new_tensor(0.0)
+        has_sg_labels = prepared.space_group is not None
+        if prepared.lattice_representation == "diffcsp_k" and has_sg_labels:
+            sg = prepared.space_group.to(device=out_l.device)
+            pred_proj = self.lattice_symmetry.proj_k_to_spacegroup(out_l, sg)
+            target_proj = self.lattice_symmetry.proj_k_to_spacegroup(prepared.target_l, sg)
+            projection_error_pred = (out_l - pred_proj).abs().mean()
+            projection_error_gt = (prepared.target_l - target_proj).abs().mean()
+        if self.lattice_sg_lambda > 0.0:
+            if prepared.lattice_representation != "diffcsp_k":
+                raise RuntimeError("Soft SG lattice loss requires lattice_representation='diffcsp_k'.")
+            if self.lattice_parameterization != "x0":
+                raise RuntimeError("Soft SG lattice loss expects x0 lattice parameterization.")
+            if prepared.space_group is None:
+                raise RuntimeError("lattice_sg_lambda > 0 requires batch.space_group.")
+            loss_sg_lattice_graph = self.lattice_symmetry.soft_lattice_sg_loss_per_graph(
+                pred_k0=out_l,
+                spacegroup=prepared.space_group.to(device=out_l.device),
+                normalize=self.lattice_sg_normalize,
             )
-        else:
-            loss_v_graph = loss_v_sum / counts
-            loss_v_weighted_graph = loss_v_graph
-            loss_l_weighted_graph = loss_l_graph
-            loss_graph = loss_v_graph + loss_l_graph
+
+        loss_graph = loss_v_graph + loss_l_graph + self.lattice_sg_lambda * loss_sg_lattice_graph
 
         if time_weight is not None:
             weight = time_weight.reshape(-1).to(device=loss_graph.device, dtype=loss_graph.dtype)
             total_loss = (weight * loss_graph).mean()
+            loss_sg_lattice_weighted = (weight * loss_sg_lattice_graph).mean()
         else:
             total_loss = loss_graph.mean()
+            loss_sg_lattice_weighted = loss_sg_lattice_graph.mean()
 
         metrics = {
             "loss": total_loss.detach(),
             "loss_v": loss_v_graph.mean().detach(),
             "loss_l": loss_l_graph.mean().detach(),
+            "loss_sg_lattice": loss_sg_lattice_graph.mean().detach(),
+            "loss_sg_lattice_weighted": loss_sg_lattice_weighted.detach(),
+            "lambda_sg_lattice": out_l.new_tensor(self.lattice_sg_lambda).detach(),
+            "projection_error_pred_k": projection_error_pred.detach(),
+            "projection_error_gt_k": projection_error_gt.detach(),
             "loss_v_weighted": loss_v_weighted_graph.mean().detach(),
             "loss_l_weighted": loss_l_weighted_graph.mean().detach(),
             "loss_graph": loss_graph.detach(),
             "loss_v_graph": loss_v_graph.detach(),
             "loss_l_graph": loss_l_graph.detach(),
+            "loss_sg_lattice_graph": loss_sg_lattice_graph.detach(),
             "loss_v_weighted_graph": loss_v_weighted_graph.detach(),
             "loss_l_weighted_graph": loss_l_weighted_graph.detach(),
         }
         return total_loss, metrics
-
-    def _space_group_condition(
-        self,
-        *,
-        batch: Data | Batch,
-        training_dropout: bool,
-    ) -> torch.Tensor | None:
-        if not bool(getattr(self.score_network, "sg_conditional", False)):
-            return None
-        if not hasattr(batch, "space_group"):
-            raise ValueError("SG-conditioned KLDM requires batch.space_group.")
-        device = next(self.parameters()).device
-        space_group = torch.as_tensor(
-            batch.space_group,
-            device=device,
-            dtype=torch.long,
-        ).reshape(-1)
-        if training_dropout and self.sg_condition_dropout > 0.0:
-            drop_mask = torch.rand(space_group.shape, device=device) < self.sg_condition_dropout
-            space_group = space_group.clone()
-            space_group[drop_mask] = 0
-        return space_group
-
-    def _score_network_forward(
-        self,
-        *,
-        t: torch.Tensor,
-        pos: torch.Tensor,
-        v: torch.Tensor,
-        h: torch.Tensor,
-        l: torch.Tensor,
-        node_index: torch.Tensor,
-        edge_node_index: torch.Tensor,
-        space_group: torch.Tensor | None = None,
-        sg_guidance_scale: float = 1.0,
-    ) -> dict[str, torch.Tensor]:
-        if not bool(getattr(self.score_network, "sg_conditional", False)):
-            return self.score_network(
-                t=t,
-                pos=pos,
-                v=v,
-                h=h,
-                l=l,
-                node_index=node_index,
-                edge_node_index=edge_node_index,
-            )
-
-        if space_group is None:
-            return self.score_network(
-                t=t,
-                pos=pos,
-                v=v,
-                h=h,
-                l=l,
-                node_index=node_index,
-                edge_node_index=edge_node_index,
-                space_group=None,
-            )
-
-        pred_cond = self.score_network(
-            t=t,
-            pos=pos,
-            v=v,
-            h=h,
-            l=l,
-            node_index=node_index,
-            edge_node_index=edge_node_index,
-            space_group=space_group,
-        )
-        if float(sg_guidance_scale) == 1.0:
-            return pred_cond
-
-        pred_uncond = self.score_network(
-            t=t,
-            pos=pos,
-            v=v,
-            h=h,
-            l=l,
-            node_index=node_index,
-            edge_node_index=edge_node_index,
-            space_group=torch.zeros_like(space_group),
-        )
-        guided: dict[str, torch.Tensor] = {}
-        for key, value in pred_cond.items():
-            guided[key] = pred_uncond[key] + float(sg_guidance_scale) * (value - pred_uncond[key])
-        return guided
 
     def algorithm2_loss(
         self,
@@ -969,15 +835,6 @@ class ModelKLDM(nn.Module):
         dt: float,
         num_atoms: torch.Tensor,
     ) -> torch.Tensor:
-        if isinstance(self.diffusion_l, ContinuousMattergenVPDiffusion):
-            return self.diffusion_l.reverse_step_ancestral(
-                t=t,
-                x_t=x_t,
-                pred=pred,
-                dt=dt,
-                num_atoms=num_atoms,
-            )
-
         return self.diffusion_l.reverse_step(
             t=t,
             x_t=x_t,
@@ -1179,8 +1036,6 @@ class ModelKLDM(nn.Module):
         batch: Batch | Data,
         t_start: float = 1.0,
         t_final: float = 1e-6,
-        space_group: torch.Tensor | None = None,
-        sg_guidance_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Algorithm 3 from Appendix H: EM sampling for the CSP model.
@@ -1196,8 +1051,6 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
-            space_group=space_group,
-            sg_guidance_scale=sg_guidance_scale,
         )
         state = self._run_csp_em_reverse_chain(state)
 
@@ -1206,7 +1059,9 @@ class ModelKLDM(nn.Module):
 
         return state["f_t"], state["v_t"], state["l_t"], state["a_t"]
 
-    def sample_CSP_algorithm5(
+    # Archived legacy sampler body retained only as an internal reference
+    # during the KLDMplus -> CASAL/CASCAL cleanup.
+    def _legacy_algorithm5_impl(
         self,
         n_steps: int,
         batch: Batch | Data,
@@ -1243,7 +1098,6 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
-            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
 
         for step_idx, times in enumerate(
@@ -1251,7 +1105,7 @@ class ModelKLDM(nn.Module):
             start=1,
         ):
             with torch.no_grad():
-                preds_curr = self._score_network_forward(
+                preds_curr = self.score_network(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1259,8 +1113,6 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
-                    space_group=state.get("space_group"),
-                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
@@ -1343,7 +1195,6 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
-            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
 
         with torch.no_grad():
@@ -1352,7 +1203,7 @@ class ModelKLDM(nn.Module):
                 # times.now is the current/noisier time, and times.next is the
                 # predicted/cleaner time used for the second network evaluation.
                 # 1. Evaluate the network at the current time level t_n.
-                preds_curr = self._score_network_forward(
+                preds_curr = self.score_network(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1360,8 +1211,6 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
-                    space_group=state.get("space_group"),
-                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 # 2. Predictor from t_n to t_{n+1}. The TDM helper uses the
@@ -1383,7 +1232,7 @@ class ModelKLDM(nn.Module):
                 if times.t_next_float < 1e-3:
                     continue
 
-                preds_next = self._score_network_forward(
+                preds_next = self.score_network(
                     t=times.next.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1391,8 +1240,6 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
-                    space_group=state.get("space_group"),
-                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 # 4. Single corrector step at t_{n+1}.
@@ -1406,8 +1253,8 @@ class ModelKLDM(nn.Module):
                     tau=tau,
                 )
 
-                # 5. Lattice branch: KLDM VP uses EM; MatterGen VP uses the
-                # source-style ancestral lattice predictor.
+                # 5. Lattice branch: KLDM VP uses the standard reverse
+                # predictor for the 6D lattice state.
                 state["l_t"] = self._reverse_lattice_sampling_step(
                     t=times.next.lattice,
                     x_t=state["l_t"],
@@ -1427,6 +1274,8 @@ class ModelKLDM(nn.Module):
         batch: Batch | Data,
         t_start: float = 1.0,
         t_final: float = 1e-6,
+        debug_label: str | None = None,
+        debug_print_every: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         FacitKLDM Algorithm 3 loop, preserved for ablation comparisons.
@@ -1439,12 +1288,27 @@ class ModelKLDM(nn.Module):
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
-            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
+        debug_enabled = bool(debug_label)
+        if debug_enabled:
+            print(
+                f"[facit-em] start label={debug_label} total_steps={int(n_steps)}",
+                flush=True,
+            )
 
         with torch.no_grad():
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
-                preds_curr = self._score_network_forward(
+                completed_step = int(times.step) + 1
+                remaining_step = int(n_steps) - int(times.step)
+                tau = float(remaining_step) / float(max(int(n_steps), 1))
+                if debug_print_every is not None and int(debug_print_every) > 0:
+                    if completed_step == 1 or completed_step % int(debug_print_every) == 0 or remaining_step <= 1:
+                        print(
+                            f"[facit-em] label={debug_label} progress completed={completed_step}/{int(n_steps)} "
+                            f"remaining={remaining_step} tau={tau:.3f}",
+                            flush=True,
+                        )
+                preds_curr = self.score_network(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1452,8 +1316,6 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
-                    space_group=state.get("space_group"),
-                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
@@ -1480,6 +1342,11 @@ class ModelKLDM(nn.Module):
 
         if state["restore_training"]:
             state["score_network"].train()
+        if debug_enabled:
+            print(
+                f"[facit-em] done label={debug_label}",
+                flush=True,
+            )
 
         return state["f_t"], state["v_t"], state["l_t"], state["a_t"]
 
@@ -1491,55 +1358,44 @@ class ModelKLDM(nn.Module):
         t_final: float = 1e-6,
         tau: float = 0.25,
         n_correction_steps: int = 1,
+        debug_label: str | None = None,
+        debug_print_every: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         FacitKLDM Algorithm 4 loop, preserved for ablation comparisons.
 
-        `n_correction_steps` is accepted for config compatibility; the facit
-        sampler performs corrector step(s) before the predictor, and applies
-        predictor/corrector updates to the lattice branch as well.
+        This follows `src/kldm/kldm.py::sample_CSP_algorithm4`:
+        predictor at the current time, then corrector at the next time, then
+        one lattice EM reverse step. `n_correction_steps` repeats only the
+        corrector block for local ablations; the facit default is one.
         """
         state = self._prepare_csp_sampling(
             batch=batch,
             n_steps=n_steps,
             t_start=t_start,
             t_final=t_final,
-            space_group=self._space_group_condition(batch=batch, training_dropout=False),
         )
+        debug_enabled = bool(debug_label)
+        if debug_enabled:
+            print(
+                f"[facit-pc] start label={debug_label} total_steps={int(n_steps)} "
+                f"tau={float(tau):.3f} correctors={int(n_correction_steps)}",
+                flush=True,
+            )
 
         with torch.no_grad():
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
-                for _ in range(max(int(n_correction_steps), 1)):
-                    preds_corr = self._score_network_forward(
-                        t=times.now.graph,
-                        pos=state["f_t"],
-                        v=state["v_t"],
-                        h=state["a_t"],
-                        l=state["l_t"],
-                        node_index=state["node_index"],
-                        edge_node_index=state["edge_node_index"],
-                        space_group=state.get("space_group"),
-                        sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
-                    )
-
-                    state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_corrector(
-                        t=times.now.nodes,
-                        f_t=state["f_t"],
-                        v_t=state["v_t"],
-                        pred_v=preds_corr["v"],
-                        dt=times.dt,
-                        index=state["node_index"],
-                        tau=tau,
-                    )
-
-                    state["l_t"] = state["sampling_diffusion_l"].reverse_step_corrector(
-                        t=times.now.lattice,
-                        x_t=state["l_t"],
-                        pred=preds_corr["l"],
-                        tau=tau,
-                    )
-
-                preds_pred = self._score_network_forward(
+                completed_step = int(times.step) + 1
+                remaining_step = int(n_steps) - int(times.step)
+                tau_progress = float(remaining_step) / float(max(int(n_steps), 1))
+                if debug_print_every is not None and int(debug_print_every) > 0:
+                    if completed_step == 1 or completed_step % int(debug_print_every) == 0 or remaining_step <= 1:
+                        print(
+                            f"[facit-pc] label={debug_label} progress completed={completed_step}/{int(n_steps)} "
+                            f"remaining={remaining_step} tau={tau_progress:.3f}",
+                            flush=True,
+                        )
+                preds_curr = self.score_network(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -1547,32 +1403,62 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
-                    space_group=state.get("space_group"),
-                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_predictor(
                     t=times.now.nodes,
                     f_t=state["f_t"],
                     v_t=state["v_t"],
-                    pred_v=preds_pred["v"],
+                    pred_v=preds_curr["v"],
                     index=state["node_index"],
                     dt=times.dt,
                 )
 
-                state["l_t"] = state["sampling_diffusion_l"].reverse_step_predictor(
-                    t=times.now.lattice,
+                if times.t_next_float < 1e-3:
+                    continue
+
+                for _ in range(max(int(n_correction_steps), 1)):
+                    preds_next = self.score_network(
+                        t=times.next.graph,
+                        pos=state["f_t"],
+                        v=state["v_t"],
+                        h=state["a_t"],
+                        l=state["l_t"],
+                        node_index=state["node_index"],
+                        edge_node_index=state["edge_node_index"],
+                    )
+
+                    state["f_t"], state["v_t"] = state["sampling_tdm"].reverse_step_corrector(
+                        t=times.next.nodes,
+                        f_t=state["f_t"],
+                        v_t=state["v_t"],
+                        pred_v=preds_next["v"],
+                        dt=times.dt,
+                        index=state["node_index"],
+                        tau=tau,
+                    )
+
+                state["l_t"] = state["sampling_diffusion_l"].reverse_step(
+                    t=times.next.lattice,
                     x_t=state["l_t"],
-                    pred=preds_pred["l"],
+                    pred=preds_next["l"],
                     dt=times.dt,
+                    num_atoms=state["batch"].num_atoms,
                 )
 
         if state["restore_training"]:
             state["score_network"].train()
+        if debug_enabled:
+            print(
+                f"[facit-pc] done label={debug_label}",
+                flush=True,
+            )
 
         return state["f_t"], state["v_t"], state["l_t"], state["a_t"]
 
-    def sample_CSP_algorithm6(
+    # Archived legacy sampler body retained only as an internal reference
+    # during the KLDMplus -> CASAL/CASCAL cleanup.
+    def _legacy_algorithm6_impl(
         self,
         n_steps: int,
         batch: Batch | Data,
@@ -2128,59 +2014,21 @@ class ModelKLDM(nn.Module):
 
         return pos_current, v_current, l_current, h_current
 
-    def sample_CSP_kldm_dpnp_sg(
-        self,
-        n_steps: int,
-        batch: Batch | Data,
-        lattice_transform: ContinuousIntervalLattice | None = None,
-        t_start: float = 1.0,
-        t_final: float = 1e-6,
-        sgdpnp_config: dict[str, Any] | SGDPnPConfig | None = None,
-        template_prior: Any | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Clean KLDM-DPnP-SG sampler.
-
-        This is the new small architecture:
-
-            KLDM prior sample -> Wyckoff PCS sample -> KLDM DDS -> final Wyckoff PCS.
-
-        The old Algorithm 6 implementation is intentionally left isolated below
-        this entry point; new experiments should call this method instead.
-        """
-        config = (
-            sgdpnp_config
-            if isinstance(sgdpnp_config, SGDPnPConfig)
-            else SGDPnPConfig.from_mapping(sgdpnp_config)
-        )
-        return sample_kldm_dpnp_sg(
-            model=self,
-            n_steps=n_steps,
-            batch=batch,
-            lattice_transform=lattice_transform,
-            t_start=t_start,
-            t_final=t_final,
-            config=config,
-            template_prior=template_prior,
+    def sample_CSP_algorithm5(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Legacy symmetry sampler algorithm5 was removed during cleanup. "
+            "Keep using original KLDMplus sampling or Algorithm10/12 CASAL samplers.",
         )
 
-    def sample_CSP_algorithm7(
-        self,
-        n_steps: int,
-        batch: Batch | Data,
-        lattice_transform: ContinuousIntervalLattice | None = None,
-        t_start: float = 1.0,
-        t_final: float = 1e-6,
-        sgdpnp_config: dict[str, Any] | SGDPnPConfig | None = None,
-        template_prior: Any | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.sample_CSP_kldm_dpnp_sg(
-            n_steps=n_steps,
-            batch=batch,
-            lattice_transform=lattice_transform,
-            t_start=t_start,
-            t_final=t_final,
-            sgdpnp_config=sgdpnp_config,
-            template_prior=template_prior,
+    def sample_CSP_algorithm6(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Legacy symmetry sampler algorithm6 was removed during cleanup. "
+            "Use Algorithm10 CASAL with Wyckoff projection instead.",
+        )
+
+    def sample_CSP_algorithm7(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Legacy SG-DPnP sampler algorithm7 was removed during cleanup.",
         )
 
     def sample_CSP_algorithm8(
@@ -2190,15 +2038,46 @@ class ModelKLDM(nn.Module):
         lattice_transform: ContinuousIntervalLattice | None = None,
         t_start: float = 1.0,
         t_final: float = 1e-6,
-        dpnpsvd_config: dict[str, Any] | DPnPSVDConfig | None = None,
-        template_prior: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        config = (
-            dpnpsvd_config
-            if isinstance(dpnpsvd_config, DPnPSVDConfig)
-            else DPnPSVDConfig.from_mapping(dpnpsvd_config)
+        raise NotImplementedError(
+            "Legacy DPnP-SVD sampler algorithm8 was removed during cleanup.",
         )
-        return sample_kldm_dpnp_svd(
+
+    def sample_CSP_algorithm9(
+        self,
+        n_steps: int,
+        batch: Batch | Data,
+        lattice_transform: ContinuousIntervalLattice | None = None,
+        t_start: float = 1.0,
+        t_final: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        raise NotImplementedError(
+            "Legacy DAPS sampler algorithm9 was removed during cleanup.",
+        )
+
+    def sample_CSP_algorithm10(
+        self,
+        n_steps: int,
+        batch: Batch | Data,
+        lattice_transform: ContinuousIntervalLattice | None = None,
+        t_start: float = 1.0,
+        t_final: float = 1e-6,
+        algorithm10_config: dict[str, Any] | Algorithm10Config | None = None,
+        template_prior: Any | None = None,
+        return_diagnostics: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[dict[str, Any]],
+    ]:
+        config = (
+            algorithm10_config
+            if isinstance(algorithm10_config, Algorithm10Config)
+            else Algorithm10Config.from_mapping(algorithm10_config)
+        )
+        return sample_kldm_casal_chart(
             model=self,
             n_steps=n_steps,
             batch=batch,
@@ -2207,6 +2086,7 @@ class ModelKLDM(nn.Module):
             t_final=t_final,
             config=config,
             template_prior=template_prior,
+            return_diagnostics=return_diagnostics,
         )
 
     def _prepare_csp_sampling(
@@ -2215,8 +2095,6 @@ class ModelKLDM(nn.Module):
         n_steps: int,
         t_start: float,
         t_final: float,
-        space_group: torch.Tensor | None = None,
-        sg_guidance_scale: float = 1.0,
         initial_f: torch.Tensor | None = None,
         initial_v: torch.Tensor | None = None,
         initial_l: torch.Tensor | None = None,
@@ -2268,13 +2146,8 @@ class ModelKLDM(nn.Module):
                 mu_r_t = self.tdm.wrapped_gaussian_mu_r_t(t_nodes_internal, v_t)
                 f_t = self.tdm.wrap_displacements(initial_f + mu_r_t)
 
-                if isinstance(self.diffusion_l, ContinuousMattergenVPDiffusion):
-                    alpha_t = self.diffusion_l._match_dims(self.diffusion_l.alpha(start_times.lattice), initial_l)
-                    mu_vec = self.diffusion_l.prior_mean(num_atoms=batch.num_atoms, ref=initial_l)
-                    l_t = alpha_t * initial_l + (1.0 - alpha_t) * mu_vec
-                else:
-                    alpha_t = self.diffusion_l._match_dims(self.diffusion_l.alpha(start_times.lattice), initial_l)
-                    l_t = alpha_t * initial_l
+                alpha_t = self.diffusion_l._match_dims(self.diffusion_l.alpha(start_times.lattice), initial_l)
+                l_t = alpha_t * initial_l
             else:
                 f_t, v_t, _epsilon_v, _epsilon_r, _r_t = self.tdm.sample_noisy_state(
                     t=start_times.nodes,
@@ -2289,8 +2162,7 @@ class ModelKLDM(nn.Module):
         else:
             # Appendix H-style priors, kept in one place so the sampler owns its
             # initial state: f_T ~ U(0, 1) represented in TDM's signed chart,
-            # v_T ~ centered N_v(0, I), and l_T follows either the KLDM standard
-            # normal prior or the MatterGen atom-count-aware prior.
+            # v_T ~ centered N_v(0, I), and l_T follows the KLDM lattice prior.
             f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
             v_t = self.tdm.sample_velocity_noise(f_t, index=node_index)
             l_t = self.diffusion_l.sample_prior(
@@ -2305,18 +2177,6 @@ class ModelKLDM(nn.Module):
         score_network = self.score_network
         restore_training = score_network.training
         score_network.eval()
-
-        if bool(getattr(score_network, "sg_conditional", False)):
-            if space_group is None and hasattr(batch, "space_group"):
-                space_group = torch.as_tensor(
-                    batch.space_group,
-                    device=device,
-                    dtype=torch.long,
-                ).reshape(-1)
-            elif space_group is not None:
-                space_group = space_group.to(device=device, dtype=torch.long).reshape(-1)
-        else:
-            space_group = None
 
         sampling_time_grid = sampling_grid(
             batch=batch,
@@ -2341,8 +2201,6 @@ class ModelKLDM(nn.Module):
             "v_t": v_t,
             "l_t": l_t,
             "a_t": a_t,
-            "space_group": space_group,
-            "sg_guidance_scale": float(sg_guidance_scale),
             "sampling_time_grid": sampling_time_grid,
         }
 
@@ -2353,7 +2211,7 @@ class ModelKLDM(nn.Module):
             different sign than the appendix algorithms.
             """
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
-                preds_curr = self._score_network_forward(
+                preds_curr = self.score_network(
                     t=times.now.graph,
                     pos=state["f_t"],
                     v=state["v_t"],
@@ -2361,8 +2219,6 @@ class ModelKLDM(nn.Module):
                     l=state["l_t"],
                     node_index=state["node_index"],
                     edge_node_index=state["edge_node_index"],
-                    space_group=state.get("space_group"),
-                    sg_guidance_scale=float(state.get("sg_guidance_scale", 1.0)),
                 )
 
                 score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
@@ -2454,12 +2310,6 @@ class ModelKLDM(nn.Module):
         alpha_grid = self.diffusion_l.alpha(t_unit_grid)
         sigma_grid = self.diffusion_l.sigma(t_unit_grid)
         lattice_width_grid = sigma_grid / alpha_grid.clamp_min(1.0e-6)
-        if isinstance(self.diffusion_l, ContinuousMattergenVPDiffusion) and num_atoms is not None:
-            ref = ref_l if ref_l is not None else torch.zeros((int(num_atoms.shape[0]), 6), device=device, dtype=dtype)
-            _, sigma_n = self.diffusion_l.mu_sigma_n(num_atoms=num_atoms.to(device=device), ref=ref.to(device=device, dtype=dtype))
-            lattice_scale = torch.median(sigma_n.to(device=device, dtype=dtype)).clamp_min(1.0e-6)
-            lattice_width_grid = lattice_width_grid * lattice_scale
-
         combined_error = (sigma_r_grid - target).square() + (lattice_width_grid - target).square()
         idx = int(torch.argmin(combined_error).item())
         t_internal = float(t_internal_grid[idx].item())

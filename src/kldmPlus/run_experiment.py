@@ -108,6 +108,13 @@ def make_fixed_subset(dataset, subset_size: int | None, seed: int) -> Any:
     return Subset(dataset, indices)
 
 
+def make_fraction_subset(dataset, fraction: float | None, seed: int) -> Any:
+    if fraction is None or float(fraction) <= 0.0 or float(fraction) >= 1.0:
+        return dataset
+    subset_size = max(1, int(round(len(dataset) * float(fraction))))
+    return make_fixed_subset(dataset, subset_size=subset_size, seed=seed)
+
+
 def should_stop(run) -> bool:
     if STOP_REQUESTED:
         return True
@@ -263,72 +270,6 @@ def isolated_rng_seed(seed: int):
         yield
 
 
-def summarize_requested_space_groups(results: list[Any]) -> list[dict[str, Any]]:
-    grouped: dict[int, dict[str, Any]] = {}
-    for result in results:
-        requested_sg = getattr(result, "requested_space_group", None)
-        if requested_sg is None:
-            continue
-        requested_sg = int(requested_sg)
-        bucket = grouped.setdefault(
-            requested_sg,
-            {
-                "requested_sg": requested_sg,
-                "count": 0,
-                "valid": [],
-                "match": [],
-                "composition_match": [],
-                "requested_sg_match": [],
-                "detected_counts": {},
-            },
-        )
-        bucket["count"] += 1
-        bucket["valid"].append(float(bool(getattr(result, "valid", False))))
-        bucket["match"].append(float(bool(getattr(result, "match", False))))
-        composition_match = getattr(result, "composition_match", None)
-        if composition_match is not None:
-            bucket["composition_match"].append(float(bool(composition_match)))
-        requested_match = getattr(result, "requested_space_group_match", None)
-        if requested_match is not None:
-            bucket["requested_sg_match"].append(float(bool(requested_match)))
-        detected_sg = getattr(result, "detected_space_group", None)
-        if detected_sg is not None:
-            detected_sg = int(detected_sg)
-            bucket["detected_counts"][detected_sg] = bucket["detected_counts"].get(detected_sg, 0) + 1
-
-    summaries: list[dict[str, Any]] = []
-    for requested_sg in sorted(grouped):
-        bucket = grouped[requested_sg]
-        detected_counts = bucket["detected_counts"]
-        detected_top = ",".join(
-            f"{sg}:{count}"
-            for sg, count in sorted(
-                detected_counts.items(),
-                key=lambda item: (-item[1], item[0]),
-            )[:5]
-        )
-        summaries.append(
-            {
-                "requested_sg": requested_sg,
-                "count": int(bucket["count"]),
-                "valid": float(np.mean(bucket["valid"])) if bucket["valid"] else None,
-                "match_rate": float(np.mean(bucket["match"])) if bucket["match"] else None,
-                "composition_match_rate": (
-                    float(np.mean(bucket["composition_match"]))
-                    if bucket["composition_match"]
-                    else None
-                ),
-                "requested_space_group_match_rate": (
-                    float(np.mean(bucket["requested_sg_match"]))
-                    if bucket["requested_sg_match"]
-                    else None
-                ),
-                "top_detected_space_groups": detected_top or "none",
-            }
-        )
-    return summaries
-
-
 def epoch_from_checkpoint_name(path: Path) -> int | None:
     match = re.search(r"(?:^|[_-])epoch[_-](\d+)(?:\D|$)", path.name)
     if match is None:
@@ -396,6 +337,7 @@ class ExperimentRunner:
         self.experiment_name = str(self.config["experiment_name"])
 
         self.sampler_cfg = dict(self.config["sampler"])
+        self.training_cfg = dict(self.config.get("training", {}) or {})
         self.logging_cfg = dict(self.config["logging"])
         self.validation_cfg = dict(self.config["validation"])
         self.checkpoint_cfg = dict(self.config["checkpoint"])
@@ -405,6 +347,8 @@ class ExperimentRunner:
 
         self.train_every_epochs = int(self.logging_cfg["train_every_epochs"])
         self.validate_every_epochs = int(self.validation_cfg["every_n_epochs"])
+        self.max_epochs = self.training_cfg.get("max_epochs")
+        self.max_epochs = None if self.max_epochs is None else int(self.max_epochs)
 
         # -------------------------------------------------
         # Runtime objects: device, data, model, optimizer, EMA
@@ -416,8 +360,6 @@ class ExperimentRunner:
         print("startup phase=build_time_sampler:start", flush=True)
         self.time_sampler = self.build_time_sampler()
         print("startup phase=build_time_sampler:done", flush=True)
-        self._inject_mattergen_lattice_stats()
-
         print("startup phase=build_training_components:start", flush=True)
         self.model, self.optimizer, self.ema = build_training_components(
             config=self.config,
@@ -438,10 +380,6 @@ class ExperimentRunner:
             "match_rate_std": [],
             "valid_mean": [],
             "valid_std": [],
-            "composition_match_rate_mean": [],
-            "composition_match_rate_std": [],
-            "requested_space_group_match_rate_mean": [],
-            "requested_space_group_match_rate_std": [],
         }
 
         # Optional resume path for continuing training from a saved checkpoint.
@@ -486,19 +424,6 @@ class ExperimentRunner:
                 self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
         if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
             prune_wandb_artifact_cache(resolved_checkpoint_path)
-
-        sg_conditional = bool(getattr(self.model.score_network, "sg_conditional", False))
-        sg_dropout = float(getattr(self.model, "sg_condition_dropout", 0.0))
-        validation_sg_conditioned = bool(self.validation_cfg.get("sg_conditioned_sampling", sg_conditional))
-        validation_sg_guidance_scale = float(self.validation_cfg.get("sg_guidance_scale", 1.0))
-        print(
-            "space_group_training "
-            f"sg_conditional={int(sg_conditional)} "
-            f"sg_condition_dropout={sg_dropout:.3f} "
-            f"validation_sg_conditioned={int(validation_sg_conditioned)} "
-            f"validation_sg_guidance_scale={validation_sg_guidance_scale:.3f}",
-            flush=True,
-        )
 
     def build_time_sampler(self):
         cfg = dict(self.config.get("time_sampler", {}))
@@ -610,10 +535,17 @@ class ExperimentRunner:
 
         dataset_cfg = dict(self.config["dataset"])
         model_cfg = dict(self.config["model"])
+        dataset_lattice_representation = str(dataset_cfg.get("lattice_representation", "kldm"))
+        model_lattice_representation = str(model_cfg.get("lattice_representation", dataset_lattice_representation))
+        if model_lattice_representation != dataset_lattice_representation:
+            raise ValueError(
+                "dataset.lattice_representation and model.lattice_representation must match: "
+                f"dataset={dataset_lattice_representation!r}, model={model_lattice_representation!r}."
+            )
         # Guard against silent representation/diffusion mismatches before the
         # runner creates datasets or starts training.
         validate_lattice_configuration(
-            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
+            lattice_representation=dataset_lattice_representation,
             lattice_parameterization=str(model_cfg["lattice_parameterization"]),
             lattice_diffusion_type=str(model_cfg.get("lattice_diffusion_type", "VP")),
         )
@@ -621,7 +553,7 @@ class ExperimentRunner:
         task = CSPTask(
             dataset_name=str(dataset_cfg["name"]),
             lattice_parameterization=str(model_cfg["lattice_parameterization"]),
-            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
+            lattice_representation=dataset_lattice_representation,
         )
 
         root = resolve_data_root(dataset_cfg["root"])
@@ -633,16 +565,21 @@ class ExperimentRunner:
 
         # Keep training/validation splits fixed so experiment metrics are always
         # comparable across runs.
-        train_loader = task.dataloader(
-            root=root,
-            split=TRAIN_SPLIT,
+        train_dataset_full = task.fit_dataset(root=root, split=TRAIN_SPLIT, download=True)
+        train_dataset = make_fraction_subset(
+            train_dataset_full,
+            fraction=dataset_cfg.get("train_subset_fraction"),
+            seed=int(dataset_cfg.get("train_subset_seed", TRAIN_SEED)),
+        )
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            download=True,
             generator=train_generator,
             worker_init_fn=worker_init_fn,
+            collate_fn=train_dataset_full.collate_fn,
         )
 
         # Validation always uses the validation split, optionally with a fixed
@@ -666,18 +603,7 @@ class ExperimentRunner:
         return train_loader, val_loader, task.make_lattice_transform(
             root=root,
             download=True,
-            mattergen_limit_var_scaling_constant=model_cfg.get("mattergen_limit_var_scaling_constant"),
         )
-
-    def _inject_mattergen_lattice_stats(self) -> None:
-        if getattr(self.lattice_transform, "representation", None) != "mattergen":
-            return
-        if not hasattr(self.lattice_transform, "stats"):
-            return
-        c, nu = self.lattice_transform.stats()
-        self.config.setdefault("model", {})
-        self.config["model"]["mattergen_lattice_c"] = float(c)
-        self.config["model"]["mattergen_lattice_nu"] = float(nu)
 
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
@@ -685,7 +611,8 @@ class ExperimentRunner:
         if train_generator is not None:
             train_generator.manual_seed(TRAIN_SEED + int(epoch))
 
-        total_loss_v = total_loss_l = total_loss_weighted = 0.0
+        total_loss_v = total_loss_l = total_loss_sg_lattice = total_loss_weighted = 0.0
+        total_projection_error_pred_k = total_projection_error_gt_k = 0.0
         total_loss_v_weighted = total_loss_l_weighted = 0.0
         total_graphs = 0
 
@@ -720,6 +647,9 @@ class ExperimentRunner:
             total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
             total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
+            total_loss_sg_lattice += float(metrics.get("loss_sg_lattice", 0.0)) * int(batch.num_graphs)
+            total_projection_error_pred_k += float(metrics.get("projection_error_pred_k", 0.0)) * int(batch.num_graphs)
+            total_projection_error_gt_k += float(metrics.get("projection_error_gt_k", 0.0)) * int(batch.num_graphs)
             total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.num_graphs)
             total_loss_l_weighted += float(metrics["loss_l_weighted"]) * int(batch.num_graphs)
             total_graphs += int(batch.num_graphs)
@@ -731,6 +661,9 @@ class ExperimentRunner:
             "loss": total_loss_weighted / total_graphs,
             "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
+            "loss_sg_lattice": total_loss_sg_lattice / total_graphs,
+            "projection_error_pred_k": total_projection_error_pred_k / total_graphs,
+            "projection_error_gt_k": total_projection_error_gt_k / total_graphs,
             "loss_v_weighted": total_loss_v_weighted / total_graphs,
             "loss_l_weighted": total_loss_l_weighted / total_graphs,
             "loss_weighted": total_loss_weighted / total_graphs,
@@ -741,7 +674,8 @@ class ExperimentRunner:
     def evaluate_loss(self) -> dict[str, float]:
         self.model.eval()
 
-        total_loss_v = total_loss_l = total_loss_weighted = 0.0
+        total_loss_v = total_loss_l = total_loss_sg_lattice = total_loss_weighted = 0.0
+        total_projection_error_pred_k = total_projection_error_gt_k = 0.0
         total_loss_v_weighted = total_loss_l_weighted = 0.0
         total_graphs = 0
         loss_seed = int(self.validation_cfg.get("loss_seed", TRAIN_SEED + 17))
@@ -759,6 +693,9 @@ class ExperimentRunner:
                 total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
                 total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
                 total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
+                total_loss_sg_lattice += float(metrics.get("loss_sg_lattice", 0.0)) * int(batch.num_graphs)
+                total_projection_error_pred_k += float(metrics.get("projection_error_pred_k", 0.0)) * int(batch.num_graphs)
+                total_projection_error_gt_k += float(metrics.get("projection_error_gt_k", 0.0)) * int(batch.num_graphs)
                 total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.num_graphs)
                 total_loss_l_weighted += float(metrics["loss_l_weighted"]) * int(batch.num_graphs)
                 total_graphs += int(batch.num_graphs)
@@ -770,6 +707,9 @@ class ExperimentRunner:
             "loss": total_loss_weighted / total_graphs,
             "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
+            "loss_sg_lattice": total_loss_sg_lattice / total_graphs,
+            "projection_error_pred_k": total_projection_error_pred_k / total_graphs,
+            "projection_error_gt_k": total_projection_error_gt_k / total_graphs,
             "loss_v_weighted": total_loss_v_weighted / total_graphs,
             "loss_l_weighted": total_loss_l_weighted / total_graphs,
             "loss_weighted": total_loss_weighted / total_graphs,
@@ -782,25 +722,10 @@ class ExperimentRunner:
         )
 
         self.model.eval()
-        sg_conditioned_sampling = bool(
-            self.validation_cfg.get(
-                "sg_conditioned_sampling",
-                bool(getattr(self.model.score_network, "sg_conditional", False)),
-            )
-        )
-        sg_guidance_scale = float(self.validation_cfg.get("sg_guidance_scale", 1.0))
-        debug_space_group = bool(self.validation_cfg.get("debug_space_group", True))
-        debug_space_group_max_groups = int(self.validation_cfg.get("debug_space_group_max_groups", 32))
 
         def collect_one_pass(*, seed: int | None = None) -> dict[str, Any]:
             if seed is not None:
                 print(f"validation_sampling_seed={seed} pass_start", flush=True)
-            print(
-                "validation_sampling_mode "
-                f"sg_conditioned={int(sg_conditioned_sampling)} "
-                f"sg_guidance_scale={sg_guidance_scale:.3f}",
-                flush=True,
-            )
 
             seed_context = isolated_rng_seed(seed) if seed is not None else preserve_rng_state()
             with seed_context:
@@ -823,13 +748,6 @@ class ExperimentRunner:
                             "t_start": float(self.sampler_cfg["t_start"]),
                             "t_final": float(self.sampler_cfg["t_final"]),
                         }
-                        if sg_conditioned_sampling and hasattr(batch, "space_group"):
-                            sample_kwargs["space_group"] = torch.as_tensor(
-                                batch.space_group,
-                                device=self.device,
-                                dtype=torch.long,
-                            ).reshape(-1)
-                            sample_kwargs["sg_guidance_scale"] = sg_guidance_scale
                         if str(self.sampler_cfg["method"]) == "pc":
                             sample_kwargs["tau"] = float(self.sampler_cfg["tau"])
                             sample_kwargs["n_correction_steps"] = int(self.sampler_cfg["n_correction_steps"])
@@ -838,11 +756,6 @@ class ExperimentRunner:
 
                     ptr = batch.ptr.tolist()
                     for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr[:-1], ptr[1:])):
-                        requested_space_group = None
-                        if hasattr(batch, "space_group"):
-                            requested_space_group = int(
-                                torch.as_tensor(batch.space_group).reshape(-1)[graph_idx].item()
-                            )
                         results.append(
                             evaluate_csp_reconstruction(
                                 pred_f=pos_t[start_idx:end_idx],
@@ -852,7 +765,7 @@ class ExperimentRunner:
                                 target_l=batch.l[graph_idx],
                                 target_a=batch.atomic_numbers[start_idx:end_idx],
                                 lattice_transform=self.lattice_transform,
-                                requested_space_group=requested_space_group,
+                                requested_space_group=int(torch.as_tensor(batch.space_group).reshape(-1)[graph_idx].item()),
                             )
                         )
                         num_graphs_seen += 1
@@ -876,28 +789,17 @@ class ExperimentRunner:
                 )
 
             summary = aggregate_csp_reconstruction_metrics(results)
-            requested_sg_summaries = summarize_requested_space_groups(results)
-            if debug_space_group:
-                for sg_summary in requested_sg_summaries[:debug_space_group_max_groups]:
-                    print(
-                        "validation_requested_sg "
-                        f"requested_sg={sg_summary['requested_sg']} "
-                        f"count={sg_summary['count']} "
-                        f"requested_sg_match_rate={format_metric(sg_summary['requested_space_group_match_rate'], '.4f')} "
-                        f"valid={format_metric(sg_summary['valid'], '.4f')} "
-                        f"match_rate={format_metric(sg_summary['match_rate'], '.4f')} "
-                        f"composition_match_rate={format_metric(sg_summary['composition_match_rate'], '.4f')} "
-                        f"top_detected={sg_summary['top_detected_space_groups']}",
-                        flush=True,
-                    )
             return {
                 "valid": summary.get("valid"),
                 "match_rate": summary.get("match_rate"),
                 "rmse": summary.get("rmse"),
-                "composition_match_rate": summary.get("composition_match_rate"),
-                "requested_space_group_match_rate": summary.get("requested_space_group_match_rate"),
+                "frac_rmse": summary.get("frac_rmse"),
+                "detected_family_agreement": summary.get("detected_family_agreement"),
+                "detected_sg_agreement": summary.get("detected_sg_agreement"),
+                "lattice_lengths_rmse": summary.get("lattice_lengths_rmse"),
+                "lattice_angles_rmse": summary.get("lattice_angles_rmse"),
+                "volume_rel_error": summary.get("volume_rel_error"),
                 "num_samples": summary.get("num_samples"),
-                "requested_sg_summaries": requested_sg_summaries,
             }
 
         if not bool(self.validation_cfg.get("ablation", False)):
@@ -924,9 +826,7 @@ class ExperimentRunner:
                 f"validation_ablation_seed_summary seed={seed} "
                 f"valid={format_metric(one_pass['valid'], '.4f')} "
                 f"match_rate={format_metric(one_pass['match_rate'], '.4f')} "
-                f"rmse={format_metric(one_pass['rmse'], '.6f')} "
-                f"composition_match_rate={format_metric(one_pass.get('composition_match_rate'), '.4f')} "
-                f"requested_sg_match_rate={format_metric(one_pass.get('requested_space_group_match_rate'), '.4f')}",
+                f"rmse={format_metric(one_pass['rmse'], '.6f')}",
                 flush=True,
             )
             pass_summaries.append(one_pass)
@@ -947,10 +847,12 @@ class ExperimentRunner:
         valid_mean, valid_std = aggregate_scalar("valid")
         match_rate_mean, match_rate_std = aggregate_scalar("match_rate")
         rmse_mean, rmse_std = aggregate_scalar("rmse")
-        composition_match_rate_mean, composition_match_rate_std = aggregate_scalar("composition_match_rate")
-        requested_sg_match_rate_mean, requested_sg_match_rate_std = aggregate_scalar(
-            "requested_space_group_match_rate"
-        )
+        frac_rmse_mean, frac_rmse_std = aggregate_scalar("frac_rmse")
+        detected_family_agreement_mean, detected_family_agreement_std = aggregate_scalar("detected_family_agreement")
+        detected_sg_agreement_mean, detected_sg_agreement_std = aggregate_scalar("detected_sg_agreement")
+        lattice_lengths_rmse_mean, lattice_lengths_rmse_std = aggregate_scalar("lattice_lengths_rmse")
+        lattice_angles_rmse_mean, lattice_angles_rmse_std = aggregate_scalar("lattice_angles_rmse")
+        volume_rel_error_mean, volume_rel_error_std = aggregate_scalar("volume_rel_error")
 
         return {
             "valid": valid_mean,
@@ -959,10 +861,18 @@ class ExperimentRunner:
             "match_rate_std": match_rate_std,
             "rmse": rmse_mean,
             "rmse_std": rmse_std,
-            "composition_match_rate": composition_match_rate_mean,
-            "composition_match_rate_std": composition_match_rate_std,
-            "requested_space_group_match_rate": requested_sg_match_rate_mean,
-            "requested_space_group_match_rate_std": requested_sg_match_rate_std,
+            "frac_rmse": frac_rmse_mean,
+            "frac_rmse_std": frac_rmse_std,
+            "detected_family_agreement": detected_family_agreement_mean,
+            "detected_family_agreement_std": detected_family_agreement_std,
+            "detected_sg_agreement": detected_sg_agreement_mean,
+            "detected_sg_agreement_std": detected_sg_agreement_std,
+            "lattice_lengths_rmse": lattice_lengths_rmse_mean,
+            "lattice_lengths_rmse_std": lattice_lengths_rmse_std,
+            "lattice_angles_rmse": lattice_angles_rmse_mean,
+            "lattice_angles_rmse_std": lattice_angles_rmse_std,
+            "volume_rel_error": volume_rel_error_mean,
+            "volume_rel_error_std": volume_rel_error_std,
             "num_samples": pass_summaries[0].get("num_samples") if pass_summaries else 0,
             "ablation_num_seeds": num_seeds,
             "seed_summaries": seed_summaries,
@@ -1115,24 +1025,6 @@ class ExperimentRunner:
         history["match_rate_std"].append(float(match_rate_std))
         history["valid_mean"].append(float(val_sample_metrics["valid"]))
         history["valid_std"].append(float(valid_std))
-        composition_std = val_sample_metrics.get("composition_match_rate_std")
-        requested_sg_std = val_sample_metrics.get("requested_space_group_match_rate_std")
-        if (
-            val_sample_metrics.get("composition_match_rate") is not None
-            and composition_std is not None
-        ):
-            history["composition_match_rate_mean"].append(
-                float(val_sample_metrics["composition_match_rate"])
-            )
-            history["composition_match_rate_std"].append(float(composition_std))
-        if (
-            val_sample_metrics.get("requested_space_group_match_rate") is not None
-            and requested_sg_std is not None
-        ):
-            history["requested_space_group_match_rate_mean"].append(
-                float(val_sample_metrics["requested_space_group_match_rate"])
-            )
-            history["requested_space_group_match_rate_std"].append(float(requested_sg_std))
 
         rmse_fig = self._build_validation_ablation_band_figure(
             metric="rmse",
@@ -1149,36 +1041,12 @@ class ExperimentRunner:
             title="Validation validity across sampling seeds",
             y_label="Validity",
         )
-        extra_payload = {}
-        extra_figures = []
-        if history["requested_space_group_match_rate_mean"]:
-            requested_sg_fig = self._build_validation_ablation_band_figure(
-                metric="requested_space_group_match_rate",
-                title="Validation requested SG match rate across sampling seeds",
-                y_label="Requested SG match rate",
-            )
-            extra_payload["val_sampling/requested_sg_match_rate_mean_std_plot"] = wandb.Image(
-                requested_sg_fig
-            )
-            extra_figures.append(requested_sg_fig)
-        if history["composition_match_rate_mean"]:
-            composition_fig = self._build_validation_ablation_band_figure(
-                metric="composition_match_rate",
-                title="Validation composition match rate across sampling seeds",
-                y_label="Composition match rate",
-            )
-            extra_payload["val_sampling/composition_match_rate_mean_std_plot"] = wandb.Image(
-                composition_fig
-            )
-            extra_figures.append(composition_fig)
-
         self.run.log(
             {
                 "epoch": epoch,
                 "val_sampling/rmse_mean_std_plot": wandb.Image(rmse_fig),
                 "val_sampling/match_rate_mean_std_plot": wandb.Image(match_rate_fig),
                 "val_sampling/valid_mean_std_plot": wandb.Image(valid_fig),
-                **extra_payload,
             },
             step=epoch,
         )
@@ -1186,8 +1054,6 @@ class ExperimentRunner:
         plt.close(rmse_fig)
         plt.close(match_rate_fig)
         plt.close(valid_fig)
-        for fig in extra_figures:
-            plt.close(fig)
 
     def validate_epoch(self, epoch: int) -> None:
         # Match facitKLDM semantics:
@@ -1213,16 +1079,21 @@ class ExperimentRunner:
         merged_metrics = {
             "loss_v": val_loss_metrics["loss_v"],
             "loss_l": val_loss_metrics["loss_l"],
+            "loss_sg_lattice": val_loss_metrics["loss_sg_lattice"],
+            "projection_error_pred_k": val_loss_metrics["projection_error_pred_k"],
+            "projection_error_gt_k": val_loss_metrics["projection_error_gt_k"],
             "loss_v_weighted": val_loss_metrics["loss_v_weighted"],
             "loss_l_weighted": val_loss_metrics["loss_l_weighted"],
             "loss_weighted": val_loss_metrics["loss_weighted"],
             "valid": val_sample_metrics["valid"],
             "match_rate": val_sample_metrics["match_rate"],
             "rmse": val_sample_metrics["rmse"],
-            "composition_match_rate": val_sample_metrics.get("composition_match_rate"),
-            "requested_space_group_match_rate": val_sample_metrics.get(
-                "requested_space_group_match_rate"
-            ),
+            "frac_rmse": val_sample_metrics.get("frac_rmse"),
+            "detected_family_agreement": val_sample_metrics.get("detected_family_agreement"),
+            "detected_sg_agreement": val_sample_metrics.get("detected_sg_agreement"),
+            "lattice_lengths_rmse": val_sample_metrics.get("lattice_lengths_rmse"),
+            "lattice_angles_rmse": val_sample_metrics.get("lattice_angles_rmse"),
+            "volume_rel_error": val_sample_metrics.get("volume_rel_error"),
         }
         if "valid_std" in val_sample_metrics:
             merged_metrics["valid_std"] = val_sample_metrics["valid_std"]
@@ -1230,26 +1101,35 @@ class ExperimentRunner:
             merged_metrics["match_rate_std"] = val_sample_metrics["match_rate_std"]
         if "rmse_std" in val_sample_metrics:
             merged_metrics["rmse_std"] = val_sample_metrics["rmse_std"]
-        if "composition_match_rate_std" in val_sample_metrics:
-            merged_metrics["composition_match_rate_std"] = val_sample_metrics[
-                "composition_match_rate_std"
-            ]
-        if "requested_space_group_match_rate_std" in val_sample_metrics:
-            merged_metrics["requested_space_group_match_rate_std"] = val_sample_metrics[
-                "requested_space_group_match_rate_std"
-            ]
+        for key in (
+            "frac_rmse_std",
+            "detected_family_agreement_std",
+            "detected_sg_agreement_std",
+            "lattice_lengths_rmse_std",
+            "lattice_angles_rmse_std",
+            "volume_rel_error_std",
+        ):
+            if key in val_sample_metrics:
+                merged_metrics[key] = val_sample_metrics[key]
         log_data = {
             "epoch": epoch,
             "val/loss_v": merged_metrics["loss_v"],
             "val/loss_l": merged_metrics["loss_l"],
+            "val/loss_sg_lattice": merged_metrics["loss_sg_lattice"],
+            "val/projection_error_pred_k": merged_metrics["projection_error_pred_k"],
+            "val/projection_error_gt_k": merged_metrics["projection_error_gt_k"],
             "val/loss_v_weighted": merged_metrics["loss_v_weighted"],
             "val/loss_l_weighted": merged_metrics["loss_l_weighted"],
             "val/loss_weighted": merged_metrics["loss_weighted"],
             "val/valid": merged_metrics["valid"],
             "val/match_rate": merged_metrics["match_rate"],
             "val/rmse": merged_metrics["rmse"],
-            "val/composition_match_rate": merged_metrics["composition_match_rate"],
-            "val/requested_space_group_match_rate": merged_metrics["requested_space_group_match_rate"],
+            "val/frac_rmse": merged_metrics["frac_rmse"],
+            "val/detected_family_agreement": merged_metrics["detected_family_agreement"],
+            "val/detected_sg_agreement": merged_metrics["detected_sg_agreement"],
+            "val/lattice_lengths_rmse": merged_metrics["lattice_lengths_rmse"],
+            "val/lattice_angles_rmse": merged_metrics["lattice_angles_rmse"],
+            "val/volume_rel_error": merged_metrics["volume_rel_error"],
         }
         if "valid_std" in merged_metrics:
             log_data["val/valid_std"] = merged_metrics["valid_std"]
@@ -1257,12 +1137,16 @@ class ExperimentRunner:
             log_data["val/match_rate_std"] = merged_metrics["match_rate_std"]
         if "rmse_std" in merged_metrics:
             log_data["val/rmse_std"] = merged_metrics["rmse_std"]
-        if "composition_match_rate_std" in merged_metrics:
-            log_data["val/composition_match_rate_std"] = merged_metrics["composition_match_rate_std"]
-        if "requested_space_group_match_rate_std" in merged_metrics:
-            log_data["val/requested_space_group_match_rate_std"] = merged_metrics[
-                "requested_space_group_match_rate_std"
-            ]
+        for key in (
+            "frac_rmse_std",
+            "detected_family_agreement_std",
+            "detected_sg_agreement_std",
+            "lattice_lengths_rmse_std",
+            "lattice_angles_rmse_std",
+            "volume_rel_error_std",
+        ):
+            if key in merged_metrics:
+                log_data[f"val/{key}"] = merged_metrics[key]
         self.run.log(log_data, step=epoch)
         self._log_validation_ablation_band_plots(
             epoch=epoch,
@@ -1274,29 +1158,32 @@ class ExperimentRunner:
         print(
             f"validation_epoch={epoch:04d} val_loss_weighted={merged_metrics['loss_weighted']:.6f} "
             f"(loss_v={merged_metrics['loss_v']:.6f}, loss_l={merged_metrics['loss_l']:.6f}, "
+            f"loss_sg_lattice={merged_metrics['loss_sg_lattice']:.6f}, "
+            f"proj_pred_k={merged_metrics['projection_error_pred_k']:.6f}, "
+            f"proj_gt_k={merged_metrics['projection_error_gt_k']:.6f}, "
             f"loss_v_weighted={merged_metrics['loss_v_weighted']:.6f}, "
             f"loss_l_weighted={merged_metrics['loss_l_weighted']:.6f}) "
             f"valid={format_metric(merged_metrics['valid'], '.4f')} "
             f"match_rate={format_metric(merged_metrics['match_rate'], '.4f')} "
             f"rmse={format_metric(merged_metrics['rmse'], '.6f')} "
-            f"composition_match_rate={format_metric(merged_metrics.get('composition_match_rate'), '.4f')} "
-            f"requested_sg_match_rate={format_metric(merged_metrics.get('requested_space_group_match_rate'), '.4f')}",
+            f"frac_rmse={format_metric(merged_metrics['frac_rmse'], '.6f')} "
+            f"family_agreement={format_metric(merged_metrics['detected_family_agreement'], '.4f')} "
+            f"sg_agreement={format_metric(merged_metrics['detected_sg_agreement'], '.4f')} "
+            f"lengths_rmse={format_metric(merged_metrics['lattice_lengths_rmse'], '.6f')} "
+            f"angles_rmse={format_metric(merged_metrics['lattice_angles_rmse'], '.6f')} "
+            f"volume_rel_error={format_metric(merged_metrics['volume_rel_error'], '.6f')}",
             flush=True,
         )
         if (
             "valid_std" in merged_metrics
             or "match_rate_std" in merged_metrics
             or "rmse_std" in merged_metrics
-            or "composition_match_rate_std" in merged_metrics
-            or "requested_space_group_match_rate_std" in merged_metrics
         ):
             print(
                 f"validation_epoch_std={epoch:04d} "
                 f"valid_std={format_metric(merged_metrics.get('valid_std'), '.4f')} "
                 f"match_rate_std={format_metric(merged_metrics.get('match_rate_std'), '.4f')} "
-                f"rmse_std={format_metric(merged_metrics.get('rmse_std'), '.6f')} "
-                f"composition_match_rate_std={format_metric(merged_metrics.get('composition_match_rate_std'), '.4f')} "
-                f"requested_sg_match_rate_std={format_metric(merged_metrics.get('requested_space_group_match_rate_std'), '.4f')}",
+                f"rmse_std={format_metric(merged_metrics.get('rmse_std'), '.6f')}",
                 flush=True,
             )
         seed_summaries = val_sample_metrics.get("seed_summaries", [])
@@ -1314,29 +1201,9 @@ class ExperimentRunner:
                 "rmse_values": [summary.get("rmse") for summary in seed_summaries],
                 "rmse_mean": merged_metrics.get("rmse"),
                 "rmse_std": merged_metrics.get("rmse_std"),
-                "composition_match_rate_values": [
-                    summary.get("composition_match_rate") for summary in seed_summaries
-                ],
-                "composition_match_rate_mean": merged_metrics.get("composition_match_rate"),
-                "composition_match_rate_std": merged_metrics.get("composition_match_rate_std"),
-                "requested_space_group_match_rate_values": [
-                    summary.get("requested_space_group_match_rate") for summary in seed_summaries
-                ],
-                "requested_space_group_match_rate_mean": merged_metrics.get(
-                    "requested_space_group_match_rate"
-                ),
-                "requested_space_group_match_rate_std": merged_metrics.get(
-                    "requested_space_group_match_rate_std"
-                ),
             }
             print(
                 f"validation_ablation_backup={json.dumps(backup_payload, sort_keys=True)}",
-                flush=True,
-            )
-        requested_sg_summaries = val_sample_metrics.get("requested_sg_summaries", [])
-        if requested_sg_summaries:
-            print(
-                f"validation_requested_sg_backup={json.dumps(requested_sg_summaries, sort_keys=True)}",
                 flush=True,
             )
         if checkpoint_uploaded:
@@ -1377,7 +1244,7 @@ class ExperimentRunner:
         epoch = self.start_epoch + 1
         interrupted = False
         try:
-            while not should_stop(self.run):
+            while not should_stop(self.run) and (self.max_epochs is None or epoch <= self.max_epochs):
                 train_metrics = self.train_epoch(epoch)
 
                 if epoch % self.train_every_epochs == 0:
@@ -1385,6 +1252,9 @@ class ExperimentRunner:
                         "epoch": epoch,
                         "train/loss_v": train_metrics["loss_v"],
                         "train/loss_l": train_metrics["loss_l"],
+                        "train/loss_sg_lattice": train_metrics["loss_sg_lattice"],
+                        "train/projection_error_pred_k": train_metrics["projection_error_pred_k"],
+                        "train/projection_error_gt_k": train_metrics["projection_error_gt_k"],
                         "train/loss_v_weighted": train_metrics["loss_v_weighted"],
                         "train/loss_l_weighted": train_metrics["loss_l_weighted"],
                         "train/loss_weighted": train_metrics["loss_weighted"],
@@ -1397,6 +1267,9 @@ class ExperimentRunner:
                     print(
                         f"epoch={epoch:04d} train_loss_weighted={train_metrics['loss_weighted']:.6f} "
                         f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f}, "
+                        f"loss_sg_lattice={train_metrics['loss_sg_lattice']:.6f}, "
+                        f"proj_pred_k={train_metrics['projection_error_pred_k']:.6f}, "
+                        f"proj_gt_k={train_metrics['projection_error_gt_k']:.6f}, "
                         f"loss_v_weighted={train_metrics['loss_v_weighted']:.6f}, "
                         f"loss_l_weighted={train_metrics['loss_l_weighted']:.6f})",
                         flush=True,

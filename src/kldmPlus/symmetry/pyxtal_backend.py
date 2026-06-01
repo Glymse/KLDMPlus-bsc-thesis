@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 class PyXtalWyckoffResult:
     space_group: int
     lattice_parameters: np.ndarray
+    lattice_matrix: np.ndarray
     anchor_frac_coords: np.ndarray
     anchor_atomic_numbers: np.ndarray
     site_labels: tuple[str, ...]
@@ -129,6 +130,7 @@ def build_pyxtal_wyckoff_result(
     return PyXtalWyckoffResult(
         space_group=int(crystal.group.number),
         lattice_parameters=np.asarray(crystal.lattice.get_para(degree=True), dtype=float),
+        lattice_matrix=np.asarray(crystal.lattice.matrix, dtype=float),
         anchor_frac_coords=np.asarray(anchor_frac_coords, dtype=float),
         anchor_atomic_numbers=np.asarray(anchor_atomic_numbers, dtype=int),
         site_labels=tuple(site_labels),
@@ -148,6 +150,24 @@ def _torus_pairwise_distance_sq(source: np.ndarray, target: np.ndarray) -> np.nd
     delta = source[:, None, :] - target[None, :, :]
     delta = delta - np.round(delta)
     return np.sum(delta * delta, axis=-1)
+
+
+def _coerce_frac_coords(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 1:
+        if arr.size % 3 != 0:
+            raise ValueError(f"Expected flat fractional coordinates with size multiple of 3, got shape {arr.shape}.")
+        arr = arr.reshape(-1, 3)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Expected fractional coordinates with shape [N, 3], got {arr.shape}.")
+    return np.array(arr, dtype=float, copy=False)
+
+
+def _coerce_atomic_numbers(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=int)
+    return np.array(arr, dtype=int, copy=False).reshape(-1)
 
 
 def _match_cost_matrix(cost_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -181,6 +201,11 @@ def species_aware_torus_rmse(
     target_atomic_numbers: np.ndarray,
 ) -> tuple[float | None, str | None]:
     """Match by species and return the torus RMSE plus an explicit status."""
+    source_frac_coords = _coerce_frac_coords(source_frac_coords)
+    target_frac_coords = _coerce_frac_coords(target_frac_coords)
+    source_atomic_numbers = _coerce_atomic_numbers(source_atomic_numbers)
+    target_atomic_numbers = _coerce_atomic_numbers(target_atomic_numbers)
+
     if len(source_frac_coords) != len(target_frac_coords):
         return None, "num_atoms_mismatch"
 
