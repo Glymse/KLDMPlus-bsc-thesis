@@ -30,7 +30,7 @@ model:
   conv_sg_aux:
     enabled: true
     mode: direct
-    lambda: 5
+    lambda: 20
     time_weight: alpha2
     require_valid_transform: true
   lattice_orbit_metric_max_candidates: 512

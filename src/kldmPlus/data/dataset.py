@@ -8,10 +8,13 @@ import socket
 import time
 import shutil
 from typing import Any
+import warnings
 
 import requests
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
+
+from kldmPlus.symmetry.latticeSymmetry import LatticeSymmetry
 
 try:
     from torch_geometric.data import Batch
@@ -24,6 +27,8 @@ try:
     from mattergen.common.data.chemgraph import ChemGraph
     from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
     from mattergen.common.data.transform import Transform
+    from pymatgen.core import Lattice, Structure
+    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
     from pymatgen.symmetry.groups import SpaceGroup
     MATTERGEN_AVAILABLE = True
     MATTERGEN_IMPORT_ERROR: Exception | None = None
@@ -32,6 +37,9 @@ except ImportError as exc:  # pragma: no cover
     CrystalDataset = Any
     CrystalDatasetBuilder = Any
     DatasetTransform = Any
+    Lattice = Any
+    Structure = Any
+    SpacegroupAnalyzer = Any
     SpaceGroup = Any
     MATTERGEN_AVAILABLE = False
     MATTERGEN_IMPORT_ERROR = exc
@@ -49,6 +57,7 @@ SPACE_GROUP_COLUMN = "spacegroup.number"
 CACHE_SCHEMA_VERSION = 2
 CACHE_META_FILENAME = "_kldm_cache_meta.json"
 CORE_CACHE_FILENAMES = ("cell.npy", "atomic_numbers.npy", "num_atoms.npy", "pos.npy")
+DIFFCSP_K_CACHE_FILENAMES = ("diffcsp_k.npy", "conv_C.npy", "conv_weight.npy", "conv_fit_error.npy")
 BUILD_LOCK_DIRNAME = ".kldm_build_lock"
 BUILD_LOCK_STALE_SECONDS = 6 * 60 * 60
 BUILD_LOCK_POLL_SECONDS = 5.0
@@ -58,6 +67,10 @@ BUILD_LOCK_WAIT_LOG_SECONDS = 60.0
 def resolve_data_root(root: str | Path | None = None) -> Path:
     """The data root. """
     return DEFAULT_DATA_ROOT if root is None else Path(root).expanduser()
+
+
+def _is_diffcsp_k_transform(transform: Any) -> bool:
+    return str(getattr(transform, "representation", "")) == "diffcsp_k"
 
 
 class CrystalDatasetWrapper(Dataset):
@@ -96,7 +109,16 @@ class CrystalDatasetWrapper(Dataset):
         # Store configuration.
         self.root = Path(root).expanduser()
         self.split = split
-        self.transforms = transforms or []
+        requested_transforms = transforms or []
+        self._diffcsp_k_transform = next(
+            (transform for transform in requested_transforms if _is_diffcsp_k_transform(transform)),
+            None,
+        )
+        self._diffcsp_k_out_key = str(getattr(self._diffcsp_k_transform, "out_key", "l"))
+        self.transforms = [
+            transform for transform in requested_transforms
+            if not _is_diffcsp_k_transform(transform)
+        ]
         self.dataset_transforms = dataset_transforms or []
         requested_properties = list(required_properties or [SPACE_GROUP_PROPERTY])
         if SPACE_GROUP_PROPERTY not in requested_properties:
@@ -110,6 +132,7 @@ class CrystalDatasetWrapper(Dataset):
 
         # Build or load the MatterGen CrystalDataset.
         self.data = self._build()
+        self._load_diffcsp_k_cache()
 
     @property
     def raw_folder(self) -> Path:
@@ -227,9 +250,9 @@ class CrystalDatasetWrapper(Dataset):
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
 
-    def _missing_cache_files(self) -> list[str]:
+    def _missing_files(self, filenames: tuple[str, ...]) -> list[str]:
         missing: list[str] = []
-        for filename in CORE_CACHE_FILENAMES:
+        for filename in filenames:
             path = self.processed_split_folder / filename
             try:
                 usable = path.is_file() and path.stat().st_size > 0
@@ -237,6 +260,10 @@ class CrystalDatasetWrapper(Dataset):
                 usable = False
             if not usable:
                 missing.append(filename)
+        return missing
+
+    def _missing_property_files(self) -> list[str]:
+        missing: list[str] = []
         for property_name in self.required_properties:
             path = self.processed_split_folder / f"{property_name}.json"
             try:
@@ -250,9 +277,12 @@ class CrystalDatasetWrapper(Dataset):
     def _cache_status(self) -> tuple[bool, str]:
         if not self.processed_split_folder.exists():
             return False, "missing_processed_split"
-        missing_files = self._missing_cache_files()
+        missing_files = self._missing_files(CORE_CACHE_FILENAMES)
         if missing_files:
             return False, f"missing_cache_files={','.join(missing_files)}"
+        missing_property_files = self._missing_property_files()
+        if missing_property_files:
+            return False, f"missing_property_files={','.join(missing_property_files)}"
 
         meta = self._read_cache_meta()
         if meta is None:
@@ -272,7 +302,123 @@ class CrystalDatasetWrapper(Dataset):
             return False, "raw_csv_path_mismatch"
         if meta.get("raw_signature") != self._raw_signature():
             return False, "raw_signature_mismatch"
+        if self._diffcsp_k_transform is not None:
+            missing_diffcsp_files = self._missing_files(DIFFCSP_K_CACHE_FILENAMES)
+            if missing_diffcsp_files:
+                return False, f"missing_diffcsp_cache_files={','.join(missing_diffcsp_files)}"
         return True, "fresh"
+
+    def _atomic_save_npy(self, path: Path, array: np.ndarray) -> None:
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        np.save(tmp_path, array)
+        npy_tmp_path = tmp_path if tmp_path.suffix == ".npy" else Path(f"{tmp_path}.npy")
+        os.replace(npy_tmp_path, path)
+
+    def _compute_conventional_chart(
+        self,
+        *,
+        raw_cell: np.ndarray,
+        primitive_chart_cell: torch.Tensor,
+        frac: np.ndarray,
+        species: np.ndarray,
+        dtype: torch.dtype,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="No Pauling electronegativity.*")
+                structure = Structure(
+                    Lattice(np.array(raw_cell, copy=True)),
+                    [int(value) for value in species],
+                    np.array(frac, copy=True),
+                    coords_are_cartesian=False,
+                )
+                conventional = SpacegroupAnalyzer(
+                    structure,
+                    symprec=0.1,
+                    angle_tolerance=5.0,
+                ).get_conventional_standard_structure()
+            conv_cell = torch.as_tensor(
+                np.array(conventional.lattice.matrix, copy=True),
+                dtype=dtype,
+            )
+            transform = conv_cell @ torch.linalg.pinv(primitive_chart_cell)
+            fit_error = (transform @ primitive_chart_cell - conv_cell).abs().max()
+            weight = (fit_error <= 1.0e-4).to(dtype=dtype)
+            return (
+                transform.detach().cpu().numpy().astype(np.float32),
+                weight.reshape(1).detach().cpu().numpy().astype(np.float32),
+                fit_error.reshape(1).detach().cpu().numpy().astype(np.float32),
+            )
+        except Exception:
+            return (
+                np.eye(3, dtype=np.float32),
+                np.array([0.0], dtype=np.float32),
+                np.array([np.inf], dtype=np.float32),
+            )
+
+    def _ensure_diffcsp_k_cache(self) -> None:
+        if self._diffcsp_k_transform is None:
+            return
+        missing = self._missing_files(DIFFCSP_K_CACHE_FILENAMES)
+        if not missing:
+            return
+
+        cell = np.load(self.processed_split_folder / "cell.npy")
+        pos = np.load(self.processed_split_folder / "pos.npy")
+        atomic_numbers = np.load(self.processed_split_folder / "atomic_numbers.npy")
+        num_atoms = np.load(self.processed_split_folder / "num_atoms.npy")
+
+        lattice_symmetry = LatticeSymmetry(eps=float(getattr(self._diffcsp_k_transform, "eps", 1.0e-8)))
+        dtype = torch.float32
+        index_offsets = np.concatenate([np.array([0]), np.cumsum(num_atoms[:-1])])
+        n_structures = int(len(num_atoms))
+        diffcsp_k = np.empty((n_structures, 6), dtype=np.float32)
+        conv_C = np.empty((n_structures, 3, 3), dtype=np.float32)
+        conv_weight = np.empty((n_structures, 1), dtype=np.float32)
+        conv_fit_error = np.empty((n_structures, 1), dtype=np.float32)
+
+        print(
+            f"dataset_cache action=precompute_diffcsp_k:start dataset={self.dataset_name} split={self.split} "
+            f"n={n_structures}",
+            flush=True,
+        )
+        with torch.no_grad():
+            for idx in tqdm(range(n_structures), desc=f"Precomputing {self.dataset_name} {self.split} diffcsp_k", miniters=500):
+                raw_cell_t = torch.as_tensor(cell[idx], dtype=dtype)
+                primitive_chart_cell = lattice_symmetry.de_so3(raw_cell_t.reshape(1, 3, 3)).squeeze(0)
+                k = lattice_symmetry.m2v(primitive_chart_cell.reshape(1, 3, 3)).squeeze(0)
+                diffcsp_k[idx] = k.detach().cpu().numpy().astype(np.float32)
+
+                start = int(index_offsets[idx])
+                end = start + int(num_atoms[idx])
+                c_i, w_i, fit_i = self._compute_conventional_chart(
+                    raw_cell=cell[idx],
+                    primitive_chart_cell=primitive_chart_cell,
+                    frac=pos[start:end],
+                    species=atomic_numbers[start:end],
+                    dtype=dtype,
+                )
+                conv_C[idx] = c_i
+                conv_weight[idx] = w_i
+                conv_fit_error[idx] = fit_i
+
+        self._atomic_save_npy(self.processed_split_folder / "diffcsp_k.npy", diffcsp_k)
+        self._atomic_save_npy(self.processed_split_folder / "conv_C.npy", conv_C)
+        self._atomic_save_npy(self.processed_split_folder / "conv_weight.npy", conv_weight)
+        self._atomic_save_npy(self.processed_split_folder / "conv_fit_error.npy", conv_fit_error)
+        print(
+            f"dataset_cache action=precompute_diffcsp_k:done dataset={self.dataset_name} split={self.split} "
+            f"valid_weight_mean={float(np.nanmean(conv_weight)):.6f}",
+            flush=True,
+        )
+
+    def _load_diffcsp_k_cache(self) -> None:
+        if self._diffcsp_k_transform is None:
+            return
+        self._diffcsp_k_cache = np.load(self.processed_split_folder / "diffcsp_k.npy", mmap_mode="r")
+        self._conv_C_cache = np.load(self.processed_split_folder / "conv_C.npy", mmap_mode="r")
+        self._conv_weight_cache = np.load(self.processed_split_folder / "conv_weight.npy", mmap_mode="r")
+        self._conv_fit_error_cache = np.load(self.processed_split_folder / "conv_fit_error.npy", mmap_mode="r")
 
     def _rebuild_cache(self) -> CrystalDatasetBuilder:
         if not self.raw_csv.exists():
@@ -308,6 +454,7 @@ class CrystalDatasetWrapper(Dataset):
             f"dataset_cache action=ensure_required_properties:done dataset={self.dataset_name} split={self.split}",
             flush=True,
         )
+        self._ensure_diffcsp_k_cache()
         print(
             f"dataset_cache action=write_meta:start dataset={self.dataset_name} split={self.split}",
             flush=True,
@@ -318,6 +465,16 @@ class CrystalDatasetWrapper(Dataset):
             flush=True,
         )
         return builder
+
+    def _refresh_cache_without_full_rebuild(self, reason: str) -> CrystalDatasetBuilder | None:
+        if reason.startswith("missing_diffcsp_cache_files="):
+            self._ensure_diffcsp_k_cache()
+            self._write_cache_meta()
+            return CrystalDatasetBuilder.from_cache_path(
+                cache_path=str(self.processed_split_folder),
+                transforms=self.transforms,
+            )
+        return None
 
     def _read_lock_owner(self) -> dict[str, str]:
         owner_path = self.cache_lock_dir / "owner.txt"
@@ -473,7 +630,9 @@ class CrystalDatasetWrapper(Dataset):
                         # before writing the processed cache. We intentionally rely on that
                         # upstream full-structure reduction here instead of trying to reduce
                         # only the lattice matrix later in a transform.
-                        builder = self._rebuild_cache()
+                        builder = self._refresh_cache_without_full_rebuild(cache_reason)
+                        if builder is None:
+                            builder = self._rebuild_cache()
                 finally:
                     if acquired_lock:
                         self._release_build_lock()
@@ -563,7 +722,17 @@ class CrystalDatasetWrapper(Dataset):
             self._space_group_for_structure_id(structure_id),
             dtype=torch.long,
         )
-        return sample.replace(space_group=space_group)
+        fields: dict[str, Any] = {"space_group": space_group}
+        if self._diffcsp_k_transform is not None:
+            fields.update(
+                {
+                    self._diffcsp_k_out_key: torch.from_numpy(self._diffcsp_k_cache[index]).float().view(1, 6),
+                    "conv_C": torch.from_numpy(self._conv_C_cache[index]).float().view(1, 3, 3),
+                    "conv_weight": torch.from_numpy(self._conv_weight_cache[index]).float().view(1),
+                    "conv_fit_error": torch.from_numpy(self._conv_fit_error_cache[index]).float().view(1),
+                }
+            )
+        return sample.replace(**fields)
 
     def __len__(self) -> int:
         """Return number of structures in the selected split."""
