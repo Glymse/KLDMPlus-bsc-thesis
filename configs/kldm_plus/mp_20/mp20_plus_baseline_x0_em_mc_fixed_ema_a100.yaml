@@ -20,6 +20,7 @@ model:
   lattice_parameterization: x0
   lattice_diffusion_type: VP
   lattice_representation: kldm
+  lattice_debug: false
   wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: true

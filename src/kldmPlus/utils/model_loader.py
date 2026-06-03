@@ -61,6 +61,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         lambda_conv_sg=lambda_conv_sg,
         conv_sg_time_weight=conv_sg_time_weight,
         conv_sg_require_valid_transform=conv_sg_require_valid_transform,
+        lattice_debug=bool(cfg.get("lattice_debug", False)),
         lattice_orbit_metric_max_candidates=cfg.get("lattice_orbit_metric_max_candidates", 512),
         score_network_kwargs=score_network,
     ).to(device)

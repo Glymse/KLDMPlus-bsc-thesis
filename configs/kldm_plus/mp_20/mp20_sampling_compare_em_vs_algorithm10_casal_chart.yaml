@@ -7,6 +7,7 @@ dataset:
   num_workers: 0
 
 model:
+  lattice_debug: false
   lambda_l: 2.0
   lattice_parameterization: eps
   lattice_diffusion_type: VP

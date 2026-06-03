@@ -107,6 +107,7 @@ class ModelKLDM(nn.Module):
         lambda_conv_sg: float = 0.0,
         conv_sg_time_weight: str = "alpha_squared",
         conv_sg_require_valid_transform: bool = True,
+        lattice_debug: bool = False,
         lattice_orbit_metric_max_candidates: int | None = 512,
         *,
         score_network_kwargs: dict[str, Any],
@@ -145,6 +146,7 @@ class ModelKLDM(nn.Module):
         self.lambda_conv_sg = float(lambda_conv_sg)
         self.conv_sg_time_weight = "alpha_squared" if str(conv_sg_time_weight) == "alpha2" else str(conv_sg_time_weight)
         self.conv_sg_require_valid_transform = bool(conv_sg_require_valid_transform)
+        self.lattice_debug = bool(lattice_debug)
         self.lattice_orbit_metric_max_candidates = lattice_orbit_metric_max_candidates
         self.lattice_symmetry = LatticeSymmetry(eps=eps)
 
@@ -316,21 +318,22 @@ class ModelKLDM(nn.Module):
         space_group = getattr(batch, "space_group", None)
         has_sg_labels = space_group is not None
 
-        if self.lattice_representation == "diffcsp_k" and has_sg_labels:
+        if self.lattice_debug and self.lattice_representation == "diffcsp_k" and has_sg_labels:
             sg = space_group.to(device=out_l.device)
             projection_error_pred = self.lattice_symmetry.direct_sg_residual_abs_mean(out_l, sg).mean()
             projection_error_gt = self.lattice_symmetry.direct_sg_residual_abs_mean(target_l, sg).mean()
-            with torch.no_grad():
-                projection_error_pred_orbit = self.lattice_symmetry.orbit_sg_residual_abs_mean(
-                    out_l.detach(),
-                    sg,
-                    max_candidates=self.lattice_orbit_metric_max_candidates,
-                ).mean()
-                projection_error_gt_orbit = self.lattice_symmetry.orbit_sg_residual_abs_mean(
-                    target_l.detach(),
-                    sg,
-                    max_candidates=self.lattice_orbit_metric_max_candidates,
-                ).mean()
+            if self.lattice_orbit_metric_max_candidates is not None and int(self.lattice_orbit_metric_max_candidates) > 0:
+                with torch.no_grad():
+                    projection_error_pred_orbit = self.lattice_symmetry.orbit_sg_residual_abs_mean(
+                        out_l.detach(),
+                        sg,
+                        max_candidates=self.lattice_orbit_metric_max_candidates,
+                    ).mean()
+                    projection_error_gt_orbit = self.lattice_symmetry.orbit_sg_residual_abs_mean(
+                        target_l.detach(),
+                        sg,
+                        max_candidates=self.lattice_orbit_metric_max_candidates,
+                    ).mean()
         if self.lattice_sg_lambda > 0.0:
             if self.lattice_representation != "diffcsp_k":
                 raise RuntimeError("Soft SG lattice loss requires lattice_representation='diffcsp_k'.")
@@ -427,6 +430,7 @@ class ModelKLDM(nn.Module):
             "lambda_l": out_l.new_tensor(self.lambda_l).detach(),
             "lambda_sg_lattice": out_l.new_tensor(self.lattice_sg_lambda).detach(),
             "lambda_conv_sg": out_l.new_tensor(self.lambda_conv_sg).detach(),
+            "lattice_debug": out_l.new_tensor(float(self.lattice_debug)).detach(),
             "lattice_sg_time_weight_mean": sg_time_weight_graph.mean().detach(),
             "conv_sg_time_weight_mean": conv_sg_time_weight_graph.mean().detach(),
             "conv_weight_mean": conv_weight_graph.mean().detach(),

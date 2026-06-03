@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 from typing import Any
+import warnings
 
 import numpy as np
 import torch
@@ -31,6 +34,20 @@ except ImportError:  # pragma: no cover
     Lattice = None
     Structure = None
     SpacegroupAnalyzer = None
+
+
+@contextmanager
+def _suppress_native_stderr():
+    """Silence noisy C-library stderr output from spglib during standardization."""
+    stderr_fd = 2
+    saved_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            yield
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(saved_fd)
 
 
 # Atomic vocabulary used when atom types are represented by indices.
@@ -568,6 +585,23 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
         )
         self.lattice_symmetry = LatticeSymmetry(eps=eps)
 
+    @staticmethod
+    def _sample_debug_id(sample: ChemGraph) -> str:
+        for key in ("material_id", "structure_id", "id"):
+            if hasattr(sample, key):
+                value = getattr(sample, key)
+                if isinstance(value, torch.Tensor):
+                    value = value.reshape(-1)[0].item() if value.numel() else "empty"
+                return f"{key}={value}"
+        return "sample_id=unknown"
+
+    def _warn_missing_conventional_chart(self, sample: ChemGraph, reason: str) -> None:
+        print(
+            "conv_sg_aux_warning=missing_conventional_chart "
+            f"{self._sample_debug_id(sample)} reason={reason}",
+            flush=True,
+        )
+
     def _conventional_chart_transform(
         self,
         sample: ChemGraph,
@@ -578,33 +612,42 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
         eye = torch.eye(3, device=raw_cell.device, dtype=raw_cell.dtype)
         zero = torch.zeros((), device=raw_cell.device, dtype=raw_cell.dtype)
         if Lattice is None or Structure is None or SpacegroupAnalyzer is None:
+            self._warn_missing_conventional_chart(sample, "pymatgen_unavailable")
             return eye, zero, torch.full((), float("inf"), device=raw_cell.device, dtype=raw_cell.dtype)
 
         try:
             species = torch.as_tensor(sample.atomic_numbers).reshape(-1).detach().cpu().tolist()
             frac = torch.as_tensor(sample.pos).detach().cpu().numpy()
             cell_np = raw_cell.detach().cpu().numpy()
-            structure = Structure(
-                Lattice(cell_np),
-                species,
-                frac,
-                coords_are_cartesian=False,
-            )
-            conventional = SpacegroupAnalyzer(
-                structure,
-                symprec=0.1,
-                angle_tolerance=5.0,
-            ).get_conventional_standard_structure()
+            with warnings.catch_warnings(), _suppress_native_stderr():
+                warnings.filterwarnings("ignore", message="No Pauling electronegativity.*")
+                structure = Structure(
+                    Lattice(cell_np),
+                    species,
+                    frac,
+                    coords_are_cartesian=False,
+                )
+                conventional = SpacegroupAnalyzer(
+                    structure,
+                    symprec=0.1,
+                    angle_tolerance=5.0,
+                ).get_conventional_standard_structure()
             conv_cell = torch.as_tensor(
-                conventional.lattice.matrix,
+                np.array(conventional.lattice.matrix, copy=True),
                 device=raw_cell.device,
                 dtype=raw_cell.dtype,
             )
             transform = conv_cell @ torch.linalg.pinv(primitive_chart_cell)
             fit_error = (transform @ primitive_chart_cell - conv_cell).abs().max()
             weight = (fit_error <= 1.0e-4).to(dtype=raw_cell.dtype)
+            if float(weight.detach().cpu().item()) <= 0.0:
+                self._warn_missing_conventional_chart(
+                    sample,
+                    f"fit_error={float(fit_error.detach().cpu().item()):.6g}",
+                )
             return transform, weight, fit_error
-        except Exception:
+        except Exception as exc:
+            self._warn_missing_conventional_chart(sample, f"{type(exc).__name__}:{exc}")
             return eye, zero, torch.full((), float("inf"), device=raw_cell.device, dtype=raw_cell.dtype)
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:

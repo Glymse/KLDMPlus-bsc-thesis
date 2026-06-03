@@ -9,7 +9,7 @@ dataset:
   batch_size: 32
   num_workers: 0
   pin_memory: false
-  train_subset_fraction: 0.05
+  train_subset_fraction: 0.1
   train_subset_seed: 2002
   train_subset_strategy: balanced_space_group
 
@@ -23,6 +23,7 @@ model:
   lattice_parameterization: x0
   lattice_diffusion_type: VP
   lattice_representation: diffcsp_k
+  lattice_debug: false
   lattice_sg_lambda: 0.0
   lattice_sg_normalize: true
   lattice_sg_time_weight: alpha_squared

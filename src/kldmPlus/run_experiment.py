@@ -583,6 +583,70 @@ class ExperimentRunner:
             download=True,
         )
 
+    def lattice_debug_enabled(self) -> bool:
+        # Toggle expensive legacy primitive/orbit lattice diagnostics.
+        return bool(getattr(self.model, "lattice_debug", False))
+
+    def add_lattice_log_data(self, log_data: dict[str, Any], metrics: Mapping[str, Any], *, prefix: str) -> None:
+        log_data.update(
+            {
+                f"{prefix}/loss_conv_sg": metrics["loss_conv_sg"],
+                f"{prefix}/conv_weight": metrics["conv_weight_mean"],
+                f"{prefix}/conv_proj_pred_k": metrics["conv_projection_error_pred_k"],
+                f"{prefix}/conv_proj_gt_k": metrics["conv_projection_error_gt_k"],
+            }
+        )
+        if not self.lattice_debug_enabled():
+            return
+        log_data.update(
+            {
+                f"{prefix}/loss_sg_lattice": metrics["loss_sg_lattice"],
+                f"{prefix}/loss_sg_lattice_weighted": metrics["loss_sg_lattice_weighted"],
+                f"{prefix}/loss_sg_lattice_lambda_scaled": metrics["loss_sg_lattice_lambda_scaled"],
+                f"{prefix}/loss_conv_sg_weighted": metrics["loss_conv_sg_weighted"],
+                f"{prefix}/loss_conv_sg_lambda_scaled": metrics["loss_conv_sg_lambda_scaled"],
+                f"{prefix}/lambda_sg_lattice": metrics["lambda_sg_lattice"],
+                f"{prefix}/lambda_conv_sg": metrics["lambda_conv_sg"],
+                f"{prefix}/lattice_sg_time_weight_mean": metrics["lattice_sg_time_weight_mean"],
+                f"{prefix}/conv_sg_time_weight_mean": metrics["conv_sg_time_weight_mean"],
+                f"{prefix}/conv_weight_mean": metrics["conv_weight_mean"],
+                f"{prefix}/projection_error_pred_k": metrics["projection_error_pred_k"],
+                f"{prefix}/projection_error_gt_k": metrics["projection_error_gt_k"],
+                f"{prefix}/primitive_projection_error_pred_k": metrics["primitive_projection_error_pred_k"],
+                f"{prefix}/primitive_projection_error_gt_k": metrics["primitive_projection_error_gt_k"],
+                f"{prefix}/conv_projection_error_pred_k": metrics["conv_projection_error_pred_k"],
+                f"{prefix}/conv_projection_error_gt_k": metrics["conv_projection_error_gt_k"],
+                f"{prefix}/projection_error_pred_direct_k": metrics["projection_error_pred_direct_k"],
+                f"{prefix}/projection_error_gt_direct_k": metrics["projection_error_gt_direct_k"],
+                f"{prefix}/projection_error_pred_orbit_k": metrics["projection_error_pred_orbit_k"],
+                f"{prefix}/projection_error_gt_orbit_k": metrics["projection_error_gt_orbit_k"],
+            }
+        )
+
+    def lattice_status_text(self, metrics: Mapping[str, Any]) -> str:
+        essential = (
+            f"loss_conv_sg={metrics['loss_conv_sg']:.6f}, "
+            f"conv_weight={metrics['conv_weight_mean']:.6f}, "
+            f"conv_proj_pred_k={metrics['conv_projection_error_pred_k']:.6f}, "
+            f"conv_proj_gt_k={metrics['conv_projection_error_gt_k']:.6f}"
+        )
+        if not self.lattice_debug_enabled():
+            return essential
+        return (
+            f"loss_sg_lattice={metrics['loss_sg_lattice']:.6f}, "
+            f"loss_sg_lambda_scaled={metrics['loss_sg_lattice_lambda_scaled']:.6f}, "
+            f"{essential}, "
+            f"loss_conv_lambda_scaled={metrics['loss_conv_sg_lambda_scaled']:.6f}, "
+            f"lambda_sg={metrics['lambda_sg_lattice']:.6f}, "
+            f"lambda_conv_sg={metrics['lambda_conv_sg']:.6f}, "
+            f"sg_time_weight={metrics['lattice_sg_time_weight_mean']:.6f}, "
+            f"conv_time_weight={metrics['conv_sg_time_weight_mean']:.6f}, "
+            f"proj_pred_k={metrics['projection_error_pred_k']:.6f}, "
+            f"proj_gt_k={metrics['projection_error_gt_k']:.6f}, "
+            f"proj_pred_orbit_k={metrics['projection_error_pred_orbit_k']:.6f}, "
+            f"proj_gt_orbit_k={metrics['projection_error_gt_orbit_k']:.6f}"
+        )
+
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
         train_generator = getattr(self.train_loader, "generator", None)
@@ -861,7 +925,7 @@ class ExperimentRunner:
                                 requested_space_group=requested_sg,
                             )
                         )
-                        if self.model.lattice_representation == "diffcsp_k":
+                        if self.lattice_debug_enabled() and self.model.lattice_representation == "diffcsp_k":
                             sg_t = torch.tensor([requested_sg], device=l_t.device, dtype=torch.long)
                             pred_l_graph = l_t[graph_idx].reshape(1, -1)
                             gt_l_graph = batch.l[graph_idx].reshape(1, -1)
@@ -1139,27 +1203,6 @@ class ExperimentRunner:
             "epoch": epoch,
             "val/loss_v": merged_metrics["loss_v"],
             "val/loss_l": merged_metrics["loss_l"],
-            "val/loss_sg_lattice": merged_metrics["loss_sg_lattice"],
-            "val/loss_sg_lattice_weighted": merged_metrics["loss_sg_lattice_weighted"],
-            "val/loss_sg_lattice_lambda_scaled": merged_metrics["loss_sg_lattice_lambda_scaled"],
-            "val/loss_conv_sg": merged_metrics["loss_conv_sg"],
-            "val/loss_conv_sg_weighted": merged_metrics["loss_conv_sg_weighted"],
-            "val/loss_conv_sg_lambda_scaled": merged_metrics["loss_conv_sg_lambda_scaled"],
-            "val/lambda_sg_lattice": merged_metrics["lambda_sg_lattice"],
-            "val/lambda_conv_sg": merged_metrics["lambda_conv_sg"],
-            "val/lattice_sg_time_weight_mean": merged_metrics["lattice_sg_time_weight_mean"],
-            "val/conv_sg_time_weight_mean": merged_metrics["conv_sg_time_weight_mean"],
-            "val/conv_weight_mean": merged_metrics["conv_weight_mean"],
-            "val/projection_error_pred_k": merged_metrics["projection_error_pred_k"],
-            "val/projection_error_gt_k": merged_metrics["projection_error_gt_k"],
-            "val/primitive_projection_error_pred_k": merged_metrics["primitive_projection_error_pred_k"],
-            "val/primitive_projection_error_gt_k": merged_metrics["primitive_projection_error_gt_k"],
-            "val/conv_projection_error_pred_k": merged_metrics["conv_projection_error_pred_k"],
-            "val/conv_projection_error_gt_k": merged_metrics["conv_projection_error_gt_k"],
-            "val/projection_error_pred_direct_k": merged_metrics["projection_error_pred_k"],
-            "val/projection_error_gt_direct_k": merged_metrics["projection_error_gt_k"],
-            "val/projection_error_pred_orbit_k": merged_metrics["projection_error_pred_orbit_k"],
-            "val/projection_error_gt_orbit_k": merged_metrics["projection_error_gt_orbit_k"],
             "val/loss_v_weighted": merged_metrics["loss_v_weighted"],
             "val/loss_l_weighted": merged_metrics["loss_l_weighted"],
             "val/loss_weighted": merged_metrics["loss_weighted"],
@@ -1173,11 +1216,17 @@ class ExperimentRunner:
             "val/lattice_lengths_rmse": merged_metrics["lattice_lengths_rmse"],
             "val/lattice_angles_rmse": merged_metrics["lattice_angles_rmse"],
             "val/volume_rel_error": merged_metrics["volume_rel_error"],
-            "val/sample_projection_error_pred_direct_k": merged_metrics["sample_projection_error_pred_direct_k"],
-            "val/sample_projection_error_gt_direct_k": merged_metrics["sample_projection_error_gt_direct_k"],
-            "val/sample_projection_error_pred_orbit_k": merged_metrics["sample_projection_error_pred_orbit_k"],
-            "val/sample_projection_error_gt_orbit_k": merged_metrics["sample_projection_error_gt_orbit_k"],
         }
+        self.add_lattice_log_data(log_data, merged_metrics, prefix="val")
+        if self.lattice_debug_enabled():
+            log_data.update(
+                {
+                    "val/sample_projection_error_pred_direct_k": merged_metrics["sample_projection_error_pred_direct_k"],
+                    "val/sample_projection_error_gt_direct_k": merged_metrics["sample_projection_error_gt_direct_k"],
+                    "val/sample_projection_error_pred_orbit_k": merged_metrics["sample_projection_error_pred_orbit_k"],
+                    "val/sample_projection_error_gt_orbit_k": merged_metrics["sample_projection_error_gt_orbit_k"],
+                }
+            )
         self.run.log(log_data, step=epoch)
 
         checkpoint_path, checkpoint_uploaded = self.save_validation_checkpoint(epoch, merged_metrics)
@@ -1185,21 +1234,7 @@ class ExperimentRunner:
         print(
             f"validation_epoch={epoch:04d} val_loss_weighted={merged_metrics['loss_weighted']:.6f} "
             f"(loss_v={merged_metrics['loss_v']:.6f}, loss_l={merged_metrics['loss_l']:.6f}, "
-            f"loss_sg_lattice={merged_metrics['loss_sg_lattice']:.6f}, "
-            f"loss_sg_lambda_scaled={merged_metrics['loss_sg_lattice_lambda_scaled']:.6f}, "
-            f"loss_conv_sg={merged_metrics['loss_conv_sg']:.6f}, "
-            f"loss_conv_lambda_scaled={merged_metrics['loss_conv_sg_lambda_scaled']:.6f}, "
-            f"lambda_sg={merged_metrics['lambda_sg_lattice']:.6f}, "
-            f"lambda_conv_sg={merged_metrics['lambda_conv_sg']:.6f}, "
-            f"sg_time_weight={merged_metrics['lattice_sg_time_weight_mean']:.6f}, "
-            f"conv_time_weight={merged_metrics['conv_sg_time_weight_mean']:.6f}, "
-            f"conv_weight={merged_metrics['conv_weight_mean']:.6f}, "
-            f"proj_pred_k={merged_metrics['projection_error_pred_k']:.6f}, "
-            f"proj_gt_k={merged_metrics['projection_error_gt_k']:.6f}, "
-            f"conv_proj_pred_k={merged_metrics['conv_projection_error_pred_k']:.6f}, "
-            f"conv_proj_gt_k={merged_metrics['conv_projection_error_gt_k']:.6f}, "
-            f"proj_pred_orbit_k={merged_metrics['projection_error_pred_orbit_k']:.6f}, "
-            f"proj_gt_orbit_k={merged_metrics['projection_error_gt_orbit_k']:.6f}, "
+            f"{self.lattice_status_text(merged_metrics)}, "
             f"loss_v_weighted={merged_metrics['loss_v_weighted']:.6f}, "
             f"loss_l_weighted={merged_metrics['loss_l_weighted']:.6f}) "
             f"valid={format_metric(merged_metrics['valid'], '.4f')} "
@@ -1209,13 +1244,18 @@ class ExperimentRunner:
             f"family_agreement={format_metric(merged_metrics['detected_family_agreement'], '.4f')} "
             f"sg_agreement={format_metric(merged_metrics['detected_sg_agreement'], '.4f')} "
             f"wyckoff_letter_agreement={format_metric(merged_metrics['wyckoff_letter_agreement'], '.4f')} "
-            f"sample_proj_pred_direct_k={format_metric(merged_metrics['sample_projection_error_pred_direct_k'], '.6f')} "
-            f"sample_proj_pred_orbit_k={format_metric(merged_metrics['sample_projection_error_pred_orbit_k'], '.6f')} "
             f"lengths_rmse={format_metric(merged_metrics['lattice_lengths_rmse'], '.6f')} "
             f"angles_rmse={format_metric(merged_metrics['lattice_angles_rmse'], '.6f')} "
             f"volume_rel_error={format_metric(merged_metrics['volume_rel_error'], '.6f')}",
             flush=True,
         )
+        if self.lattice_debug_enabled():
+            print(
+                "validation_lattice_debug "
+                f"sample_proj_pred_direct_k={format_metric(merged_metrics['sample_projection_error_pred_direct_k'], '.6f')} "
+                f"sample_proj_pred_orbit_k={format_metric(merged_metrics['sample_projection_error_pred_orbit_k'], '.6f')}",
+                flush=True,
+            )
         print(
             "validation_wyckoff_dimensionality "
             f"pred={merged_metrics['predicted_wyckoff_dimensionality_distribution']} "
@@ -1257,6 +1297,7 @@ class ExperimentRunner:
             f"lattice_sg_time_weight={getattr(self.model, 'lattice_sg_time_weight', 'none')} "
             f"lambda_conv_sg={float(getattr(self.model, 'lambda_conv_sg', 0.0)):.6f} "
             f"conv_sg_time_weight={getattr(self.model, 'conv_sg_time_weight', 'none')} "
+            f"lattice_debug={bool(getattr(self.model, 'lattice_debug', False))} "
             f"orbit_metric_max_candidates={getattr(self.model, 'lattice_orbit_metric_max_candidates', None)}",
             flush=True,
         )
@@ -1282,31 +1323,11 @@ class ExperimentRunner:
                         "epoch": epoch,
                         "train/loss_v": train_metrics["loss_v"],
                         "train/loss_l": train_metrics["loss_l"],
-                        "train/loss_sg_lattice": train_metrics["loss_sg_lattice"],
-                        "train/loss_sg_lattice_weighted": train_metrics["loss_sg_lattice_weighted"],
-                        "train/loss_sg_lattice_lambda_scaled": train_metrics["loss_sg_lattice_lambda_scaled"],
-                        "train/loss_conv_sg": train_metrics["loss_conv_sg"],
-                        "train/loss_conv_sg_weighted": train_metrics["loss_conv_sg_weighted"],
-                        "train/loss_conv_sg_lambda_scaled": train_metrics["loss_conv_sg_lambda_scaled"],
-                        "train/lambda_sg_lattice": train_metrics["lambda_sg_lattice"],
-                        "train/lambda_conv_sg": train_metrics["lambda_conv_sg"],
-                        "train/lattice_sg_time_weight_mean": train_metrics["lattice_sg_time_weight_mean"],
-                        "train/conv_sg_time_weight_mean": train_metrics["conv_sg_time_weight_mean"],
-                        "train/conv_weight_mean": train_metrics["conv_weight_mean"],
-                        "train/projection_error_pred_k": train_metrics["projection_error_pred_k"],
-                        "train/projection_error_gt_k": train_metrics["projection_error_gt_k"],
-                        "train/primitive_projection_error_pred_k": train_metrics["primitive_projection_error_pred_k"],
-                        "train/primitive_projection_error_gt_k": train_metrics["primitive_projection_error_gt_k"],
-                        "train/conv_projection_error_pred_k": train_metrics["conv_projection_error_pred_k"],
-                        "train/conv_projection_error_gt_k": train_metrics["conv_projection_error_gt_k"],
-                        "train/projection_error_pred_direct_k": train_metrics["projection_error_pred_direct_k"],
-                        "train/projection_error_gt_direct_k": train_metrics["projection_error_gt_direct_k"],
-                        "train/projection_error_pred_orbit_k": train_metrics["projection_error_pred_orbit_k"],
-                        "train/projection_error_gt_orbit_k": train_metrics["projection_error_gt_orbit_k"],
                         "train/loss_v_weighted": train_metrics["loss_v_weighted"],
                         "train/loss_l_weighted": train_metrics["loss_l_weighted"],
                         "train/loss_weighted": train_metrics["loss_weighted"],
                     }
+                    self.add_lattice_log_data(log_data, train_metrics, prefix="train")
                     for key, value in train_metrics.items():
                         if key.startswith("time_sampler/"):
                             log_data[key] = value
@@ -1315,21 +1336,7 @@ class ExperimentRunner:
                     print(
                         f"epoch={epoch:04d} train_loss_weighted={train_metrics['loss_weighted']:.6f} "
                         f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f}, "
-                        f"loss_sg_lattice={train_metrics['loss_sg_lattice']:.6f}, "
-                        f"loss_sg_lambda_scaled={train_metrics['loss_sg_lattice_lambda_scaled']:.6f}, "
-                        f"loss_conv_sg={train_metrics['loss_conv_sg']:.6f}, "
-                        f"loss_conv_lambda_scaled={train_metrics['loss_conv_sg_lambda_scaled']:.6f}, "
-                        f"lambda_sg={train_metrics['lambda_sg_lattice']:.6f}, "
-                        f"lambda_conv_sg={train_metrics['lambda_conv_sg']:.6f}, "
-                        f"sg_time_weight={train_metrics['lattice_sg_time_weight_mean']:.6f}, "
-                        f"conv_time_weight={train_metrics['conv_sg_time_weight_mean']:.6f}, "
-                        f"conv_weight={train_metrics['conv_weight_mean']:.6f}, "
-                        f"proj_pred_k={train_metrics['projection_error_pred_k']:.6f}, "
-                        f"proj_gt_k={train_metrics['projection_error_gt_k']:.6f}, "
-                        f"conv_proj_pred_k={train_metrics['conv_projection_error_pred_k']:.6f}, "
-                        f"conv_proj_gt_k={train_metrics['conv_projection_error_gt_k']:.6f}, "
-                        f"proj_pred_orbit_k={train_metrics['projection_error_pred_orbit_k']:.6f}, "
-                        f"proj_gt_orbit_k={train_metrics['projection_error_gt_orbit_k']:.6f}, "
+                        f"{self.lattice_status_text(train_metrics)}, "
                         f"loss_v_weighted={train_metrics['loss_v_weighted']:.6f}, "
                         f"loss_l_weighted={train_metrics['loss_l_weighted']:.6f})",
                         flush=True,

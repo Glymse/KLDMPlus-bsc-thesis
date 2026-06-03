@@ -20,6 +20,7 @@ model:
   lattice_parameterization: x0
   lattice_diffusion_type: VP
   lattice_representation: diffcsp_k
+  lattice_debug: false
   lattice_sg_lambda: 0.0
   lattice_sg_normalize: true
   lattice_sg_time_weight: alpha_squared

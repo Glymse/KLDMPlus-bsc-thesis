@@ -14,6 +14,7 @@ time_sampler:
   type: uniform
 
 model:
+  lattice_debug: false
   eps: 1.0e-6
   lambda_l: 2.0
   lattice_parameterization: x0 # alternatives: eps, x0

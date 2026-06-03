@@ -19,6 +19,7 @@ dataset:
   pin_memory: false
 
 model:
+  lattice_debug: false
   eps: 1.0e-6
   lambda_l: 2.0
   lattice_parameterization: eps
