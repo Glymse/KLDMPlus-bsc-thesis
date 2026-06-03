@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
-import pickle
 import random
 import sys
 import tempfile
@@ -116,8 +114,6 @@ class SamplingRunner:
         self.device = get_default_device()
         self.checkpoint_path = self._checkpoint_path(self.sampling_cfg["checkpoint_path"])
         self.loader, self.lattice_transform = self._build_loader()
-        self.template_prior = None
-        self._template_prior_initialized = False
         self.model = build_model(config=self.config, device=self.device)
         load_checkpoint(
             checkpoint_path=self.checkpoint_path,
@@ -184,96 +180,6 @@ class SamplingRunner:
             download=True,
         )
 
-    def _ensure_template_prior(self):
-        if not self._template_prior_initialized:
-            self.template_prior = self._build_template_prior()
-            self._template_prior_initialized = True
-        return self.template_prior
-
-    def _build_template_prior(self):
-        from kldmPlus.data import CSPTask, resolve_data_root
-        from kldmPlus.symmetry import build_dataset_template_prior
-        from kldmPlus.symmetry.template_prior import _anonymous_count_key
-        from kldmPlus.symmetry.wyckoff_templates import requested_composition_key
-
-        sampling_algorithm = int(self.sampling_cfg.get("sampling_algorithm", 4 if str(self.sampling_cfg["method"]) == "pc" else 3))
-        if sampling_algorithm != 10:
-            return None
-        prior_cfg = dict(self.sampling_cfg.get("algorithm10", {}))
-        if not bool(prior_cfg.get("template_prior_enabled", True)):
-            return None
-        if float(prior_cfg.get("template_prior_weight", 1.0)) <= 0.0:
-            return None
-
-        dataset_cfg = dict(self.config["dataset"])
-        model_cfg = dict(self.config["model"])
-        root = resolve_data_root(dataset_cfg["root"])
-        task = CSPTask(
-            dataset_name=str(dataset_cfg["name"]),
-            lattice_parameterization=str(model_cfg["lattice_parameterization"]),
-            lattice_representation=str(dataset_cfg.get("lattice_representation", "kldm")),
-        )
-        train_dataset = task.fit_dataset(root=root, split="train", download=True)
-        max_samples = int(prior_cfg.get("template_prior_max_samples", 2000))
-        if max_samples <= 0:
-            return None
-        match_targets_only = bool(prior_cfg.get("template_prior_match_targets_only", True))
-        allowed_keys = None
-        if match_targets_only:
-            allowed_keys = {
-                requested_composition_key(
-                    space_group_number=int(torch.as_tensor(sample.space_group).reshape(-1)[0].item()),
-                    atomic_numbers=sample.atomic_numbers,
-                )
-                for sample in self.loader.dataset
-            }
-        cache_path = None
-        if bool(prior_cfg.get("template_prior_cache", True)):
-            cache_dir = Path.cwd() / ".cache" / "kldmPlus" / "template_prior"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_payload = {
-                "dataset": str(dataset_cfg["name"]),
-                "lattice_representation": str(dataset_cfg.get("lattice_representation", "kldm")),
-                "lattice_parameterization": str(model_cfg["lattice_parameterization"]),
-                "max_samples": int(max_samples),
-                "allowed_keys": sorted(map(repr, allowed_keys or [])),
-            }
-            cache_hash = hashlib.sha1(repr(cache_payload).encode("utf-8")).hexdigest()[:16]
-            cache_path = cache_dir / f"{cache_hash}.pkl"
-            if cache_path.exists():
-                with cache_path.open("rb") as handle:
-                    prior = pickle.load(handle)
-                print(
-                    f"template_prior_cache_hit path={cache_path} records={len(prior)}",
-                    flush=True,
-                )
-                return prior
-        allowed_render = 0 if allowed_keys is None else len(allowed_keys)
-        anonymous_render = 0 if allowed_keys is None else len({_anonymous_count_key(key) for key in allowed_keys})
-        print(
-            f"template_prior_build start max_samples={max_samples} "
-            f"match_targets_only={int(match_targets_only)} allowed_keys={allowed_render} "
-            f"allowed_anonymous_keys={anonymous_render}",
-            flush=True,
-        )
-        started_at = time.perf_counter()
-        prior = build_dataset_template_prior(
-            dataset=train_dataset,
-            lattice_transform=self.lattice_transform,
-            max_samples=max_samples,
-            allowed_keys=allowed_keys,
-        )
-        elapsed_s = time.perf_counter() - started_at
-        print(
-            f"template_prior_build done records={len(prior)} elapsed_s={elapsed_s:.1f}",
-            flush=True,
-        )
-        if cache_path is not None:
-            with cache_path.open("wb") as handle:
-                pickle.dump(prior, handle)
-            print(f"template_prior_cache_write path={cache_path}", flush=True)
-        return prior
-
     # Samples one batch with the configured KLDM sampler.
     def _sample_batch(self, batch):
         method = str(self.sampling_cfg["method"])
@@ -284,16 +190,7 @@ class SamplingRunner:
             "t_start": float(self.sampling_cfg["t_start"]),
             "t_final": float(self.sampling_cfg["t_final"]),
         }
-        if sampling_algorithm == 10:
-            if method not in {"casal", "em"}:
-                raise ValueError(
-                    "sampling_algorithm=10 expects sampling.method in {'casal', 'em'} for KLDM reverse-step compatibility.",
-                )
-            kwargs["lattice_transform"] = self.lattice_transform
-            kwargs["algorithm10_config"] = dict(self.sampling_cfg.get("algorithm10", {}))
-            kwargs["template_prior"] = self._ensure_template_prior()
-            sample_fn = self.model.sample_CSP_algorithm10
-        elif sampling_algorithm == 4:
+        if sampling_algorithm == 4:
             kwargs["tau"] = float(self.sampling_cfg["tau"])
             kwargs["n_correction_steps"] = int(self.sampling_cfg["n_correction_steps"])
             sample_fn = self.model.sample_CSP_algorithm4
@@ -302,7 +199,7 @@ class SamplingRunner:
         else:
             raise ValueError(
                 f"Unsupported sampling_algorithm={sampling_algorithm}. "
-                "Supported sampler paths are original KLDMplus (3/4) and CASAL/CASCAL (10)."
+                "Supported sampler paths are original KLDMplus (3/4)."
             )
 
         return sample_fn(**kwargs)

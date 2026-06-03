@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
-import json
 import random
 import re
 import shutil
@@ -18,19 +18,13 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, Subset
 import yaml
 
 from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import sample_times
-from kldmPlus.utils.time_sampler import (
-    AdaptiveReinforceTimeSampler,
-    AdaptiveReinforcePaperTimeSampler,
-    KLDMUniformTimeSampler,
-    LossSecondMomentTimeSampler,
-)
+from kldmPlus.utils.time_sampler import TimeSampler
 
 try:
     import wandb
@@ -106,6 +100,54 @@ def make_fixed_subset(dataset, subset_size: int | None, seed: int) -> Any:
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
     return Subset(dataset, indices)
+
+
+def _space_group_to_family(space_group_number: int) -> str:
+    sg = int(space_group_number)
+    if sg <= 2:
+        return "triclinic"
+    if sg <= 15:
+        return "monoclinic"
+    if sg <= 74:
+        return "orthorhombic"
+    if sg <= 142:
+        return "tetragonal"
+    if sg <= 167:
+        return "trigonal"
+    if sg <= 194:
+        return "hexagonal"
+    return "cubic"
+
+
+def make_balanced_subset(dataset, subset_size: int | None, seed: int, *, group_key) -> Any:
+    if subset_size is None or subset_size <= 0 or subset_size >= len(dataset):
+        return dataset
+
+    generator = torch.Generator().manual_seed(seed)
+    grouped_indices: dict[Any, list[int]] = defaultdict(list)
+    for idx in range(len(dataset)):
+        grouped_indices[group_key(dataset[idx])].append(idx)
+
+    group_items = sorted(grouped_indices.items(), key=lambda item: str(item[0]))
+    shuffled_groups: list[tuple[Any, list[int]]] = []
+    for group, indices in group_items:
+        order = torch.randperm(len(indices), generator=generator).tolist()
+        shuffled_groups.append((group, [indices[pos] for pos in order]))
+
+    selected: list[int] = []
+    while len(selected) < int(subset_size):
+        made_progress = False
+        for _group, indices in shuffled_groups:
+            if not indices:
+                continue
+            selected.append(indices.pop(0))
+            made_progress = True
+            if len(selected) >= int(subset_size):
+                break
+        if not made_progress:
+            break
+
+    return Subset(dataset, selected)
 
 
 def make_fraction_subset(dataset, fraction: float | None, seed: int) -> Any:
@@ -233,6 +275,15 @@ def prune_wandb_artifact_cache(checkpoint_path: Path) -> None:
             shutil.rmtree(candidate, ignore_errors=True)
 
 
+def prune_validation_artifact_cache(experiment_name: str) -> None:
+    if not WANDB_ARTIFACTS_ROOT.exists():
+        return
+    artifact_name = f"{experiment_name}_validation"
+    for candidate in WANDB_ARTIFACTS_ROOT.glob(f"*/*/model/{artifact_name}"):
+        if candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
+
+
 def format_metric(value: float | int | None, fmt: str) -> str:
     if value is None:
         return "na"
@@ -282,24 +333,31 @@ def checkpoint_dir(config: dict[str, Any], experiment_name: str) -> Path:
     return CHECKPOINTS_ROOT / experiment_name
 
 
-def save_named_checkpoint(
+def clear_local_checkpoint_dir(config: dict[str, Any], experiment_name: str) -> None:
+    candidate = checkpoint_dir(config=config, experiment_name=experiment_name)
+    if candidate.exists():
+        shutil.rmtree(candidate, ignore_errors=True)
+
+
+def clear_wandb_artifact_cache() -> None:
+    if WANDB_ARTIFACTS_ROOT.exists():
+        shutil.rmtree(WANDB_ARTIFACTS_ROOT, ignore_errors=True)
+
+
+def write_checkpoint_file(
     *,
     model,
     optimizer: torch.optim.Optimizer,
     ema,
     time_sampler,
+    output_path: Path,
     config: dict[str, Any],
-    experiment_name: str,
     epoch: int,
     metrics: Mapping[str, float | int | None],
-    filename: str,
-    keep_paths: list[Path] | None = None,
 ) -> Path:
     from kldmPlus.utils.model_loader import save_checkpoint
 
-    output_dir = checkpoint_dir(config=config, experiment_name=experiment_name)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
     save_checkpoint(
@@ -312,18 +370,7 @@ def save_named_checkpoint(
         epoch=epoch,
         metrics=metrics,
     )
-    keep_names = {output_path.name}
-    if keep_paths is not None:
-        keep_names.update(path.name for path in keep_paths)
-    for candidate in output_dir.iterdir():
-        if candidate.is_file() and candidate.name not in keep_names:
-            candidate.unlink(missing_ok=True)
     return output_path
-
-
-def save_wandb_checkpoint(path: Path) -> None:
-    if path.exists():
-        wandb.save(str(path), policy="now")
 
 
 class ExperimentRunner:
@@ -344,6 +391,8 @@ class ExperimentRunner:
         self.wandb_project = str(self.logging_cfg.get("wandb_project", self.experiment_name))
         self.wandb_run_name = str(self.logging_cfg.get("wandb_run_name", self.experiment_name))
         set_global_training_seed(TRAIN_SEED)
+        clear_local_checkpoint_dir(self.config, self.experiment_name)
+        clear_wandb_artifact_cache()
 
         self.train_every_epochs = int(self.logging_cfg["train_every_epochs"])
         self.validate_every_epochs = int(self.validation_cfg["every_n_epochs"])
@@ -371,16 +420,7 @@ class ExperimentRunner:
         self.run = None
         self._last_validation_artifact = None
         self._last_validation_artifact_epoch: int | None = None
-        self._warned_missing_wandb_image = False
-        self.validation_ablation_history: dict[str, list[float]] = {
-            "epoch": [],
-            "rmse_mean": [],
-            "rmse_std": [],
-            "match_rate_mean": [],
-            "match_rate_std": [],
-            "valid_mean": [],
-            "valid_std": [],
-        }
+        self._last_validation_checkpoint_name: str | None = None
 
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
@@ -424,110 +464,21 @@ class ExperimentRunner:
                 self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
         if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
             prune_wandb_artifact_cache(resolved_checkpoint_path)
+        clear_wandb_artifact_cache()
 
     def build_time_sampler(self):
         cfg = dict(self.config.get("time_sampler", {}))
         sampler_type = str(cfg.get("type", "uniform"))
-
-        if sampler_type == "uniform":
-            return KLDMUniformTimeSampler(
-                lower_bound=TIME_LOWER_BOUND,
-                seed=TRAIN_SEED,
+        if sampler_type not in {"uniform", "log_uniform"}:
+            raise ValueError(
+                "KLDMPlus now only supports time_sampler.type in {'uniform', 'log_uniform'}. "
+                f"Got {sampler_type!r}."
             )
-
-        if sampler_type == "loss_second_moment":
-            return LossSecondMomentTimeSampler(
-                n_bins=int(cfg.get("n_bins", 64)),
-                lower_bound=TIME_LOWER_BOUND,
-                history_per_bin=int(cfg.get("history_per_bin", 10)),
-                alpha=float(cfg.get("alpha", 0.5)),
-                adaptive_power=float(cfg.get("adaptive_power", 0.5)),
-                min_prob=float(cfg.get("min_prob", 0.002)),
-                max_prob=float(cfg.get("max_prob", 0.10)),
-                velocity_weight=float(cfg.get("velocity_weight", 0.7)),
-                lattice_weight=float(cfg.get("lattice_weight", 0.3)),
-                use_importance_weights=bool(cfg.get("use_importance_weights", False)),
-                clip_importance_weights=bool(cfg.get("clip_importance_weights", True)),
-                weight_clip_min=float(cfg.get("weight_clip_min", 0.5)),
-                weight_clip_max=float(cfg.get("weight_clip_max", 2.0)),
-                seed=TRAIN_SEED,
-                device=self.device,
-            )
-
-        if sampler_type == "adaptive_reinforce":
-            policy_warmup_steps = int(cfg.get("policy_warmup_steps", 5000))
-            policy_warmup_epochs = cfg.get("policy_warmup_epochs")
-            if policy_warmup_epochs is not None:
-                batches_per_epoch = len(self.train_loader)
-                policy_warmup_steps = int(policy_warmup_epochs) * batches_per_epoch
-                self.config.setdefault("time_sampler", {})
-                self.config["time_sampler"]["policy_warmup_steps_resolved"] = policy_warmup_steps
-            return AdaptiveReinforceTimeSampler(
-                lower_bound=TIME_LOWER_BOUND,
-                policy_hidden_dim=int(cfg.get("policy_hidden_dim", 128)),
-                policy_hidden_depth=int(cfg.get("policy_hidden_depth", 2)),
-                min_concentration=float(cfg.get("min_concentration", 0.25)),
-                policy_lr=float(cfg.get("policy_lr", 2e-5)),
-                entropy_coef=float(cfg.get("entropy_coef", 1e-2)),
-                policy_update_every=int(cfg.get("policy_update_every", 100)),
-                policy_warmup_steps=policy_warmup_steps,
-                reward_candidate_times=int(cfg.get("reward_candidate_times", 7)),
-                reward_active_times=int(cfg.get("reward_active_times", 5)),
-                reward_history_size=int(cfg.get("reward_history_size", 64)),
-                use_baseline=bool(cfg.get("use_baseline", False)),
-                reward_baseline_momentum=float(cfg.get("reward_baseline_momentum", 0.95)),
-                reward_velocity_weight=float(cfg.get("reward_velocity_weight", 1.0)),
-                reward_lattice_weight=float(cfg.get("reward_lattice_weight", 1.0)),
-                reward_size_weight_power=float(cfg.get("reward_size_weight_power", 0.0)),
-                reward_size_weight_max=float(cfg.get("reward_size_weight_max", 2.0)),
-                reward_normalization_eps=float(cfg.get("reward_normalization_eps", 1e-6)),
-                entropy_in_reward=bool(cfg.get("entropy_in_reward", True)),
-                use_importance_weights=bool(cfg.get("use_importance_weights", True)),
-                clip_importance_weights=bool(cfg.get("clip_importance_weights", True)),
-                weight_clip_min=float(cfg.get("weight_clip_min", 0.25)),
-                weight_clip_max=float(cfg.get("weight_clip_max", 4.0)),
-                gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
-                feature_selection_min_history=int(cfg.get("feature_selection_min_history", 32)),
-                seed=TRAIN_SEED,
-                device=self.device,
-                reward_probe_times=cfg.get("reward_probe_times"),
-            )
-
-        if sampler_type == "adaptive_reinforce_paper":
-            policy_warmup_steps = int(cfg.get("policy_warmup_steps", 0))
-            policy_warmup_epochs = cfg.get("policy_warmup_epochs")
-            if policy_warmup_epochs is not None:
-                batches_per_epoch = len(self.train_loader)
-                policy_warmup_steps = int(policy_warmup_epochs) * batches_per_epoch
-                self.config.setdefault("time_sampler", {})
-                self.config["time_sampler"]["policy_warmup_steps_resolved"] = policy_warmup_steps
-            return AdaptiveReinforcePaperTimeSampler(
-                lower_bound=TIME_LOWER_BOUND,
-                policy_hidden_dim=int(cfg.get("policy_hidden_dim", 256)),
-                policy_hidden_depth=int(cfg.get("policy_hidden_depth", 2)),
-                min_concentration=float(cfg.get("min_concentration", 1e-5)),
-                policy_lr=float(cfg.get("policy_lr", 1e-2)),
-                entropy_coef=float(cfg.get("entropy_coef", 1e-2)),
-                policy_update_every=int(cfg.get("policy_update_every", 40)),
-                policy_warmup_steps=policy_warmup_steps,
-                reward_candidate_times=int(cfg.get("reward_candidate_times", 13)),
-                reward_active_times=int(cfg.get("reward_active_times", 3)),
-                reward_history_size=int(cfg.get("reward_history_size", 5)),
-                feature_selection_min_history=int(cfg.get("feature_selection_min_history", 2)),
-                feature_queue_single_graph=bool(cfg.get("feature_queue_single_graph", True)),
-                feature_probe_graphs=int(
-                    cfg.get(
-                        "feature_probe_graphs",
-                        1 if bool(cfg.get("feature_queue_single_graph", True)) else 0,
-                    )
-                ),
-                gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
-                seed=TRAIN_SEED,
-                device=self.device,
-                reward_probe_times=cfg.get("reward_probe_times"),
-            )
-
-        raise ValueError(f"Unknown time_sampler.type={sampler_type!r}")
+        return TimeSampler(
+            mode=sampler_type,
+            lower_bound=TIME_LOWER_BOUND,
+            seed=TRAIN_SEED,
+        )
 
     def create_loaders(self) -> tuple[DataLoader, DataLoader, Any]:
         from kldmPlus.data import CSPTask, resolve_data_root
@@ -566,11 +517,26 @@ class ExperimentRunner:
         # Keep training/validation splits fixed so experiment metrics are always
         # comparable across runs.
         train_dataset_full = task.fit_dataset(root=root, split=TRAIN_SPLIT, download=True)
-        train_dataset = make_fraction_subset(
-            train_dataset_full,
-            fraction=dataset_cfg.get("train_subset_fraction"),
-            seed=int(dataset_cfg.get("train_subset_seed", TRAIN_SEED)),
-        )
+        train_subset_fraction = dataset_cfg.get("train_subset_fraction")
+        train_subset_seed = int(dataset_cfg.get("train_subset_seed", TRAIN_SEED))
+        train_subset_strategy = str(dataset_cfg.get("train_subset_strategy", "random"))
+        if train_subset_fraction is None or float(train_subset_fraction) <= 0.0 or float(train_subset_fraction) >= 1.0:
+            train_dataset = train_dataset_full
+        else:
+            train_subset_size = max(1, int(round(len(train_dataset_full) * float(train_subset_fraction))))
+            if train_subset_strategy == "balanced_space_group":
+                train_dataset = make_balanced_subset(
+                    train_dataset_full,
+                    subset_size=train_subset_size,
+                    seed=train_subset_seed,
+                    group_key=lambda sample: int(torch.as_tensor(sample.space_group).reshape(-1)[0].item()),
+                )
+            else:
+                train_dataset = make_fixed_subset(
+                    train_dataset_full,
+                    subset_size=train_subset_size,
+                    seed=train_subset_seed,
+                )
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -585,11 +551,22 @@ class ExperimentRunner:
         # Validation always uses the validation split, optionally with a fixed
         # subset for faster checks.
         val_dataset_full = task.fit_dataset(root=root, split=VAL_SPLIT, download=True)
-        val_dataset = make_fixed_subset(
-            val_dataset_full,
-            subset_size=self.validation_cfg["subset_size"],
-            seed=int(self.validation_cfg["subset_seed"]),
-        )
+        val_subset_strategy = str(self.validation_cfg.get("subset_strategy", "random"))
+        if val_subset_strategy == "balanced_family":
+            val_dataset = make_balanced_subset(
+                val_dataset_full,
+                subset_size=self.validation_cfg["subset_size"],
+                seed=int(self.validation_cfg["subset_seed"]),
+                group_key=lambda sample: _space_group_to_family(
+                    int(torch.as_tensor(sample.space_group).reshape(-1)[0].item()),
+                ),
+            )
+        else:
+            val_dataset = make_fixed_subset(
+                val_dataset_full,
+                subset_size=self.validation_cfg["subset_size"],
+                seed=int(self.validation_cfg["subset_seed"]),
+            )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -611,73 +588,131 @@ class ExperimentRunner:
         if train_generator is not None:
             train_generator.manual_seed(TRAIN_SEED + int(epoch))
 
-        total_loss_v = total_loss_l = total_loss_sg_lattice = total_loss_weighted = 0.0
+        total_loss_v = total_loss_l = total_loss_sg_lattice = 0.0
+        total_loss_conv_sg = 0.0
         total_projection_error_pred_k = total_projection_error_gt_k = 0.0
-        total_loss_v_weighted = total_loss_l_weighted = 0.0
-        total_graphs = 0
+        total_conv_projection_error_pred_k = total_conv_projection_error_gt_k = 0.0
+        total_projection_error_pred_orbit_k = total_projection_error_gt_orbit_k = 0.0
+        total_lattice_sg_time_weight_mean = 0.0
+        total_conv_sg_time_weight_mean = total_conv_weight_mean = 0.0
+        total_loss_v_weighted = total_loss_l_weighted = total_loss_sg_lattice_weighted = 0.0
+        total_loss_sg_lattice_lambda_scaled = 0.0
+        total_loss_conv_sg_weighted = total_loss_conv_sg_lambda_scaled = 0.0
+        total_nodes = total_graphs = 0
+        lambda_sg_lattice = 0.0
+        lambda_conv_sg = 0.0
 
         for batch in self.train_loader:
             if STOP_REQUESTED:
                 break
 
             batch = batch.to(self.device)
-            self.time_sampler.before_model_update(batch=batch, model=self.model)
-
-            sampled_time = self.time_sampler.sample(batch)
+            sampled_t, sampled_weights = self.time_sampler.sample(batch)
 
             self.optimizer.zero_grad(set_to_none=True)
             loss, metrics = self.model.algorithm2_loss(
                 batch=batch,
-                t=sampled_time.t,
-                time_weight=sampled_time.weights,
+                t=sampled_t,
+                time_weight=sampled_weights,
                 debug=False,
             )
             loss.backward()
             self.optimizer.step()
-            self.time_sampler.after_model_update(
-                batch=batch,
-                model=self.model,
-                sampled_time=sampled_time,
-                metrics=metrics,
-            )
 
             if self.ema is not None:
                 self.ema.update(self.model, current_epoch=epoch)
 
-            total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
-            total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
+            total_loss_v += float(metrics["loss_v"]) * int(batch.pos.shape[0])
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
             total_loss_sg_lattice += float(metrics.get("loss_sg_lattice", 0.0)) * int(batch.num_graphs)
+            total_loss_conv_sg += float(metrics.get("loss_conv_sg", 0.0)) * int(batch.num_graphs)
             total_projection_error_pred_k += float(metrics.get("projection_error_pred_k", 0.0)) * int(batch.num_graphs)
             total_projection_error_gt_k += float(metrics.get("projection_error_gt_k", 0.0)) * int(batch.num_graphs)
-            total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.num_graphs)
+            total_conv_projection_error_pred_k += float(metrics.get("conv_projection_error_pred_k", 0.0)) * int(batch.num_graphs)
+            total_conv_projection_error_gt_k += float(metrics.get("conv_projection_error_gt_k", 0.0)) * int(batch.num_graphs)
+            total_projection_error_pred_orbit_k += float(metrics.get("projection_error_pred_orbit_k", 0.0)) * int(batch.num_graphs)
+            total_projection_error_gt_orbit_k += float(metrics.get("projection_error_gt_orbit_k", 0.0)) * int(batch.num_graphs)
+            total_lattice_sg_time_weight_mean += float(metrics.get("lattice_sg_time_weight_mean", 0.0)) * int(batch.num_graphs)
+            total_conv_sg_time_weight_mean += float(metrics.get("conv_sg_time_weight_mean", 0.0)) * int(batch.num_graphs)
+            total_conv_weight_mean += float(metrics.get("conv_weight_mean", 0.0)) * int(batch.num_graphs)
+            total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.pos.shape[0])
             total_loss_l_weighted += float(metrics["loss_l_weighted"]) * int(batch.num_graphs)
+            total_loss_sg_lattice_weighted += float(metrics.get("loss_sg_lattice_weighted", 0.0)) * int(batch.num_graphs)
+            total_loss_sg_lattice_lambda_scaled += float(metrics.get("loss_sg_lattice_lambda_scaled", 0.0)) * int(batch.num_graphs)
+            total_loss_conv_sg_weighted += float(metrics.get("loss_conv_sg_weighted", 0.0)) * int(batch.num_graphs)
+            total_loss_conv_sg_lambda_scaled += float(metrics.get("loss_conv_sg_lambda_scaled", 0.0)) * int(batch.num_graphs)
+            lambda_sg_lattice = float(metrics.get("lambda_sg_lattice", lambda_sg_lattice))
+            lambda_conv_sg = float(metrics.get("lambda_conv_sg", lambda_conv_sg))
+            total_nodes += int(batch.pos.shape[0])
             total_graphs += int(batch.num_graphs)
 
-        if total_graphs == 0:
+        if total_nodes == 0 or total_graphs == 0:
             raise RuntimeError("Training stopped before any batches were processed.")
 
+        mean_loss_v = total_loss_v / total_nodes
+        mean_loss_l = total_loss_l / total_graphs
+        mean_loss_sg_lattice = total_loss_sg_lattice / total_graphs
+        mean_loss_conv_sg = total_loss_conv_sg / total_graphs
+        mean_loss_v_weighted = total_loss_v_weighted / total_nodes
+        mean_loss_l_weighted = total_loss_l_weighted / total_graphs
+        mean_loss_sg_lattice_weighted = total_loss_sg_lattice_weighted / total_graphs
+        mean_loss_sg_lattice_lambda_scaled = total_loss_sg_lattice_lambda_scaled / total_graphs
+        mean_loss_conv_sg_weighted = total_loss_conv_sg_weighted / total_graphs
+        mean_loss_conv_sg_lambda_scaled = total_loss_conv_sg_lambda_scaled / total_graphs
+        mean_total_loss = (
+            mean_loss_v_weighted
+            + mean_loss_l_weighted
+            + mean_loss_sg_lattice_lambda_scaled
+            + mean_loss_conv_sg_lambda_scaled
+        )
+
         metrics = {
-            "loss": total_loss_weighted / total_graphs,
-            "loss_v": total_loss_v / total_graphs,
-            "loss_l": total_loss_l / total_graphs,
-            "loss_sg_lattice": total_loss_sg_lattice / total_graphs,
+            "loss": mean_total_loss,
+            "loss_v": mean_loss_v,
+            "loss_l": mean_loss_l,
+            "loss_sg_lattice": mean_loss_sg_lattice,
+            "loss_conv_sg": mean_loss_conv_sg,
             "projection_error_pred_k": total_projection_error_pred_k / total_graphs,
             "projection_error_gt_k": total_projection_error_gt_k / total_graphs,
-            "loss_v_weighted": total_loss_v_weighted / total_graphs,
-            "loss_l_weighted": total_loss_l_weighted / total_graphs,
-            "loss_weighted": total_loss_weighted / total_graphs,
+            "primitive_projection_error_pred_k": total_projection_error_pred_k / total_graphs,
+            "primitive_projection_error_gt_k": total_projection_error_gt_k / total_graphs,
+            "conv_projection_error_pred_k": total_conv_projection_error_pred_k / total_graphs,
+            "conv_projection_error_gt_k": total_conv_projection_error_gt_k / total_graphs,
+            "projection_error_pred_direct_k": total_projection_error_pred_k / total_graphs,
+            "projection_error_gt_direct_k": total_projection_error_gt_k / total_graphs,
+            "projection_error_pred_orbit_k": total_projection_error_pred_orbit_k / total_graphs,
+            "projection_error_gt_orbit_k": total_projection_error_gt_orbit_k / total_graphs,
+            "lattice_sg_time_weight_mean": total_lattice_sg_time_weight_mean / total_graphs,
+            "conv_sg_time_weight_mean": total_conv_sg_time_weight_mean / total_graphs,
+            "conv_weight_mean": total_conv_weight_mean / total_graphs,
+            "loss_v_weighted": mean_loss_v_weighted,
+            "loss_l_weighted": mean_loss_l_weighted,
+            "loss_sg_lattice_weighted": mean_loss_sg_lattice_weighted,
+            "loss_sg_lattice_lambda_scaled": mean_loss_sg_lattice_lambda_scaled,
+            "loss_conv_sg_weighted": mean_loss_conv_sg_weighted,
+            "loss_conv_sg_lambda_scaled": mean_loss_conv_sg_lambda_scaled,
+            "lambda_sg_lattice": lambda_sg_lattice,
+            "lambda_conv_sg": lambda_conv_sg,
+            "loss_weighted": mean_total_loss,
         }
-        metrics.update(self.time_sampler.diagnostics())
         return metrics
 
     def evaluate_loss(self) -> dict[str, float]:
         self.model.eval()
 
-        total_loss_v = total_loss_l = total_loss_sg_lattice = total_loss_weighted = 0.0
+        total_loss_v = total_loss_l = total_loss_sg_lattice = 0.0
+        total_loss_conv_sg = 0.0
         total_projection_error_pred_k = total_projection_error_gt_k = 0.0
-        total_loss_v_weighted = total_loss_l_weighted = 0.0
-        total_graphs = 0
+        total_conv_projection_error_pred_k = total_conv_projection_error_gt_k = 0.0
+        total_projection_error_pred_orbit_k = total_projection_error_gt_orbit_k = 0.0
+        total_lattice_sg_time_weight_mean = 0.0
+        total_conv_sg_time_weight_mean = total_conv_weight_mean = 0.0
+        total_loss_v_weighted = total_loss_l_weighted = total_loss_sg_lattice_weighted = 0.0
+        total_loss_sg_lattice_lambda_scaled = 0.0
+        total_loss_conv_sg_weighted = total_loss_conv_sg_lambda_scaled = 0.0
+        total_nodes = total_graphs = 0
+        lambda_sg_lattice = 0.0
+        lambda_conv_sg = 0.0
         loss_seed = int(self.validation_cfg.get("loss_seed", TRAIN_SEED + 17))
 
         with isolated_rng_seed(loss_seed):
@@ -690,29 +725,78 @@ class ExperimentRunner:
                 with torch.no_grad():
                     _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
 
-                total_loss_weighted += float(metrics["loss"]) * int(batch.num_graphs)
-                total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
+                total_loss_v += float(metrics["loss_v"]) * int(batch.pos.shape[0])
                 total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
                 total_loss_sg_lattice += float(metrics.get("loss_sg_lattice", 0.0)) * int(batch.num_graphs)
+                total_loss_conv_sg += float(metrics.get("loss_conv_sg", 0.0)) * int(batch.num_graphs)
                 total_projection_error_pred_k += float(metrics.get("projection_error_pred_k", 0.0)) * int(batch.num_graphs)
                 total_projection_error_gt_k += float(metrics.get("projection_error_gt_k", 0.0)) * int(batch.num_graphs)
-                total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.num_graphs)
+                total_conv_projection_error_pred_k += float(metrics.get("conv_projection_error_pred_k", 0.0)) * int(batch.num_graphs)
+                total_conv_projection_error_gt_k += float(metrics.get("conv_projection_error_gt_k", 0.0)) * int(batch.num_graphs)
+                total_projection_error_pred_orbit_k += float(metrics.get("projection_error_pred_orbit_k", 0.0)) * int(batch.num_graphs)
+                total_projection_error_gt_orbit_k += float(metrics.get("projection_error_gt_orbit_k", 0.0)) * int(batch.num_graphs)
+                total_lattice_sg_time_weight_mean += float(metrics.get("lattice_sg_time_weight_mean", 0.0)) * int(batch.num_graphs)
+                total_conv_sg_time_weight_mean += float(metrics.get("conv_sg_time_weight_mean", 0.0)) * int(batch.num_graphs)
+                total_conv_weight_mean += float(metrics.get("conv_weight_mean", 0.0)) * int(batch.num_graphs)
+                total_loss_v_weighted += float(metrics["loss_v_weighted"]) * int(batch.pos.shape[0])
                 total_loss_l_weighted += float(metrics["loss_l_weighted"]) * int(batch.num_graphs)
+                total_loss_sg_lattice_weighted += float(metrics.get("loss_sg_lattice_weighted", 0.0)) * int(batch.num_graphs)
+                total_loss_sg_lattice_lambda_scaled += float(metrics.get("loss_sg_lattice_lambda_scaled", 0.0)) * int(batch.num_graphs)
+                total_loss_conv_sg_weighted += float(metrics.get("loss_conv_sg_weighted", 0.0)) * int(batch.num_graphs)
+                total_loss_conv_sg_lambda_scaled += float(metrics.get("loss_conv_sg_lambda_scaled", 0.0)) * int(batch.num_graphs)
+                lambda_sg_lattice = float(metrics.get("lambda_sg_lattice", lambda_sg_lattice))
+                lambda_conv_sg = float(metrics.get("lambda_conv_sg", lambda_conv_sg))
+                total_nodes += int(batch.pos.shape[0])
                 total_graphs += int(batch.num_graphs)
 
-        if total_graphs == 0:
+        if total_nodes == 0 or total_graphs == 0:
             raise RuntimeError("Validation loader is empty.")
 
+        mean_loss_v = total_loss_v / total_nodes
+        mean_loss_l = total_loss_l / total_graphs
+        mean_loss_sg_lattice = total_loss_sg_lattice / total_graphs
+        mean_loss_conv_sg = total_loss_conv_sg / total_graphs
+        mean_loss_v_weighted = total_loss_v_weighted / total_nodes
+        mean_loss_l_weighted = total_loss_l_weighted / total_graphs
+        mean_loss_sg_lattice_weighted = total_loss_sg_lattice_weighted / total_graphs
+        mean_loss_sg_lattice_lambda_scaled = total_loss_sg_lattice_lambda_scaled / total_graphs
+        mean_loss_conv_sg_weighted = total_loss_conv_sg_weighted / total_graphs
+        mean_loss_conv_sg_lambda_scaled = total_loss_conv_sg_lambda_scaled / total_graphs
+        mean_total_loss = (
+            mean_loss_v_weighted
+            + mean_loss_l_weighted
+            + mean_loss_sg_lattice_lambda_scaled
+            + mean_loss_conv_sg_lambda_scaled
+        )
+
         return {
-            "loss": total_loss_weighted / total_graphs,
-            "loss_v": total_loss_v / total_graphs,
-            "loss_l": total_loss_l / total_graphs,
-            "loss_sg_lattice": total_loss_sg_lattice / total_graphs,
+            "loss": mean_total_loss,
+            "loss_v": mean_loss_v,
+            "loss_l": mean_loss_l,
+            "loss_sg_lattice": mean_loss_sg_lattice,
+            "loss_conv_sg": mean_loss_conv_sg,
             "projection_error_pred_k": total_projection_error_pred_k / total_graphs,
             "projection_error_gt_k": total_projection_error_gt_k / total_graphs,
-            "loss_v_weighted": total_loss_v_weighted / total_graphs,
-            "loss_l_weighted": total_loss_l_weighted / total_graphs,
-            "loss_weighted": total_loss_weighted / total_graphs,
+            "primitive_projection_error_pred_k": total_projection_error_pred_k / total_graphs,
+            "primitive_projection_error_gt_k": total_projection_error_gt_k / total_graphs,
+            "conv_projection_error_pred_k": total_conv_projection_error_pred_k / total_graphs,
+            "conv_projection_error_gt_k": total_conv_projection_error_gt_k / total_graphs,
+            "projection_error_pred_direct_k": total_projection_error_pred_k / total_graphs,
+            "projection_error_gt_direct_k": total_projection_error_gt_k / total_graphs,
+            "projection_error_pred_orbit_k": total_projection_error_pred_orbit_k / total_graphs,
+            "projection_error_gt_orbit_k": total_projection_error_gt_orbit_k / total_graphs,
+            "lattice_sg_time_weight_mean": total_lattice_sg_time_weight_mean / total_graphs,
+            "conv_sg_time_weight_mean": total_conv_sg_time_weight_mean / total_graphs,
+            "conv_weight_mean": total_conv_weight_mean / total_graphs,
+            "loss_v_weighted": mean_loss_v_weighted,
+            "loss_l_weighted": mean_loss_l_weighted,
+            "loss_sg_lattice_weighted": mean_loss_sg_lattice_weighted,
+            "loss_sg_lattice_lambda_scaled": mean_loss_sg_lattice_lambda_scaled,
+            "loss_conv_sg_weighted": mean_loss_conv_sg_weighted,
+            "loss_conv_sg_lambda_scaled": mean_loss_conv_sg_lambda_scaled,
+            "lambda_sg_lattice": lambda_sg_lattice,
+            "lambda_conv_sg": lambda_conv_sg,
+            "loss_weighted": mean_total_loss,
         }
 
     def run_sampling_evaluation(self) -> dict[str, Any]:
@@ -731,6 +815,13 @@ class ExperimentRunner:
             with seed_context:
                 results = []
                 num_graphs_seen = 0
+                projection_sums = {
+                    "projection_error_pred_direct_k": 0.0,
+                    "projection_error_gt_direct_k": 0.0,
+                    "projection_error_pred_orbit_k": 0.0,
+                    "projection_error_gt_orbit_k": 0.0,
+                }
+                projection_count = 0
 
                 for batch in self.val_loader:
                     batch = batch.to(self.device)
@@ -756,6 +847,7 @@ class ExperimentRunner:
 
                     ptr = batch.ptr.tolist()
                     for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr[:-1], ptr[1:])):
+                        requested_sg = int(torch.as_tensor(batch.space_group).reshape(-1)[graph_idx].item())
                         results.append(
                             evaluate_csp_reconstruction(
                                 pred_f=pos_t[start_idx:end_idx],
@@ -765,9 +857,34 @@ class ExperimentRunner:
                                 target_l=batch.l[graph_idx],
                                 target_a=batch.atomic_numbers[start_idx:end_idx],
                                 lattice_transform=self.lattice_transform,
-                                requested_space_group=int(torch.as_tensor(batch.space_group).reshape(-1)[graph_idx].item()),
+                                requested_space_group=requested_sg,
                             )
                         )
+                        if self.model.lattice_representation == "diffcsp_k":
+                            sg_t = torch.tensor([requested_sg], device=l_t.device, dtype=torch.long)
+                            pred_l_graph = l_t[graph_idx].reshape(1, -1)
+                            gt_l_graph = batch.l[graph_idx].reshape(1, -1)
+                            projection_sums["projection_error_pred_direct_k"] += float(
+                                self.model.lattice_symmetry.direct_sg_residual_abs_mean(pred_l_graph, sg_t).item()
+                            )
+                            projection_sums["projection_error_gt_direct_k"] += float(
+                                self.model.lattice_symmetry.direct_sg_residual_abs_mean(gt_l_graph, sg_t).item()
+                            )
+                            projection_sums["projection_error_pred_orbit_k"] += float(
+                                self.model.lattice_symmetry.orbit_sg_residual_abs_mean(
+                                    pred_l_graph,
+                                    sg_t,
+                                    max_candidates=self.model.lattice_orbit_metric_max_candidates,
+                                ).item()
+                            )
+                            projection_sums["projection_error_gt_orbit_k"] += float(
+                                self.model.lattice_symmetry.orbit_sg_residual_abs_mean(
+                                    gt_l_graph,
+                                    sg_t,
+                                    max_candidates=self.model.lattice_orbit_metric_max_candidates,
+                                ).item()
+                            )
+                            projection_count += 1
                         num_graphs_seen += 1
 
                         if (
@@ -789,6 +906,10 @@ class ExperimentRunner:
                 )
 
             summary = aggregate_csp_reconstruction_metrics(results)
+            projection_metrics = {
+                key: (None if projection_count == 0 else value / projection_count)
+                for key, value in projection_sums.items()
+            }
             return {
                 "valid": summary.get("valid"),
                 "match_rate": summary.get("match_rate"),
@@ -796,264 +917,159 @@ class ExperimentRunner:
                 "frac_rmse": summary.get("frac_rmse"),
                 "detected_family_agreement": summary.get("detected_family_agreement"),
                 "detected_sg_agreement": summary.get("detected_sg_agreement"),
+                "wyckoff_letter_agreement": summary.get("wyckoff_letter_agreement"),
+                "predicted_wyckoff_dimensionality_distribution": summary.get("predicted_wyckoff_dimensionality_distribution"),
+                "target_wyckoff_dimensionality_distribution": summary.get("target_wyckoff_dimensionality_distribution"),
                 "lattice_lengths_rmse": summary.get("lattice_lengths_rmse"),
                 "lattice_angles_rmse": summary.get("lattice_angles_rmse"),
                 "volume_rel_error": summary.get("volume_rel_error"),
+                "projection_error_pred_direct_k": projection_metrics["projection_error_pred_direct_k"],
+                "projection_error_gt_direct_k": projection_metrics["projection_error_gt_direct_k"],
+                "projection_error_pred_orbit_k": projection_metrics["projection_error_pred_orbit_k"],
+                "projection_error_gt_orbit_k": projection_metrics["projection_error_gt_orbit_k"],
                 "num_samples": summary.get("num_samples"),
             }
 
-        if not bool(self.validation_cfg.get("ablation", False)):
-            single_seed = int(
-                self.validation_cfg.get(
-                    "sampling_seed",
-                    self.validation_cfg.get("ablation_seed_offset", 0),
-                )
-            )
-            return collect_one_pass(seed=single_seed)
-
-        num_seeds = int(self.validation_cfg.get("ablation_num_seeds", 6))
-        seed_offset = int(self.validation_cfg.get("ablation_seed_offset", 0))
-        pass_summaries = []
-        seed_summaries = []
-        for seed_index in range(num_seeds):
-            seed = seed_offset + seed_index
-            print(
-                f"validation_ablation_progress seed={seed_index + 1}/{num_seeds} actual_seed={seed}",
-                flush=True,
-            )
-            one_pass = collect_one_pass(seed=seed)
-            print(
-                f"validation_ablation_seed_summary seed={seed} "
-                f"valid={format_metric(one_pass['valid'], '.4f')} "
-                f"match_rate={format_metric(one_pass['match_rate'], '.4f')} "
-                f"rmse={format_metric(one_pass['rmse'], '.6f')}",
-                flush=True,
-            )
-            pass_summaries.append(one_pass)
-            seed_summaries.append({"seed": seed, **one_pass})
-
-        def aggregate_scalar(metric_name: str) -> tuple[float | None, float | None]:
-            values = [
-                float(summary[metric_name])
-                for summary in pass_summaries
-                if summary.get(metric_name) is not None
-            ]
-            if not values:
-                return None, None
-            if len(values) == 1:
-                return float(np.mean(values)), 0.0
-            return float(np.mean(values)), float(np.std(values, ddof=1))
-
-        valid_mean, valid_std = aggregate_scalar("valid")
-        match_rate_mean, match_rate_std = aggregate_scalar("match_rate")
-        rmse_mean, rmse_std = aggregate_scalar("rmse")
-        frac_rmse_mean, frac_rmse_std = aggregate_scalar("frac_rmse")
-        detected_family_agreement_mean, detected_family_agreement_std = aggregate_scalar("detected_family_agreement")
-        detected_sg_agreement_mean, detected_sg_agreement_std = aggregate_scalar("detected_sg_agreement")
-        lattice_lengths_rmse_mean, lattice_lengths_rmse_std = aggregate_scalar("lattice_lengths_rmse")
-        lattice_angles_rmse_mean, lattice_angles_rmse_std = aggregate_scalar("lattice_angles_rmse")
-        volume_rel_error_mean, volume_rel_error_std = aggregate_scalar("volume_rel_error")
-
-        return {
-            "valid": valid_mean,
-            "valid_std": valid_std,
-            "match_rate": match_rate_mean,
-            "match_rate_std": match_rate_std,
-            "rmse": rmse_mean,
-            "rmse_std": rmse_std,
-            "frac_rmse": frac_rmse_mean,
-            "frac_rmse_std": frac_rmse_std,
-            "detected_family_agreement": detected_family_agreement_mean,
-            "detected_family_agreement_std": detected_family_agreement_std,
-            "detected_sg_agreement": detected_sg_agreement_mean,
-            "detected_sg_agreement_std": detected_sg_agreement_std,
-            "lattice_lengths_rmse": lattice_lengths_rmse_mean,
-            "lattice_lengths_rmse_std": lattice_lengths_rmse_std,
-            "lattice_angles_rmse": lattice_angles_rmse_mean,
-            "lattice_angles_rmse_std": lattice_angles_rmse_std,
-            "volume_rel_error": volume_rel_error_mean,
-            "volume_rel_error_std": volume_rel_error_std,
-            "num_samples": pass_summaries[0].get("num_samples") if pass_summaries else 0,
-            "ablation_num_seeds": num_seeds,
-            "seed_summaries": seed_summaries,
-        }
+        single_seed = int(self.validation_cfg.get("sampling_seed", 0))
+        return collect_one_pass(seed=single_seed)
 
     def save_checkpoint(
         self,
         epoch: int,
         metrics: Mapping[str, float | int | None],
         filename: str,
-        keep_paths: list[Path] | None = None,
         *,
-        upload_to_wandb: bool = False,
-    ) -> Path:
-        path = save_named_checkpoint(
-            model=self.model,
-            optimizer=self.optimizer,
-            ema=self.ema,
-            time_sampler=self.time_sampler,
-            config=self.config,
-            experiment_name=self.experiment_name,
-            epoch=epoch,
-            metrics=metrics,
-            filename=filename,
-            keep_paths=keep_paths,
-        )
+        artifact_name: str,
+        aliases: list[str],
+    ) -> tuple[str, bool]:
+        if self.run is None or not bool(self.logging_cfg["wandb_checkpoints"]):
+            return artifact_name, False
 
-        if upload_to_wandb and bool(self.logging_cfg["wandb_checkpoints"]):
-            save_wandb_checkpoint(path)
+        with tempfile.TemporaryDirectory(prefix=f"{self.experiment_name}_checkpoint_") as temp_dir:
+            local_path = write_checkpoint_file(
+                model=self.model,
+                optimizer=self.optimizer,
+                ema=self.ema,
+                time_sampler=self.time_sampler,
+                output_path=Path(temp_dir) / filename,
+                config=self.config,
+                epoch=epoch,
+                metrics=metrics,
+            )
+            artifact = wandb.Artifact(artifact_name, type="model")
+            artifact.add_file(str(local_path), name=filename)
+            logged_artifact = self.run.log_artifact(artifact, aliases=aliases)
+            logged_artifact.wait()
+        clear_wandb_artifact_cache()
+        return artifact_name, True
 
-        return path
-
-    def save_validation_checkpoint_to_wandb(
+    def save_validation_checkpoint(
         self,
         epoch: int,
         metrics: Mapping[str, float | int | None],
-    ) -> bool:
-        from kldmPlus.utils.model_loader import save_checkpoint
-
+    ) -> tuple[str | None, bool]:
         if not bool(self.logging_cfg["wandb_checkpoints"]) or self.run is None:
-            return False
-        upload_every = int(
-            self.logging_cfg.get(
-                "validation_checkpoint_every_n_epochs",
-                self.validation_cfg.get("seeded_every_n_epochs", self.validate_every_epochs),
-            )
-        )
-        upload_start_epoch = int(self.logging_cfg.get("validation_checkpoint_start_epoch", 0))
-        if upload_every <= 0 or epoch <= upload_start_epoch or epoch % upload_every != 0:
-            return False
+            return None, False
+
+        filename = f"{self.experiment_name}_validation_epoch_{epoch}.pt"
+        artifact_name = f"{self.experiment_name}_validation"
+        previous_artifact = self._last_validation_artifact
+        previous_epoch = self._last_validation_artifact_epoch
+        if previous_artifact is None:
+            try:
+                entity = getattr(self.run, "entity", None)
+                project = getattr(self.run, "project", None)
+                if entity and project:
+                    previous_artifact = wandb.Api().artifact(
+                        f"{entity}/{project}/{artifact_name}:latest-validation",
+                        type="model",
+                    )
+            except Exception:
+                previous_artifact = None
 
         try:
-            with tempfile.TemporaryDirectory(prefix="kldm_val_ckpt_") as temp_dir_name:
-                path = Path(temp_dir_name) / f"epoch_{epoch}.pt"
-                save_checkpoint(
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    ema=self.ema,
-                    time_sampler=self.time_sampler,
-                    output_path=path,
-                    config=self.config,
-                    epoch=epoch,
-                    metrics=metrics,
-                )
-                artifact = wandb.Artifact(f"{self.experiment_name}_validation", type="model")
-                artifact.add_file(str(path), name=path.name)
-                logged_artifact = self.run.log_artifact(
-                    artifact,
-                    aliases=["latest-validation", f"epoch-{epoch}"],
-                )
-                logged_artifact.wait()
+            artifact_path, uploaded = self.save_checkpoint(
+                epoch,
+                metrics,
+                filename,
+                artifact_name=artifact_name,
+                aliases=["latest-validation", f"epoch-{epoch}"],
+            )
+            if not uploaded:
+                return None, False
+            self._last_validation_artifact_epoch = int(epoch)
+            self._last_validation_checkpoint_name = filename
 
-                previous_artifact = self._last_validation_artifact
-                previous_epoch = self._last_validation_artifact_epoch
-                self._last_validation_artifact = logged_artifact
-                self._last_validation_artifact_epoch = int(epoch)
-
-                if bool(self.logging_cfg.get("delete_previous_validation_artifacts", False)):
-                    if previous_artifact is not None:
-                        try:
-                            previous_artifact.delete(delete_aliases=True)
-                            print(
-                                f"checkpoint_deleted=wandb previous_validation epoch={previous_epoch}",
-                                flush=True,
-                            )
-                        except Exception as exc:
-                            print(
-                                f"checkpoint_delete_warning=wandb previous_validation epoch={previous_epoch} "
-                                f"error={exc}",
-                                flush=True,
-                            )
+            if previous_artifact is not None:
+                try:
+                    previous_artifact.delete(delete_aliases=True)
+                    print(
+                        f"checkpoint_deleted=wandb previous_validation epoch={previous_epoch}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"checkpoint_delete_warning=wandb previous_validation epoch={previous_epoch} "
+                        f"error={exc}",
+                        flush=True,
+                    )
+            prune_validation_artifact_cache(self.experiment_name)
+            clear_wandb_artifact_cache()
+            return artifact_path, True
         except Exception as exc:
             print(
                 f"checkpoint_upload_warning=wandb validation epoch={epoch} error={exc}",
                 flush=True,
             )
-            return False
+            clear_wandb_artifact_cache()
+            return None, False
 
-        return True
-
-    def _build_validation_ablation_band_figure(
+    def save_shutdown_checkpoint(
         self,
         *,
-        metric: str,
-        title: str,
-        y_label: str,
-    ):
-        history = self.validation_ablation_history
-        x = np.asarray(history["epoch"], dtype=float)
-        y = np.asarray(history[f"{metric}_mean"], dtype=float)
-        s = np.asarray(history[f"{metric}_std"], dtype=float)
+        epoch: int | None,
+        metrics: Mapping[str, float | int | None] | None,
+        reason: str,
+    ) -> str | None:
+        # Writes a final WandB checkpoint artifact so interrupted or completed runs can resume cleanly.
+        if epoch is None or metrics is None or self.run is None or not bool(self.logging_cfg["wandb_checkpoints"]):
+            return None
 
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.fill_between(x, y - s, y + s, alpha=0.25, label="±1 std")
-        ax.plot(x, y, marker="o", linewidth=2, label=f"mean {y_label}")
-        ax.set_title(title)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel(y_label)
-        ax.legend()
-        fig.tight_layout()
-        return fig
+        checkpoint_metrics = dict(metrics)
+        checkpoint_metrics["shutdown_requested"] = 1.0 if reason in {"stop_requested", "keyboard_interrupt"} else 0.0
+        checkpoint_metrics["completed_run"] = 1.0 if reason == "completed" else 0.0
 
-    def _log_validation_ablation_band_plots(
-        self,
-        *,
-        epoch: int,
-        val_sample_metrics: Mapping[str, Any],
-    ) -> None:
-        if self.run is None:
-            return
-        if not hasattr(wandb, "Image"):
-            if not self._warned_missing_wandb_image:
-                print(
-                    "validation_ablation_plot_warning=wandb.Image unavailable; skipping mean/std band plots",
-                    flush=True,
+        filename = f"{self.experiment_name}_latest_epoch_{epoch}.pt"
+        artifact_name = f"{self.experiment_name}_latest"
+        previous_artifact = None
+        try:
+            entity = getattr(self.run, "entity", None)
+            project = getattr(self.run, "project", None)
+            if entity and project:
+                previous_artifact = wandb.Api().artifact(
+                    f"{entity}/{project}/{artifact_name}:latest",
+                    type="model",
                 )
-                self._warned_missing_wandb_image = True
-            return
-        rmse_std = val_sample_metrics.get("rmse_std")
-        match_rate_std = val_sample_metrics.get("match_rate_std")
-        valid_std = val_sample_metrics.get("valid_std")
-        if rmse_std is None or match_rate_std is None or valid_std is None:
-            return
+        except Exception:
+            previous_artifact = None
 
-        history = self.validation_ablation_history
-        history["epoch"].append(float(epoch))
-        history["rmse_mean"].append(float(val_sample_metrics["rmse"]))
-        history["rmse_std"].append(float(rmse_std))
-        history["match_rate_mean"].append(float(val_sample_metrics["match_rate"]))
-        history["match_rate_std"].append(float(match_rate_std))
-        history["valid_mean"].append(float(val_sample_metrics["valid"]))
-        history["valid_std"].append(float(valid_std))
-
-        rmse_fig = self._build_validation_ablation_band_figure(
-            metric="rmse",
-            title="Validation RMSE across sampling seeds",
-            y_label="RMSE",
+        artifact_path, uploaded = self.save_checkpoint(
+            epoch=epoch,
+            metrics=checkpoint_metrics,
+            filename=filename,
+            artifact_name=artifact_name,
+            aliases=["latest", f"epoch-{epoch}", reason],
         )
-        match_rate_fig = self._build_validation_ablation_band_figure(
-            metric="match_rate",
-            title="Validation match rate across sampling seeds",
-            y_label="Match rate",
-        )
-        valid_fig = self._build_validation_ablation_band_figure(
-            metric="valid",
-            title="Validation validity across sampling seeds",
-            y_label="Validity",
-        )
-        self.run.log(
-            {
-                "epoch": epoch,
-                "val_sampling/rmse_mean_std_plot": wandb.Image(rmse_fig),
-                "val_sampling/match_rate_mean_std_plot": wandb.Image(match_rate_fig),
-                "val_sampling/valid_mean_std_plot": wandb.Image(valid_fig),
-            },
-            step=epoch,
-        )
-
-        plt.close(rmse_fig)
-        plt.close(match_rate_fig)
-        plt.close(valid_fig)
+        if not uploaded:
+            return None
+        try:
+            if previous_artifact is None:
+                return artifact_path
+            previous_artifact.delete(delete_aliases=True)
+        except Exception as exc:
+            print(f"checkpoint_delete_warning=wandb previous_latest error={exc}", flush=True)
+        clear_wandb_artifact_cache()
+        return artifact_path
 
     def validate_epoch(self, epoch: int) -> None:
         # Match facitKLDM semantics:
@@ -1080,8 +1096,24 @@ class ExperimentRunner:
             "loss_v": val_loss_metrics["loss_v"],
             "loss_l": val_loss_metrics["loss_l"],
             "loss_sg_lattice": val_loss_metrics["loss_sg_lattice"],
+            "loss_sg_lattice_weighted": val_loss_metrics["loss_sg_lattice_weighted"],
+            "loss_sg_lattice_lambda_scaled": val_loss_metrics["loss_sg_lattice_lambda_scaled"],
+            "loss_conv_sg": val_loss_metrics["loss_conv_sg"],
+            "loss_conv_sg_weighted": val_loss_metrics["loss_conv_sg_weighted"],
+            "loss_conv_sg_lambda_scaled": val_loss_metrics["loss_conv_sg_lambda_scaled"],
+            "lambda_sg_lattice": val_loss_metrics["lambda_sg_lattice"],
+            "lambda_conv_sg": val_loss_metrics["lambda_conv_sg"],
+            "lattice_sg_time_weight_mean": val_loss_metrics["lattice_sg_time_weight_mean"],
+            "conv_sg_time_weight_mean": val_loss_metrics["conv_sg_time_weight_mean"],
+            "conv_weight_mean": val_loss_metrics["conv_weight_mean"],
             "projection_error_pred_k": val_loss_metrics["projection_error_pred_k"],
             "projection_error_gt_k": val_loss_metrics["projection_error_gt_k"],
+            "primitive_projection_error_pred_k": val_loss_metrics["primitive_projection_error_pred_k"],
+            "primitive_projection_error_gt_k": val_loss_metrics["primitive_projection_error_gt_k"],
+            "conv_projection_error_pred_k": val_loss_metrics["conv_projection_error_pred_k"],
+            "conv_projection_error_gt_k": val_loss_metrics["conv_projection_error_gt_k"],
+            "projection_error_pred_orbit_k": val_loss_metrics["projection_error_pred_orbit_k"],
+            "projection_error_gt_orbit_k": val_loss_metrics["projection_error_gt_orbit_k"],
             "loss_v_weighted": val_loss_metrics["loss_v_weighted"],
             "loss_l_weighted": val_loss_metrics["loss_l_weighted"],
             "loss_weighted": val_loss_metrics["loss_weighted"],
@@ -1091,33 +1123,42 @@ class ExperimentRunner:
             "frac_rmse": val_sample_metrics.get("frac_rmse"),
             "detected_family_agreement": val_sample_metrics.get("detected_family_agreement"),
             "detected_sg_agreement": val_sample_metrics.get("detected_sg_agreement"),
+            "wyckoff_letter_agreement": val_sample_metrics.get("wyckoff_letter_agreement"),
+            "predicted_wyckoff_dimensionality_distribution": val_sample_metrics.get("predicted_wyckoff_dimensionality_distribution"),
+            "target_wyckoff_dimensionality_distribution": val_sample_metrics.get("target_wyckoff_dimensionality_distribution"),
             "lattice_lengths_rmse": val_sample_metrics.get("lattice_lengths_rmse"),
             "lattice_angles_rmse": val_sample_metrics.get("lattice_angles_rmse"),
             "volume_rel_error": val_sample_metrics.get("volume_rel_error"),
+            "sample_projection_error_pred_direct_k": val_sample_metrics.get("projection_error_pred_direct_k"),
+            "sample_projection_error_gt_direct_k": val_sample_metrics.get("projection_error_gt_direct_k"),
+            "sample_projection_error_pred_orbit_k": val_sample_metrics.get("projection_error_pred_orbit_k"),
+            "sample_projection_error_gt_orbit_k": val_sample_metrics.get("projection_error_gt_orbit_k"),
         }
-        if "valid_std" in val_sample_metrics:
-            merged_metrics["valid_std"] = val_sample_metrics["valid_std"]
-        if "match_rate_std" in val_sample_metrics:
-            merged_metrics["match_rate_std"] = val_sample_metrics["match_rate_std"]
-        if "rmse_std" in val_sample_metrics:
-            merged_metrics["rmse_std"] = val_sample_metrics["rmse_std"]
-        for key in (
-            "frac_rmse_std",
-            "detected_family_agreement_std",
-            "detected_sg_agreement_std",
-            "lattice_lengths_rmse_std",
-            "lattice_angles_rmse_std",
-            "volume_rel_error_std",
-        ):
-            if key in val_sample_metrics:
-                merged_metrics[key] = val_sample_metrics[key]
         log_data = {
             "epoch": epoch,
             "val/loss_v": merged_metrics["loss_v"],
             "val/loss_l": merged_metrics["loss_l"],
             "val/loss_sg_lattice": merged_metrics["loss_sg_lattice"],
+            "val/loss_sg_lattice_weighted": merged_metrics["loss_sg_lattice_weighted"],
+            "val/loss_sg_lattice_lambda_scaled": merged_metrics["loss_sg_lattice_lambda_scaled"],
+            "val/loss_conv_sg": merged_metrics["loss_conv_sg"],
+            "val/loss_conv_sg_weighted": merged_metrics["loss_conv_sg_weighted"],
+            "val/loss_conv_sg_lambda_scaled": merged_metrics["loss_conv_sg_lambda_scaled"],
+            "val/lambda_sg_lattice": merged_metrics["lambda_sg_lattice"],
+            "val/lambda_conv_sg": merged_metrics["lambda_conv_sg"],
+            "val/lattice_sg_time_weight_mean": merged_metrics["lattice_sg_time_weight_mean"],
+            "val/conv_sg_time_weight_mean": merged_metrics["conv_sg_time_weight_mean"],
+            "val/conv_weight_mean": merged_metrics["conv_weight_mean"],
             "val/projection_error_pred_k": merged_metrics["projection_error_pred_k"],
             "val/projection_error_gt_k": merged_metrics["projection_error_gt_k"],
+            "val/primitive_projection_error_pred_k": merged_metrics["primitive_projection_error_pred_k"],
+            "val/primitive_projection_error_gt_k": merged_metrics["primitive_projection_error_gt_k"],
+            "val/conv_projection_error_pred_k": merged_metrics["conv_projection_error_pred_k"],
+            "val/conv_projection_error_gt_k": merged_metrics["conv_projection_error_gt_k"],
+            "val/projection_error_pred_direct_k": merged_metrics["projection_error_pred_k"],
+            "val/projection_error_gt_direct_k": merged_metrics["projection_error_gt_k"],
+            "val/projection_error_pred_orbit_k": merged_metrics["projection_error_pred_orbit_k"],
+            "val/projection_error_gt_orbit_k": merged_metrics["projection_error_gt_orbit_k"],
             "val/loss_v_weighted": merged_metrics["loss_v_weighted"],
             "val/loss_l_weighted": merged_metrics["loss_l_weighted"],
             "val/loss_weighted": merged_metrics["loss_weighted"],
@@ -1127,40 +1168,37 @@ class ExperimentRunner:
             "val/frac_rmse": merged_metrics["frac_rmse"],
             "val/detected_family_agreement": merged_metrics["detected_family_agreement"],
             "val/detected_sg_agreement": merged_metrics["detected_sg_agreement"],
+            "val/wyckoff_letter_agreement": merged_metrics["wyckoff_letter_agreement"],
             "val/lattice_lengths_rmse": merged_metrics["lattice_lengths_rmse"],
             "val/lattice_angles_rmse": merged_metrics["lattice_angles_rmse"],
             "val/volume_rel_error": merged_metrics["volume_rel_error"],
+            "val/sample_projection_error_pred_direct_k": merged_metrics["sample_projection_error_pred_direct_k"],
+            "val/sample_projection_error_gt_direct_k": merged_metrics["sample_projection_error_gt_direct_k"],
+            "val/sample_projection_error_pred_orbit_k": merged_metrics["sample_projection_error_pred_orbit_k"],
+            "val/sample_projection_error_gt_orbit_k": merged_metrics["sample_projection_error_gt_orbit_k"],
         }
-        if "valid_std" in merged_metrics:
-            log_data["val/valid_std"] = merged_metrics["valid_std"]
-        if "match_rate_std" in merged_metrics:
-            log_data["val/match_rate_std"] = merged_metrics["match_rate_std"]
-        if "rmse_std" in merged_metrics:
-            log_data["val/rmse_std"] = merged_metrics["rmse_std"]
-        for key in (
-            "frac_rmse_std",
-            "detected_family_agreement_std",
-            "detected_sg_agreement_std",
-            "lattice_lengths_rmse_std",
-            "lattice_angles_rmse_std",
-            "volume_rel_error_std",
-        ):
-            if key in merged_metrics:
-                log_data[f"val/{key}"] = merged_metrics[key]
         self.run.log(log_data, step=epoch)
-        self._log_validation_ablation_band_plots(
-            epoch=epoch,
-            val_sample_metrics=val_sample_metrics,
-        )
 
-        checkpoint_uploaded = self.save_validation_checkpoint_to_wandb(epoch, merged_metrics)
+        checkpoint_path, checkpoint_uploaded = self.save_validation_checkpoint(epoch, merged_metrics)
 
         print(
             f"validation_epoch={epoch:04d} val_loss_weighted={merged_metrics['loss_weighted']:.6f} "
             f"(loss_v={merged_metrics['loss_v']:.6f}, loss_l={merged_metrics['loss_l']:.6f}, "
             f"loss_sg_lattice={merged_metrics['loss_sg_lattice']:.6f}, "
+            f"loss_sg_lambda_scaled={merged_metrics['loss_sg_lattice_lambda_scaled']:.6f}, "
+            f"loss_conv_sg={merged_metrics['loss_conv_sg']:.6f}, "
+            f"loss_conv_lambda_scaled={merged_metrics['loss_conv_sg_lambda_scaled']:.6f}, "
+            f"lambda_sg={merged_metrics['lambda_sg_lattice']:.6f}, "
+            f"lambda_conv_sg={merged_metrics['lambda_conv_sg']:.6f}, "
+            f"sg_time_weight={merged_metrics['lattice_sg_time_weight_mean']:.6f}, "
+            f"conv_time_weight={merged_metrics['conv_sg_time_weight_mean']:.6f}, "
+            f"conv_weight={merged_metrics['conv_weight_mean']:.6f}, "
             f"proj_pred_k={merged_metrics['projection_error_pred_k']:.6f}, "
             f"proj_gt_k={merged_metrics['projection_error_gt_k']:.6f}, "
+            f"conv_proj_pred_k={merged_metrics['conv_projection_error_pred_k']:.6f}, "
+            f"conv_proj_gt_k={merged_metrics['conv_projection_error_gt_k']:.6f}, "
+            f"proj_pred_orbit_k={merged_metrics['projection_error_pred_orbit_k']:.6f}, "
+            f"proj_gt_orbit_k={merged_metrics['projection_error_gt_orbit_k']:.6f}, "
             f"loss_v_weighted={merged_metrics['loss_v_weighted']:.6f}, "
             f"loss_l_weighted={merged_metrics['loss_l_weighted']:.6f}) "
             f"valid={format_metric(merged_metrics['valid'], '.4f')} "
@@ -1169,43 +1207,21 @@ class ExperimentRunner:
             f"frac_rmse={format_metric(merged_metrics['frac_rmse'], '.6f')} "
             f"family_agreement={format_metric(merged_metrics['detected_family_agreement'], '.4f')} "
             f"sg_agreement={format_metric(merged_metrics['detected_sg_agreement'], '.4f')} "
+            f"wyckoff_letter_agreement={format_metric(merged_metrics['wyckoff_letter_agreement'], '.4f')} "
+            f"sample_proj_pred_direct_k={format_metric(merged_metrics['sample_projection_error_pred_direct_k'], '.6f')} "
+            f"sample_proj_pred_orbit_k={format_metric(merged_metrics['sample_projection_error_pred_orbit_k'], '.6f')} "
             f"lengths_rmse={format_metric(merged_metrics['lattice_lengths_rmse'], '.6f')} "
             f"angles_rmse={format_metric(merged_metrics['lattice_angles_rmse'], '.6f')} "
             f"volume_rel_error={format_metric(merged_metrics['volume_rel_error'], '.6f')}",
             flush=True,
         )
-        if (
-            "valid_std" in merged_metrics
-            or "match_rate_std" in merged_metrics
-            or "rmse_std" in merged_metrics
-        ):
-            print(
-                f"validation_epoch_std={epoch:04d} "
-                f"valid_std={format_metric(merged_metrics.get('valid_std'), '.4f')} "
-                f"match_rate_std={format_metric(merged_metrics.get('match_rate_std'), '.4f')} "
-                f"rmse_std={format_metric(merged_metrics.get('rmse_std'), '.6f')}",
-                flush=True,
-            )
-        seed_summaries = val_sample_metrics.get("seed_summaries", [])
-        if seed_summaries:
-            backup_payload = {
-                "epoch": epoch,
-                "num_seeds": val_sample_metrics.get("ablation_num_seeds"),
-                "seeds": [int(summary["seed"]) for summary in seed_summaries],
-                "valid_values": [summary.get("valid") for summary in seed_summaries],
-                "valid_mean": merged_metrics.get("valid"),
-                "valid_std": merged_metrics.get("valid_std"),
-                "match_rate_values": [summary.get("match_rate") for summary in seed_summaries],
-                "match_rate_mean": merged_metrics.get("match_rate"),
-                "match_rate_std": merged_metrics.get("match_rate_std"),
-                "rmse_values": [summary.get("rmse") for summary in seed_summaries],
-                "rmse_mean": merged_metrics.get("rmse"),
-                "rmse_std": merged_metrics.get("rmse_std"),
-            }
-            print(
-                f"validation_ablation_backup={json.dumps(backup_payload, sort_keys=True)}",
-                flush=True,
-            )
+        print(
+            "validation_wyckoff_dimensionality "
+            f"pred={merged_metrics['predicted_wyckoff_dimensionality_distribution']} "
+            f"target={merged_metrics['target_wyckoff_dimensionality_distribution']}",
+            flush=True,
+        )
+        print(f"validation_checkpoint_saved path={checkpoint_path} epoch={epoch}", flush=True)
         if checkpoint_uploaded:
             print(f"checkpoint_uploaded=wandb epoch={epoch}", flush=True)
 
@@ -1234,18 +1250,31 @@ class ExperimentRunner:
         print(f"time_sampler={self.config.get('time_sampler', {'type': 'uniform'})}", flush=True)
         print(f"sampler={self.sampler_cfg}", flush=True)
         print(
+            "model_lattice_weights "
+            f"lambda_l={float(getattr(self.model, 'lambda_l', 1.0)):.6f} "
+            f"lambda_sg_lattice={float(getattr(self.model, 'lattice_sg_lambda', 0.0)):.6f} "
+            f"lattice_sg_time_weight={getattr(self.model, 'lattice_sg_time_weight', 'none')} "
+            f"lambda_conv_sg={float(getattr(self.model, 'lambda_conv_sg', 0.0)):.6f} "
+            f"conv_sg_time_weight={getattr(self.model, 'conv_sg_time_weight', 'none')} "
+            f"orbit_metric_max_candidates={getattr(self.model, 'lattice_orbit_metric_max_candidates', None)}",
+            flush=True,
+        )
+        print(
             f"validation_schedule every_n_epochs={self.validate_every_epochs} "
-            f"seeded_start_epoch={int(self.validation_cfg.get('seeded_start_epoch', 4000))} "
-            f"seeded_every_n_epochs={int(self.validation_cfg.get('seeded_every_n_epochs', 200))} "
-            f"ablation_num_seeds={int(self.validation_cfg.get('ablation_num_seeds', 4))}",
+            f"sampling_seed={int(self.validation_cfg.get('sampling_seed', 0))}",
             flush=True,
         )
 
         epoch = self.start_epoch + 1
         interrupted = False
+        last_completed_epoch: int | None = None
+        last_metrics: dict[str, float | int | None] | None = None
+        shutdown_reason = "completed"
         try:
             while not should_stop(self.run) and (self.max_epochs is None or epoch <= self.max_epochs):
                 train_metrics = self.train_epoch(epoch)
+                last_completed_epoch = epoch
+                last_metrics = dict(train_metrics)
 
                 if epoch % self.train_every_epochs == 0:
                     log_data = {
@@ -1253,8 +1282,26 @@ class ExperimentRunner:
                         "train/loss_v": train_metrics["loss_v"],
                         "train/loss_l": train_metrics["loss_l"],
                         "train/loss_sg_lattice": train_metrics["loss_sg_lattice"],
+                        "train/loss_sg_lattice_weighted": train_metrics["loss_sg_lattice_weighted"],
+                        "train/loss_sg_lattice_lambda_scaled": train_metrics["loss_sg_lattice_lambda_scaled"],
+                        "train/loss_conv_sg": train_metrics["loss_conv_sg"],
+                        "train/loss_conv_sg_weighted": train_metrics["loss_conv_sg_weighted"],
+                        "train/loss_conv_sg_lambda_scaled": train_metrics["loss_conv_sg_lambda_scaled"],
+                        "train/lambda_sg_lattice": train_metrics["lambda_sg_lattice"],
+                        "train/lambda_conv_sg": train_metrics["lambda_conv_sg"],
+                        "train/lattice_sg_time_weight_mean": train_metrics["lattice_sg_time_weight_mean"],
+                        "train/conv_sg_time_weight_mean": train_metrics["conv_sg_time_weight_mean"],
+                        "train/conv_weight_mean": train_metrics["conv_weight_mean"],
                         "train/projection_error_pred_k": train_metrics["projection_error_pred_k"],
                         "train/projection_error_gt_k": train_metrics["projection_error_gt_k"],
+                        "train/primitive_projection_error_pred_k": train_metrics["primitive_projection_error_pred_k"],
+                        "train/primitive_projection_error_gt_k": train_metrics["primitive_projection_error_gt_k"],
+                        "train/conv_projection_error_pred_k": train_metrics["conv_projection_error_pred_k"],
+                        "train/conv_projection_error_gt_k": train_metrics["conv_projection_error_gt_k"],
+                        "train/projection_error_pred_direct_k": train_metrics["projection_error_pred_direct_k"],
+                        "train/projection_error_gt_direct_k": train_metrics["projection_error_gt_direct_k"],
+                        "train/projection_error_pred_orbit_k": train_metrics["projection_error_pred_orbit_k"],
+                        "train/projection_error_gt_orbit_k": train_metrics["projection_error_gt_orbit_k"],
                         "train/loss_v_weighted": train_metrics["loss_v_weighted"],
                         "train/loss_l_weighted": train_metrics["loss_l_weighted"],
                         "train/loss_weighted": train_metrics["loss_weighted"],
@@ -1268,8 +1315,20 @@ class ExperimentRunner:
                         f"epoch={epoch:04d} train_loss_weighted={train_metrics['loss_weighted']:.6f} "
                         f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f}, "
                         f"loss_sg_lattice={train_metrics['loss_sg_lattice']:.6f}, "
+                        f"loss_sg_lambda_scaled={train_metrics['loss_sg_lattice_lambda_scaled']:.6f}, "
+                        f"loss_conv_sg={train_metrics['loss_conv_sg']:.6f}, "
+                        f"loss_conv_lambda_scaled={train_metrics['loss_conv_sg_lambda_scaled']:.6f}, "
+                        f"lambda_sg={train_metrics['lambda_sg_lattice']:.6f}, "
+                        f"lambda_conv_sg={train_metrics['lambda_conv_sg']:.6f}, "
+                        f"sg_time_weight={train_metrics['lattice_sg_time_weight_mean']:.6f}, "
+                        f"conv_time_weight={train_metrics['conv_sg_time_weight_mean']:.6f}, "
+                        f"conv_weight={train_metrics['conv_weight_mean']:.6f}, "
                         f"proj_pred_k={train_metrics['projection_error_pred_k']:.6f}, "
                         f"proj_gt_k={train_metrics['projection_error_gt_k']:.6f}, "
+                        f"conv_proj_pred_k={train_metrics['conv_projection_error_pred_k']:.6f}, "
+                        f"conv_proj_gt_k={train_metrics['conv_projection_error_gt_k']:.6f}, "
+                        f"proj_pred_orbit_k={train_metrics['projection_error_pred_orbit_k']:.6f}, "
+                        f"proj_gt_orbit_k={train_metrics['projection_error_gt_orbit_k']:.6f}, "
                         f"loss_v_weighted={train_metrics['loss_v_weighted']:.6f}, "
                         f"loss_l_weighted={train_metrics['loss_l_weighted']:.6f})",
                         flush=True,
@@ -1278,64 +1337,33 @@ class ExperimentRunner:
                 if not should_stop(self.run):
                     validate_now = self.validate_every_epochs > 0 and epoch % self.validate_every_epochs == 0
                     if validate_now:
-                        original_validation_cfg = dict(self.validation_cfg)
-                        try:
-                            seeded_start_epoch = int(
-                                original_validation_cfg.get("seeded_start_epoch", 4000)
-                            )
-                            seeded_every_epochs = int(
-                                original_validation_cfg.get("seeded_every_n_epochs", 200)
-                            )
-                            run_seeded_ablation = (
-                                bool(original_validation_cfg.get("ablation", False))
-                                and epoch > seeded_start_epoch
-                                and seeded_every_epochs > 0
-                                and epoch % seeded_every_epochs == 0
-                            )
-                            self.validation_cfg["ablation"] = run_seeded_ablation
-                            self.validation_cfg["ablation_num_seeds"] = (
-                                int(original_validation_cfg.get("ablation_num_seeds", 4))
-                                if run_seeded_ablation
-                                else 1
-                            )
-                            self.validate_epoch(epoch)
-                        finally:
-                            self.validation_cfg = original_validation_cfg
+                        self.validate_epoch(epoch)
+                else:
+                    shutdown_reason = "stop_requested"
+                    break
 
                 epoch += 1
+
+            if should_stop(self.run) and shutdown_reason != "stop_requested":
+                shutdown_reason = "stop_requested"
         except KeyboardInterrupt:
             interrupted = True
+            shutdown_reason = "keyboard_interrupt"
             print("run_experiment interrupted", flush=True)
         finally:
-            final_epoch = max(epoch - 1, self.start_epoch)
-            final_filename = f"{self.experiment_name}_epoch_{final_epoch}.pt"
-
-            # Save exactly one local checkpoint for the experiment: the final model.
-            final_path = self.save_checkpoint(
-                final_epoch,
-                {"final_epoch": float(final_epoch)},
-                final_filename,
-                upload_to_wandb=False,
+            checkpoint_path = self.save_shutdown_checkpoint(
+                epoch=last_completed_epoch,
+                metrics=last_metrics,
+                reason=shutdown_reason,
             )
-            shutdown_requested = interrupted or STOP_REQUESTED or should_stop(self.run)
-            seeded_start_epoch = int(self.validation_cfg.get("seeded_start_epoch", 4000))
-            if shutdown_requested and final_epoch < seeded_start_epoch:
-                shutdown_filename = f"{self.experiment_name}_shutdown_epoch_{final_epoch}.pt"
-                shutdown_path = self.save_checkpoint(
-                    final_epoch,
-                    {
-                        "shutdown_epoch": float(final_epoch),
-                        "stop_requested": float(STOP_REQUESTED),
-                        "keyboard_interrupt": float(interrupted),
-                    },
-                    shutdown_filename,
-                    keep_paths=[final_path],
-                    upload_to_wandb=bool(self.checkpoint_cfg.get("upload_shutdown_to_wandb", False)),
-                )
+            if checkpoint_path is not None:
                 print(
-                    f"shutdown_checkpoint_saved path={shutdown_path} epoch={final_epoch}",
+                    f"shutdown_checkpoint_saved path={checkpoint_path} epoch={last_completed_epoch} "
+                    f"reason={shutdown_reason}",
                     flush=True,
                 )
+            clear_local_checkpoint_dir(self.config, self.experiment_name)
+            clear_wandb_artifact_cache()
             if self.run is not None:
                 self.run.finish()
 

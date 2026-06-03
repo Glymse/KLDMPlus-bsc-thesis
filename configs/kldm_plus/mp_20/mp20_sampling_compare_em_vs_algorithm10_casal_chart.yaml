@@ -7,6 +7,7 @@ dataset:
   num_workers: 0
 
 model:
+  lambda_l: 2.0
   lattice_parameterization: eps
   lattice_diffusion_type: VP
   wrapped_normal_K: 3

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
-from torch_geometric.data import Batch, Data
+
+try:
+    from torch_geometric.data import Batch, Data
+except ImportError:  # pragma: no cover
+    Batch = Data = Any
 
 
 @dataclass(frozen=True)

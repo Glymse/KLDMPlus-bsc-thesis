@@ -58,7 +58,6 @@ class TrivialisedDiffusion(nn.Module):
         sigma_norm_density_K: int | None = None,
         sigma_norm_grid_points: int = 4096,
         sigma_norm_mc_samples: int = 20000,
-        centered_sigma_norm_correction: bool = False,
     ) -> None:
         super().__init__()
 
@@ -71,7 +70,6 @@ class TrivialisedDiffusion(nn.Module):
         self.sigma_norm_density_K = sigma_norm_density_K
         self.sigma_norm_grid_points = int(sigma_norm_grid_points)
         self.sigma_norm_mc_samples = int(sigma_norm_mc_samples)
-        self.centered_sigma_norm_correction = bool(centered_sigma_norm_correction)
 
         if self.compute_sigma_norm:
             sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.T, int(n_sigmas)))
@@ -104,21 +102,9 @@ class TrivialisedDiffusion(nn.Module):
     def sigma_norm_factor(
         self,
         t: torch.Tensor,
-        index: torch.Tensor,
         ref: torch.Tensor,
     ) -> torch.Tensor:
-        # Build the sqrt sigma-norm factor, optionally corrected for graph-wise centering.
         sigma_norm = self.sigma_norm_t(t).clamp_min(self.eps)
-
-        if self.centered_sigma_norm_correction:
-            num_graphs = int(index.max().item()) + 1
-            counts = torch.bincount(index, minlength=num_graphs).to(
-                device=ref.device,
-                dtype=ref.dtype,
-            )
-            count_per_atom = counts[index].clamp_min(1.0)
-            center_factor = ((count_per_atom - 1.0) / count_per_atom).clamp_min(self.eps)
-            sigma_norm = sigma_norm * center_factor
 
         return self.match_dims(torch.sqrt(sigma_norm).clamp_min(self.eps), ref)
 
@@ -349,7 +335,7 @@ class TrivialisedDiffusion(nn.Module):
         # sigma_norm rescales the simplified target so the network.
         # This is done instead of lambda(t)*MSE. The idea
         # Is initally found in the torus diffusion paper (ref in theises).
-        sigma_norm_t = self.sigma_norm_factor(t=t, index=index, ref=target)
+        sigma_norm_t = self.sigma_norm_factor(t=t, ref=target)
 
         return target / self.match_dims(
             ((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t))).clamp_min(self.eps),
@@ -389,7 +375,7 @@ class TrivialisedDiffusion(nn.Module):
 
         # Undo the sigma_norm normalization that was applied to the target
         # during training.
-        sigma_norm_t = self.sigma_norm_factor(t=t, index=index, ref=pred_v)
+        sigma_norm_t = self.sigma_norm_factor(t=t, ref=pred_v)
 
         # gaussian_velocity_sigma(t) is the pre-scaling standard deviation, so
         # the actual velocity variance in the unit chart is

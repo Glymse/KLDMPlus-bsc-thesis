@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from kldmPlus.latticeSymmetry import LatticeSymmetry
+from kldmPlus.symmetry.latticeSymmetry import LatticeSymmetry
 
 try:
     from torch_geometric.utils import dense_to_sparse
@@ -23,6 +23,14 @@ except ImportError:  # pragma: no cover
 
     class Transform:  # type: ignore[override]
         pass
+
+try:
+    from pymatgen.core import Lattice, Structure
+    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+except ImportError:  # pragma: no cover
+    Lattice = None
+    Structure = None
+    SpacegroupAnalyzer = None
 
 
 # Atomic vocabulary used when atom types are represented by indices.
@@ -560,12 +568,64 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
         )
         self.lattice_symmetry = LatticeSymmetry(eps=eps)
 
+    def _conventional_chart_transform(
+        self,
+        sample: ChemGraph,
+        raw_cell: torch.Tensor,
+        primitive_chart_cell: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute row-convention C with L_conventional ~= C @ L_primitive."""
+        eye = torch.eye(3, device=raw_cell.device, dtype=raw_cell.dtype)
+        zero = torch.zeros((), device=raw_cell.device, dtype=raw_cell.dtype)
+        if Lattice is None or Structure is None or SpacegroupAnalyzer is None:
+            return eye, zero, torch.full((), float("inf"), device=raw_cell.device, dtype=raw_cell.dtype)
+
+        try:
+            species = torch.as_tensor(sample.atomic_numbers).reshape(-1).detach().cpu().tolist()
+            frac = torch.as_tensor(sample.pos).detach().cpu().numpy()
+            cell_np = raw_cell.detach().cpu().numpy()
+            structure = Structure(
+                Lattice(cell_np),
+                species,
+                frac,
+                coords_are_cartesian=False,
+            )
+            conventional = SpacegroupAnalyzer(
+                structure,
+                symprec=0.1,
+                angle_tolerance=5.0,
+            ).get_conventional_standard_structure()
+            conv_cell = torch.as_tensor(
+                conventional.lattice.matrix,
+                device=raw_cell.device,
+                dtype=raw_cell.dtype,
+            )
+            transform = conv_cell @ torch.linalg.pinv(primitive_chart_cell)
+            fit_error = (transform @ primitive_chart_cell - conv_cell).abs().max()
+            weight = (fit_error <= 1.0e-4).to(dtype=raw_cell.dtype)
+            return transform, weight, fit_error
+        except Exception:
+            return eye, zero, torch.full((), float("inf"), device=raw_cell.device, dtype=raw_cell.dtype)
+
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         cell = sample.cell.squeeze(0)
         with torch.no_grad():
             cell_batch = cell.reshape(1, 3, 3)
-            k = self.lattice_symmetry.m2v(self.lattice_symmetry.de_so3(cell_batch)).squeeze(0)
-        return sample.replace(**{self.out_key: k.view(1, 6)})
+            primitive_chart_cell = self.lattice_symmetry.de_so3(cell_batch).squeeze(0)
+            k = self.lattice_symmetry.m2v(primitive_chart_cell.reshape(1, 3, 3)).squeeze(0)
+            conv_C, conv_weight, conv_fit_error = self._conventional_chart_transform(
+                sample,
+                raw_cell=cell,
+                primitive_chart_cell=primitive_chart_cell,
+            )
+        return sample.replace(
+            **{
+                self.out_key: k.view(1, 6),
+                "conv_C": conv_C.view(1, 3, 3),
+                "conv_weight": conv_weight.view(1),
+                "conv_fit_error": conv_fit_error.view(1),
+            }
+        )
 
     def invert_to_matrix(
         self,

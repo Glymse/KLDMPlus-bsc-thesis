@@ -1,23 +1,25 @@
-experiment_name: plus_mp20_lattice_eps_em_mc_uniform
+experiment_name: plus_mp20_baseline_x0_em_mc_fixed_ema_a100
 sampler_config: ../../samplers/euler_maruyama.yaml
 
 dataset:
   task: csp
   name: mp20
-  lattice_representation: kldm # fixed KLDMPlus lattice representation
+  lattice_representation: kldm
   root: null
   batch_size: 256
   num_workers: 1
   pin_memory: true
+  train_subset_seed: 2002
 
 time_sampler:
   type: uniform
 
 model:
   eps: 1.0e-6
-  lambda_l: 2.0
-  lattice_parameterization: eps # alternatives: eps, x0
-  lattice_diffusion_type: VP # fixed KLDMPlus lattice diffusion
+  lambda_l: 1.0
+  lattice_parameterization: x0
+  lattice_diffusion_type: VP
+  lattice_representation: kldm
   wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: true
@@ -47,26 +49,32 @@ optimizer:
 
 ema:
   enabled: true
-  type: power
-  gamma: 6.94
+  type: fixed
+  decay: 0.999
+  start_epoch: 500
+
+training:
+  max_epochs: 12000
 
 logging:
   train_every_epochs: 1
   wandb_checkpoints: true
-  wandb_project: plus_mp20_lattice_eps_em_ablation
-  wandb_run_name: mc_uniform
+  wandb_project: kldmplus_mp20_em_12000
+  wandb_run_name: plus_mp20_baseline_x0_em_mc_fixed_ema_a100
 
 validation:
-  every_n_epochs: 100
+  every_n_epochs: 200
   sampling_seed: 0
-  ema_val: true # Facit-style behavior in kldmPlus: validation loss stays on the online model; sampling metrics (valid, match_rate, rmse) use EMA when available.
-  subset_size: 1024
+  loss_seed: 2019
+  ema_val: true
+  subset_size: null
   subset_seed: 123
-  sampling_max_graphs: 1024
+  sampling_max_graphs: null
 
 checkpoint:
   resume_from: null
   wandb_resume_id: null
+  prune_wandb_artifact_cache: true
 
 sampling_eval:
   split: test

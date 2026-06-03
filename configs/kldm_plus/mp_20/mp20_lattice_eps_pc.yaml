@@ -11,21 +11,11 @@ dataset:
   pin_memory: true
 
 time_sampler:
-  type: loss_second_moment
-  n_bins: 64
-  history_per_bin: 10
-  alpha: 0.5
-  min_prob: 0.002
-  max_prob: 0.10
-  velocity_weight: 0.7
-  lattice_weight: 0.3
-  use_importance_weights: false
-  clip_importance_weights: true
-  weight_clip_min: 0.5
-  weight_clip_max: 2.0
+  type: uniform
 
 model:
   eps: 1.0e-6
+  lambda_l: 2.0
   lattice_parameterization: eps # alternatives: eps, x0
   lattice_diffusion_type: VP # fixed KLDMPlus lattice diffusion
   wrapped_normal_K: 3
@@ -36,7 +26,6 @@ model:
   tdm_sigma_norm_density_K: 40
   tdm_sigma_norm_grid_points: 8193
   tdm_sigma_norm_mc_samples: 20000
-  tdm_centered_sigma_norm_correction: false
   score_network:
     hidden_dim: 512
     time_dim: 256
@@ -67,9 +56,7 @@ logging:
 
 validation:
   every_n_epochs: 100
-  ablation: true # match paper-style validation by repeating sampling with multiple seeds and logging mean/std
-  ablation_num_seeds: 4
-  ablation_seed_offset: 0
+  sampling_seed: 0
   ema_val: true # Facit-style behavior in kldmPlus: validation loss stays on the online model; sampling metrics (valid, match_rate, rmse) use EMA when available.
   subset_size: 1024
   subset_seed: 123

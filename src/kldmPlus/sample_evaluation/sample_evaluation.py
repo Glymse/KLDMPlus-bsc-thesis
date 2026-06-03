@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
+import re
 from typing import Any
 
 import numpy as np
@@ -47,6 +49,11 @@ class CSPReconstructionResult:
     lattice_lengths_rmse: float | None = None
     lattice_angles_rmse: float | None = None
     volume_rel_error: float | None = None
+    wyckoff_letter_agreement: bool | None = None
+    predicted_wyckoff_letters: tuple[str, ...] | None = None
+    target_wyckoff_letters: tuple[str, ...] | None = None
+    predicted_wyckoff_dimensionality: dict[str, int] | None = None
+    target_wyckoff_dimensionality: dict[str, int] | None = None
     matcher_diagnostics: Any | None = None
 
 
@@ -334,6 +341,80 @@ def _symmetrized_species_orbits(
     for atomic_number in per_species:
         per_species[atomic_number] = sorted(per_species[atomic_number])
     return per_species
+
+
+def _wyckoff_letter(symbol: str) -> str:
+    match = re.search(r"([A-Za-z]+)$", str(symbol))
+    return match.group(1) if match else str(symbol)
+
+
+def _wyckoff_dimensionality_lookup(space_group_number: int | None) -> dict[str, str]:
+    if space_group_number is None:
+        return {}
+    try:
+        from pyxtal.symmetry import Group
+    except Exception:
+        return {}
+
+    lookup: dict[str, str] = {}
+    try:
+        group = Group(int(space_group_number))
+        wyckoff_positions = getattr(group, "Wyckoff_positions", [])
+    except Exception:
+        return lookup
+
+    flat_positions: list[Any] = []
+    for item in wyckoff_positions:
+        if isinstance(item, (list, tuple)):
+            flat_positions.extend(item)
+        else:
+            flat_positions.append(item)
+
+    for wp in flat_positions:
+        try:
+            letter = getattr(wp, "letter", None)
+            if letter is None and hasattr(wp, "get_label"):
+                letter = _wyckoff_letter(str(wp.get_label()))
+            if letter is None:
+                continue
+            if hasattr(wp, "get_dof"):
+                dof = int(wp.get_dof())
+            elif hasattr(wp, "get_free_xyzs"):
+                dof = len(wp.get_free_xyzs())
+            elif hasattr(wp, "dim"):
+                dof = int(wp.dim)
+            else:
+                continue
+            lookup[str(letter)] = str(dof)
+        except Exception:
+            continue
+    return lookup
+
+
+def _wyckoff_summary(
+    structure: Structure,
+    *,
+    symprec: float,
+    angle_tolerance: float,
+) -> tuple[tuple[str, ...] | None, dict[str, int] | None]:
+    if SpacegroupAnalyzer is None:
+        return None, None
+    try:
+        analyzer = SpacegroupAnalyzer(
+            structure,
+            symprec=symprec,
+            angle_tolerance=angle_tolerance,
+        )
+        symmetrized = analyzer.get_symmetrized_structure()
+        space_group = int(analyzer.get_space_group_number())
+        symbols = list(symmetrized.wyckoff_symbols)
+    except Exception:
+        return None, None
+
+    letters = tuple(sorted(_wyckoff_letter(symbol) for symbol in symbols))
+    dim_lookup = _wyckoff_dimensionality_lookup(space_group)
+    dim_counts = Counter(dim_lookup.get(letter, "unknown") for letter in letters)
+    return letters, {str(key): int(value) for key, value in sorted(dim_counts.items())}
 
 
 def _safe_rms_dist(
@@ -801,6 +882,21 @@ def evaluate_csp_reconstruction(
     lattice_lengths_mae, lattice_angles_mae = _lattice_mae(predicted, target)
     lattice_lengths_rmse, lattice_angles_rmse = _lattice_rmse(predicted, target)
     volume_rel_error = _volume_rel_error(predicted, target)
+    predicted_wyckoff_letters, predicted_wyckoff_dimensionality = _wyckoff_summary(
+        predicted,
+        symprec=sg_symprec,
+        angle_tolerance=sg_angle_tolerance,
+    )
+    target_wyckoff_letters, target_wyckoff_dimensionality = _wyckoff_summary(
+        target,
+        symprec=sg_symprec,
+        angle_tolerance=sg_angle_tolerance,
+    )
+    wyckoff_letter_agreement = (
+        None
+        if predicted_wyckoff_letters is None or target_wyckoff_letters is None
+        else bool(predicted_wyckoff_letters == target_wyckoff_letters)
+    )
     matcher_diagnostics = None
 
     if is_valid:
@@ -850,6 +946,11 @@ def evaluate_csp_reconstruction(
         lattice_lengths_rmse=lattice_lengths_rmse,
         lattice_angles_rmse=lattice_angles_rmse,
         volume_rel_error=volume_rel_error,
+        wyckoff_letter_agreement=wyckoff_letter_agreement,
+        predicted_wyckoff_letters=predicted_wyckoff_letters,
+        target_wyckoff_letters=target_wyckoff_letters,
+        predicted_wyckoff_dimensionality=predicted_wyckoff_dimensionality,
+        target_wyckoff_dimensionality=target_wyckoff_dimensionality,
         matcher_diagnostics=matcher_diagnostics,
     )
 
@@ -894,6 +995,18 @@ def aggregate_csp_reconstruction_metrics(
         for result in results
         if result.requested_space_group_match is not None
     ]
+    wyckoff_letter_agreement = [
+        float(result.wyckoff_letter_agreement)
+        for result in results
+        if result.wyckoff_letter_agreement is not None
+    ]
+    predicted_wyckoff_dimensionality: Counter[str] = Counter()
+    target_wyckoff_dimensionality: Counter[str] = Counter()
+    for result in results:
+        if result.predicted_wyckoff_dimensionality is not None:
+            predicted_wyckoff_dimensionality.update(result.predicted_wyckoff_dimensionality)
+        if result.target_wyckoff_dimensionality is not None:
+            target_wyckoff_dimensionality.update(result.target_wyckoff_dimensionality)
     detected_family_agreement = []
     lattice_lengths_rmse = []
     lattice_angles_rmse = []
@@ -938,6 +1051,11 @@ def aggregate_csp_reconstruction_metrics(
             if not detected_family_agreement
             else float(sum(detected_family_agreement) / len(detected_family_agreement))
         ),
+        "wyckoff_letter_agreement": (
+            None if not wyckoff_letter_agreement else float(sum(wyckoff_letter_agreement) / len(wyckoff_letter_agreement))
+        ),
+        "predicted_wyckoff_dimensionality_distribution": dict(predicted_wyckoff_dimensionality),
+        "target_wyckoff_dimensionality_distribution": dict(target_wyckoff_dimensionality),
         "lattice_lengths_rmse": (
             None
             if not lattice_lengths_rmse

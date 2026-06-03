@@ -26,6 +26,16 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
     if not score_network:
         raise ValueError("Config must explicitly define model.score_network.")
 
+    conv_sg_aux = cfg.get("conv_sg_aux", {}) or {}
+    if not isinstance(conv_sg_aux, dict):
+        raise ValueError("Expected model.conv_sg_aux to be a mapping.")
+    conv_sg_enabled = bool(conv_sg_aux.get("enabled", float(cfg.get("lambda_conv_sg", 0.0)) > 0.0))
+    lambda_conv_sg = float(conv_sg_aux.get("lambda", cfg.get("lambda_conv_sg", 0.0))) if conv_sg_enabled else 0.0
+    conv_sg_time_weight = str(conv_sg_aux.get("time_weight", cfg.get("conv_sg_time_weight", "alpha_squared")))
+    conv_sg_require_valid_transform = bool(
+        conv_sg_aux.get("require_valid_transform", cfg.get("conv_sg_require_valid_transform", True))
+    )
+
     n_sigmas = cfg.get("tdm_n_sigmas")
     if n_sigmas is None:
         n_sigmas = 2000 if device.type == "cuda" else 512
@@ -41,12 +51,17 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         tdm_sigma_norm_density_K=cfg.get("tdm_sigma_norm_density_K"),
         tdm_sigma_norm_grid_points=int(cfg.get("tdm_sigma_norm_grid_points", 8193)),
         tdm_sigma_norm_mc_samples=int(cfg.get("tdm_sigma_norm_mc_samples", 20000)),
-        tdm_centered_sigma_norm_correction=bool(cfg.get("tdm_centered_sigma_norm_correction", False)),
         lattice_parameterization=str(cfg.get("lattice_parameterization", "eps")),
         lattice_diffusion_type=str(cfg.get("lattice_diffusion_type", "VP")),
         lattice_representation=str(cfg.get("lattice_representation", dataset_cfg.get("lattice_representation", "kldm"))),
+        lambda_l=float(cfg.get("lambda_l", 1.0)),
         lattice_sg_lambda=float(cfg.get("lattice_sg_lambda", 0.0)),
         lattice_sg_normalize=bool(cfg.get("lattice_sg_normalize", True)),
+        lattice_sg_time_weight=str(cfg.get("lattice_sg_time_weight", "quadratic_late")),
+        lambda_conv_sg=lambda_conv_sg,
+        conv_sg_time_weight=conv_sg_time_weight,
+        conv_sg_require_valid_transform=conv_sg_require_valid_transform,
+        lattice_orbit_metric_max_candidates=cfg.get("lattice_orbit_metric_max_candidates", 512),
         score_network_kwargs=score_network,
     ).to(device)
 
@@ -132,7 +147,11 @@ def load_checkpoint(
     ema: EMA | None = None,
     prefer_ema_weights: bool = False,
 ) -> dict[str, Any]:
-    checkpoint = torch.load(str(checkpoint_path), map_location=device)
+    checkpoint = torch.load(
+        str(checkpoint_path),
+        map_location=device,
+        weights_only=False,
+    )
 
     model_state = checkpoint["model_state_dict"]
     if prefer_ema_weights:
