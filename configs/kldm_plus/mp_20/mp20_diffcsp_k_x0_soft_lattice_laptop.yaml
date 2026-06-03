@@ -9,7 +9,7 @@ dataset:
   batch_size: 32
   num_workers: 0
   pin_memory: false
-  train_subset_fraction: 0.1
+  train_subset_fraction: 0.7
   train_subset_seed: 2002
   train_subset_strategy: balanced_space_group
 
@@ -30,7 +30,7 @@ model:
   conv_sg_aux:
     enabled: true
     mode: direct
-    lambda: 1.0
+    lambda: 3
     time_weight: alpha2
     require_valid_transform: true
   lattice_orbit_metric_max_candidates: 512

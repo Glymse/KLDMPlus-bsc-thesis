@@ -150,6 +150,45 @@ def make_balanced_subset(dataset, subset_size: int | None, seed: int, *, group_k
     return Subset(dataset, selected)
 
 
+def make_balanced_subset_by_index(dataset, subset_size: int | None, seed: int, *, group_key_for_index) -> Any:
+    if subset_size is None or subset_size <= 0 or subset_size >= len(dataset):
+        return dataset
+
+    generator = torch.Generator().manual_seed(seed)
+    grouped_indices: dict[Any, list[int]] = defaultdict(list)
+    for idx in range(len(dataset)):
+        grouped_indices[group_key_for_index(idx)].append(idx)
+
+    group_items = sorted(grouped_indices.items(), key=lambda item: str(item[0]))
+    shuffled_groups: list[tuple[Any, list[int]]] = []
+    for group, indices in group_items:
+        order = torch.randperm(len(indices), generator=generator).tolist()
+        shuffled_groups.append((group, [indices[pos] for pos in order]))
+
+    selected: list[int] = []
+    while len(selected) < int(subset_size):
+        made_progress = False
+        for _group, indices in shuffled_groups:
+            if not indices:
+                continue
+            selected.append(indices.pop(0))
+            made_progress = True
+            if len(selected) >= int(subset_size):
+                break
+        if not made_progress:
+            break
+
+    return Subset(dataset, selected)
+
+
+def dataset_space_group_for_index(dataset, idx: int) -> int:
+    if hasattr(dataset, "data") and hasattr(dataset.data, "structure_id") and hasattr(dataset, "_space_group_for_structure_id"):
+        structure_id = str(dataset.data.structure_id[idx])
+        return int(dataset._space_group_for_structure_id(structure_id))
+    sample = dataset[idx]
+    return int(torch.as_tensor(sample.space_group).reshape(-1)[0].item())
+
+
 def make_fraction_subset(dataset, fraction: float | None, seed: int) -> Any:
     if fraction is None or float(fraction) <= 0.0 or float(fraction) >= 1.0:
         return dataset
@@ -526,11 +565,11 @@ class ExperimentRunner:
         else:
             train_subset_size = max(1, int(round(len(train_dataset_full) * float(train_subset_fraction))))
             if train_subset_strategy == "balanced_space_group":
-                train_dataset = make_balanced_subset(
+                train_dataset = make_balanced_subset_by_index(
                     train_dataset_full,
                     subset_size=train_subset_size,
                     seed=train_subset_seed,
-                    group_key=lambda sample: int(torch.as_tensor(sample.space_group).reshape(-1)[0].item()),
+                    group_key_for_index=lambda idx: dataset_space_group_for_index(train_dataset_full, int(idx)),
                 )
             else:
                 train_dataset = make_fixed_subset(
@@ -544,6 +583,7 @@ class ExperimentRunner:
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
             generator=train_generator,
             worker_init_fn=worker_init_fn,
             collate_fn=train_dataset_full.collate_fn,
@@ -554,12 +594,12 @@ class ExperimentRunner:
         val_dataset_full = task.fit_dataset(root=root, split=VAL_SPLIT, download=True)
         val_subset_strategy = str(self.validation_cfg.get("subset_strategy", "random"))
         if val_subset_strategy == "balanced_family":
-            val_dataset = make_balanced_subset(
+            val_dataset = make_balanced_subset_by_index(
                 val_dataset_full,
                 subset_size=self.validation_cfg["subset_size"],
                 seed=int(self.validation_cfg["subset_seed"]),
-                group_key=lambda sample: _space_group_to_family(
-                    int(torch.as_tensor(sample.space_group).reshape(-1)[0].item()),
+                group_key_for_index=lambda idx: _space_group_to_family(
+                    dataset_space_group_for_index(val_dataset_full, int(idx)),
                 ),
             )
         else:
@@ -574,6 +614,7 @@ class ExperimentRunner:
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
             worker_init_fn=worker_init_fn,
             collate_fn=val_dataset_full.collate_fn,
         )

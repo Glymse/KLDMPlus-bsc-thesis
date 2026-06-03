@@ -289,6 +289,7 @@ class FullyConnectedGraph(Transform):
         """
         self.key = key
         self.len_from = len_from
+        self._edge_cache: dict[int, torch.Tensor] = {}
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         if dense_to_sparse is None:
@@ -296,10 +297,13 @@ class FullyConnectedGraph(Transform):
 
         n = len(getattr(sample, self.len_from))
 
-        adjacency = torch.ones(n, n, device=sample.pos.device)
-        adjacency = adjacency - torch.eye(n, device=sample.pos.device)
-
-        edge_index, _ = dense_to_sparse(adjacency)
+        edge_index = self._edge_cache.get(int(n))
+        if edge_index is None:
+            adjacency = torch.ones(n, n)
+            adjacency = adjacency - torch.eye(n)
+            edge_index, _ = dense_to_sparse(adjacency)
+            self._edge_cache[int(n)] = edge_index.detach().cpu()
+        edge_index = edge_index.to(device=sample.pos.device)
 
         return sample.replace(**{self.key: edge_index})
 
@@ -584,6 +588,7 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
             representation="diffcsp_k",
         )
         self.lattice_symmetry = LatticeSymmetry(eps=eps)
+        self._feature_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def _sample_debug_id(sample: ChemGraph) -> str:
@@ -594,6 +599,16 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
                     value = value.reshape(-1)[0].item() if value.numel() else "empty"
                 return f"{key}={value}"
         return "sample_id=unknown"
+
+    @staticmethod
+    def _sample_cache_key(sample: ChemGraph) -> str | None:
+        for key in ("material_id", "structure_id", "id"):
+            if hasattr(sample, key):
+                value = getattr(sample, key)
+                if isinstance(value, torch.Tensor):
+                    value = value.reshape(-1)[0].item() if value.numel() else "empty"
+                return f"{key}={value}"
+        return None
 
     def _warn_missing_conventional_chart(self, sample: ChemGraph, reason: str) -> None:
         print(
@@ -652,6 +667,18 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         cell = sample.cell.squeeze(0)
+        cache_key = self._sample_cache_key(sample)
+        cached = self._feature_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            k, conv_C, conv_weight, conv_fit_error = cached
+            return sample.replace(
+                **{
+                    self.out_key: k.to(device=cell.device, dtype=cell.dtype).view(1, 6),
+                    "conv_C": conv_C.to(device=cell.device, dtype=cell.dtype).view(1, 3, 3),
+                    "conv_weight": conv_weight.to(device=cell.device, dtype=cell.dtype).view(1),
+                    "conv_fit_error": conv_fit_error.to(device=cell.device, dtype=cell.dtype).view(1),
+                }
+            )
         with torch.no_grad():
             cell_batch = cell.reshape(1, 3, 3)
             primitive_chart_cell = self.lattice_symmetry.de_so3(cell_batch).squeeze(0)
@@ -660,6 +687,13 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
                 sample,
                 raw_cell=cell,
                 primitive_chart_cell=primitive_chart_cell,
+            )
+        if cache_key is not None:
+            self._feature_cache[cache_key] = (
+                k.detach().cpu(),
+                conv_C.detach().cpu(),
+                conv_weight.detach().cpu(),
+                conv_fit_error.detach().cpu(),
             )
         return sample.replace(
             **{
