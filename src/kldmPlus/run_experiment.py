@@ -424,6 +424,7 @@ class ExperimentRunner:
 
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
+        resolved_checkpoint_path: Path | None = None
         if resume_from:
             print("startup phase=resolve_checkpoint:start", flush=True)
             resolved_checkpoint_path = resolve_checkpoint_reference(
@@ -462,7 +463,7 @@ class ExperimentRunner:
             )
             if load_time_sampler_state and checkpoint.get("time_sampler_state_dict") is not None:
                 self.time_sampler.load_state_dict(checkpoint.get("time_sampler_state_dict"))
-        if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)):
+        if bool(self.checkpoint_cfg.get("prune_wandb_artifact_cache", False)) and resolved_checkpoint_path is not None:
             prune_wandb_artifact_cache(resolved_checkpoint_path)
         clear_wandb_artifact_cache()
 
