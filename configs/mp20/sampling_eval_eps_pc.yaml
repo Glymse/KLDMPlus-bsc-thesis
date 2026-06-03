@@ -3,7 +3,7 @@ experiment_name: mp20_lattice_eps_pc_eval
 sampling:
   checkpoint_path: ~/kldm_baseline/kldm_theises/artifacts/HPC/checkpoints/experiments/mp20_lattice_eps_em/epoch_3600.pt
   method: pc
-  n_steps: 300
+  n_steps: 1000
   t_start: 1.0
   t_final: 1e-3
   n_samples: 100

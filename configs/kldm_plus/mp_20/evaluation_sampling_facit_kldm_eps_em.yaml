@@ -4,7 +4,7 @@ sampling:
   checkpoint_path: https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/mp20_lattice_eps_em/artifacts/model/mp20_lattice_eps_em_validation/v91/files/epoch_8900.pt
   method: em
   sampling_algorithm: 3
-  n_steps: 300
+  n_steps: 1000
   t_start: 1.0
   t_final: 1.0e-3
   n_samples: 1

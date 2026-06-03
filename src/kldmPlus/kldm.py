@@ -489,18 +489,8 @@ class ModelKLDM(nn.Module):
         restore_training = self.score_network.training
         self.score_network.eval()
 
-        f_t = torch.rand_like(batch.pos)
-        v_noise = self.tdm.sample_velocity_noise(ref=batch.pos, index=batch.batch)
-        t_start_internal = self.tdm.T * torch.full(
-            (int(batch.num_graphs),),
-            float(t_start),
-            device=batch.pos.device,
-            dtype=batch.pos.dtype,
-        )
-        v_sigma = self.tdm.gaussian_velocity_sigma(t_start_internal)[batch.batch]
-        while v_sigma.ndim < v_noise.ndim:
-            v_sigma = v_sigma.unsqueeze(-1)
-        v_t = v_sigma * v_noise
+        f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
+        v_t = self.tdm.sample_velocity_noise(ref=batch.pos, index=batch.batch)
 
         l_t = self.diffusion_l.sample_prior(
             x_like=batch.l,
@@ -532,11 +522,17 @@ class ModelKLDM(nn.Module):
                     edge_node_index=state["edge_node_index"],
                 )
 
-                state["f_t"], state["v_t"] = self.tdm.reverse_step_predictor(
+                score_v = self.tdm.reconstruct_full_reverse_velocity_score(
                     t=times.now.nodes,
-                    f_t=state["f_t"],
                     v_t=state["v_t"],
                     pred_v=preds["v"],
+                    index=state["node_index"],
+                )
+
+                state["f_t"], state["v_t"] = self.tdm.reverse_exp_step(
+                    f_t=state["f_t"],
+                    v_t=state["v_t"],
+                    score_v=score_v,
                     index=state["node_index"],
                     dt=times.dt,
                 )
@@ -558,6 +554,7 @@ class ModelKLDM(nn.Module):
         tau: float,
         n_correction_steps: int,
     ) -> dict[str, Any]:
+        del n_correction_steps
         with torch.no_grad():
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
                 preds = self.score_network(
@@ -579,45 +576,36 @@ class ModelKLDM(nn.Module):
                     dt=times.dt,
                 )
 
-                state["l_t"] = self.diffusion_l.reverse_step_predictor(
-                    t=times.now.lattice,
+                if times.t_next_float < 1e-3:
+                    continue
+
+                preds = self.score_network(
+                    t=times.next.graph,
+                    pos=state["f_t"],
+                    v=state["v_t"],
+                    h=state["a_t"],
+                    l=state["l_t"],
+                    node_index=state["node_index"],
+                    edge_node_index=state["edge_node_index"],
+                )
+
+                state["f_t"], state["v_t"] = self.tdm.reverse_step_corrector(
+                    t=times.next.nodes,
+                    f_t=state["f_t"],
+                    v_t=state["v_t"],
+                    pred_v=preds["v"],
+                    dt=times.dt,
+                    index=state["node_index"],
+                    tau=float(tau),
+                )
+
+                state["l_t"] = self._reverse_lattice_sampling_step(
+                    t=times.next.lattice,
                     x_t=state["l_t"],
                     pred=preds["l"],
                     dt=times.dt,
                     num_atoms=state["batch"].num_atoms,
                 )
-
-                if times.t_next_float < 1e-3:
-                    continue
-
-                for _ in range(max(int(n_correction_steps), 1)):
-                    preds = self.score_network(
-                        t=times.next.graph,
-                        pos=state["f_t"],
-                        v=state["v_t"],
-                        h=state["a_t"],
-                        l=state["l_t"],
-                        node_index=state["node_index"],
-                        edge_node_index=state["edge_node_index"],
-                    )
-
-                    state["f_t"], state["v_t"] = self.tdm.reverse_step_corrector(
-                        t=times.next.nodes,
-                        f_t=state["f_t"],
-                        v_t=state["v_t"],
-                        pred_v=preds["v"],
-                        dt=times.dt,
-                        index=state["node_index"],
-                        tau=float(tau),
-                    )
-
-                    state["l_t"] = self.diffusion_l.reverse_step_corrector(
-                        t=times.next.lattice,
-                        x_t=state["l_t"],
-                        pred=preds["l"],
-                        tau=float(tau),
-                        num_atoms=state["batch"].num_atoms,
-                    )
 
         return state
 
@@ -663,8 +651,9 @@ class ModelKLDM(nn.Module):
         Algorithm 4 from Appendix H: vanilla predictor-corrector sampling.
 
         At each time level:
-            1. do one predictor step for positions/velocities and lattice
-            2. do `n_correction_steps` Langevin-style corrector updates
+            1. do one predictor step for positions/velocities
+            2. do one Langevin-style corrector update for positions/velocities
+            3. do one EM reverse step for the lattice
         """
         state = self._prepare_csp_sampling(
             batch=batch,

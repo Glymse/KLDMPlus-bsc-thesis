@@ -43,7 +43,7 @@ sampling_compare:
     - name: FacitKLDM_PC
       method: facit_pc
       sampling_algorithm: 4
-      n_steps: 300
+      n_steps: 1000
       t_start: 1.0
       t_final: 1.0e-3
       tau: 0.15
@@ -52,7 +52,7 @@ sampling_compare:
     - name: Algorithm10_CASAL_chart
       method: casal
       sampling_algorithm: 10
-      n_steps: 300
+      n_steps: 1000
       t_start: 1.0
       t_final: 1.0e-3
       algorithm10:
