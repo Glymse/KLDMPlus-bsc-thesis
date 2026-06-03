@@ -201,6 +201,22 @@ class LatticeSymmetry(nn.Module):
         projected_k = self.proj_k_to_spacegroup(conventional_k, spacegroup)
         return (conventional_k - projected_k).pow(2).mean(dim=1)
 
+    def conventional_sg_loss_and_residual_per_graph(
+        self,
+        primitive_k0: torch.Tensor,
+        conv_C: torch.Tensor,
+        spacegroup: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return squared loss and abs residual from one conventional-chart pass."""
+        primitive_k0 = primitive_k0.reshape(-1, 6)
+        transform = conv_C.reshape(-1, 3, 3).to(device=primitive_k0.device, dtype=primitive_k0.dtype)
+        primitive_cell = self.v2m(primitive_k0)
+        conventional_cell = transform @ primitive_cell
+        conventional_k = self.m2v(self.de_so3(conventional_cell))
+        projected_k = self.proj_k_to_spacegroup(conventional_k, spacegroup)
+        diff = conventional_k - projected_k
+        return diff.pow(2).mean(dim=1), diff.abs().mean(dim=1)
+
     def logm_spd(self, mats: torch.Tensor) -> torch.Tensor:
         mats = 0.5 * (mats + mats.transpose(-1, -2))
         evals, evecs = torch.linalg.eigh(mats)

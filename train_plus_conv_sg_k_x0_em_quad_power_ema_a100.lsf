@@ -3,10 +3,10 @@ set -euo pipefail
 
 #BSUB -J plus_convsg_quad_a100
 #BSUB -q gpua100
-#BSUB -n 4
+#BSUB -n 8
 #BSUB -R "span[hosts=1]"
 #BSUB -gpu "num=1:mode=exclusive_process"
-#BSUB -R "rusage[mem=8GB]"
+#BSUB -R "rusage[mem=16GB]"
 #BSUB -W 24:00
 #BSUB -o logs/plus_convsg_quad_a100_%J.out
 #BSUB -e logs/plus_convsg_quad_a100_%J.err

@@ -11,6 +11,7 @@ import signal
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any, Mapping
 from urllib.parse import unquote, urlparse
 
@@ -434,6 +435,7 @@ class ExperimentRunner:
         clear_wandb_artifact_cache()
 
         self.train_every_epochs = int(self.logging_cfg["train_every_epochs"])
+        self.profile_train_batches = int(self.logging_cfg.get("profile_train_batches", 0))
         self.validate_every_epochs = int(self.validation_cfg["every_n_epochs"])
         self.max_epochs = self.training_cfg.get("max_epochs")
         self.max_epochs = None if self.max_epochs is None else int(self.max_epochs)
@@ -707,12 +709,27 @@ class ExperimentRunner:
         total_nodes = total_graphs = 0
         lambda_sg_lattice = 0.0
         lambda_conv_sg = 0.0
+        total_data_wait_seconds = 0.0
+        total_to_device_seconds = 0.0
+        total_step_seconds = 0.0
+        total_ema_seconds = 0.0
+        epoch_start = time.perf_counter()
+        batch_fetch_start = time.perf_counter()
 
-        for batch in self.train_loader:
+        for batch_idx, batch in enumerate(self.train_loader, start=1):
+            data_wait_seconds = time.perf_counter() - batch_fetch_start
+            total_data_wait_seconds += data_wait_seconds
             if STOP_REQUESTED:
                 break
 
+            to_device_start = time.perf_counter()
             batch = batch.to(self.device)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            to_device_seconds = time.perf_counter() - to_device_start
+            total_to_device_seconds += to_device_seconds
+
+            step_start = time.perf_counter()
             sampled_t, sampled_weights = self.time_sampler.sample(batch)
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -724,9 +741,26 @@ class ExperimentRunner:
             )
             loss.backward()
             self.optimizer.step()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            step_seconds = time.perf_counter() - step_start
+            total_step_seconds += step_seconds
 
             if self.ema is not None:
+                ema_start = time.perf_counter()
                 self.ema.update(self.model, current_epoch=epoch)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                total_ema_seconds += time.perf_counter() - ema_start
+
+            if self.profile_train_batches > 0 and batch_idx <= self.profile_train_batches:
+                print(
+                    f"train_batch_profile epoch={epoch:04d} batch={batch_idx} "
+                    f"data_wait_s={data_wait_seconds:.3f} to_device_s={to_device_seconds:.3f} "
+                    f"step_s={step_seconds:.3f} ema_s={total_ema_seconds:.3f} "
+                    f"graphs={int(batch.num_graphs)} nodes={int(batch.pos.shape[0])}",
+                    flush=True,
+                )
 
             total_loss_v += float(metrics["loss_v"]) * int(batch.pos.shape[0])
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
@@ -751,6 +785,7 @@ class ExperimentRunner:
             lambda_conv_sg = float(metrics.get("lambda_conv_sg", lambda_conv_sg))
             total_nodes += int(batch.pos.shape[0])
             total_graphs += int(batch.num_graphs)
+            batch_fetch_start = time.perf_counter()
 
         if total_nodes == 0 or total_graphs == 0:
             raise RuntimeError("Training stopped before any batches were processed.")
@@ -800,6 +835,11 @@ class ExperimentRunner:
             "lambda_sg_lattice": lambda_sg_lattice,
             "lambda_conv_sg": lambda_conv_sg,
             "loss_weighted": mean_total_loss,
+            "epoch_seconds": time.perf_counter() - epoch_start,
+            "data_wait_seconds": total_data_wait_seconds,
+            "to_device_seconds": total_to_device_seconds,
+            "step_seconds": total_step_seconds,
+            "ema_seconds": total_ema_seconds,
         }
         return metrics
 
@@ -1367,6 +1407,11 @@ class ExperimentRunner:
                         "train/loss_v_weighted": train_metrics["loss_v_weighted"],
                         "train/loss_l_weighted": train_metrics["loss_l_weighted"],
                         "train/loss_weighted": train_metrics["loss_weighted"],
+                        "train/epoch_seconds": train_metrics["epoch_seconds"],
+                        "train/data_wait_seconds": train_metrics["data_wait_seconds"],
+                        "train/to_device_seconds": train_metrics["to_device_seconds"],
+                        "train/step_seconds": train_metrics["step_seconds"],
+                        "train/ema_seconds": train_metrics["ema_seconds"],
                     }
                     self.add_lattice_log_data(log_data, train_metrics, prefix="train")
                     for key, value in train_metrics.items():
@@ -1379,7 +1424,12 @@ class ExperimentRunner:
                         f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f}, "
                         f"{self.lattice_status_text(train_metrics)}, "
                         f"loss_v_weighted={train_metrics['loss_v_weighted']:.6f}, "
-                        f"loss_l_weighted={train_metrics['loss_l_weighted']:.6f})",
+                        f"loss_l_weighted={train_metrics['loss_l_weighted']:.6f}) "
+                        f"timing(epoch_s={train_metrics['epoch_seconds']:.1f}, "
+                        f"data_wait_s={train_metrics['data_wait_seconds']:.1f}, "
+                        f"to_device_s={train_metrics['to_device_seconds']:.1f}, "
+                        f"step_s={train_metrics['step_seconds']:.1f}, "
+                        f"ema_s={train_metrics['ema_seconds']:.1f})",
                         flush=True,
                     )
 

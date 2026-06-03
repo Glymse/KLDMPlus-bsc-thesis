@@ -7,7 +7,7 @@ dataset:
   lattice_representation: kldm
   root: null
   batch_size: 256
-  num_workers: 1
+  num_workers: 4
   pin_memory: true
   train_subset_seed: 2002
 

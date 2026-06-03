@@ -1,4 +1,4 @@
-experiment_name: plus_mp20_diffcsp_k_x0_conv_sg_lattice_laptop
+experiment_name: plus_mp20_diffcsp_k_x0_conv_sg_lattice_laptop_profile
 sampler_config: ../../samplers/predictor_corrector.yaml
 
 dataset:
@@ -9,7 +9,7 @@ dataset:
   batch_size: 32
   num_workers: 0
   pin_memory: false
-  train_subset_fraction: 0.5
+  train_subset_fraction: 0.05
   train_subset_seed: 2002
   train_subset_strategy: balanced_space_group
 
@@ -30,7 +30,7 @@ model:
   conv_sg_aux:
     enabled: true
     mode: direct
-    lambda: 5
+    lambda: 3
     time_weight: alpha2
     require_valid_transform: true
   lattice_orbit_metric_max_candidates: 512
@@ -65,14 +65,15 @@ ema:
   enabled: false
 
 training:
-  max_epochs: 500
+  max_epochs: 1
 
 logging:
   train_every_epochs: 1
-  wandb_checkpoints: true
+  profile_train_batches: 2
+  wandb_checkpoints: false
 
 validation:
-  every_n_epochs: 10
+  every_n_epochs: 0
   sampling_seed: 0
   ema_val: false
   subset_size: 6

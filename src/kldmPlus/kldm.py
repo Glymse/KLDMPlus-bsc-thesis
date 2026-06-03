@@ -369,7 +369,7 @@ class ModelKLDM(nn.Module):
             if self.conv_sg_require_valid_transform and float(conv_weight_graph.detach().sum().item()) <= 0.0:
                 raise RuntimeError("Conventional SG auxiliary is enabled, but this batch has no valid conv_C transforms.")
             sg = space_group.to(device=out_l.device)
-            loss_conv_sg_graph = self.lattice_symmetry.conventional_sg_loss_per_graph(
+            loss_conv_sg_graph_raw, conv_residual_pred_raw = self.lattice_symmetry.conventional_sg_loss_and_residual_per_graph(
                 primitive_k0=out_l,
                 conv_C=conv_C,
                 spacegroup=sg,
@@ -378,20 +378,15 @@ class ModelKLDM(nn.Module):
                 times.lattice.to(device=out_l.device),
                 mode=self.conv_sg_time_weight,
             ).to(device=out_l.device, dtype=out_l.dtype)
-            loss_conv_sg_graph = conv_weight_graph * conv_sg_time_weight_graph * loss_conv_sg_graph
+            loss_conv_sg_graph = conv_weight_graph * conv_sg_time_weight_graph * loss_conv_sg_graph_raw
             with torch.no_grad():
-                conv_residual_pred = self.lattice_symmetry.conventional_sg_residual_abs_mean(
-                    out_l.detach(),
-                    conv_C,
-                    sg,
-                )
                 conv_residual_gt = self.lattice_symmetry.conventional_sg_residual_abs_mean(
                     target_l.detach(),
                     conv_C,
                     sg,
                 )
                 conv_denom = conv_weight_graph.detach().sum().clamp_min(1.0)
-                conv_projection_error_pred = (conv_weight_graph.detach() * conv_residual_pred).sum() / conv_denom
+                conv_projection_error_pred = (conv_weight_graph.detach() * conv_residual_pred_raw.detach()).sum() / conv_denom
                 conv_projection_error_gt = (conv_weight_graph.detach() * conv_residual_gt).sum() / conv_denom
 
         loss_l_weighted_graph = self.lambda_l * loss_l_graph

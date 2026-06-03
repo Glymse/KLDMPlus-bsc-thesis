@@ -7,7 +7,7 @@ dataset:
   lattice_representation: diffcsp_k
   root: null
   batch_size: 256
-  num_workers: 1
+  num_workers: 4
   pin_memory: true
   train_subset_seed: 2002
 
@@ -68,6 +68,7 @@ training:
 
 logging:
   train_every_epochs: 1
+  profile_train_batches: 2
   wandb_checkpoints: true
   wandb_project: kldmplus_mp20_em_12000
   wandb_run_name: plus_mp20_conv_sg_k_x0_em_quad_power_ema_a100

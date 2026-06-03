@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -608,7 +609,16 @@ class DiffCSPKContinuousIntervalLattice(ContinuousIntervalLattice):
                 if isinstance(value, torch.Tensor):
                     value = value.reshape(-1)[0].item() if value.numel() else "empty"
                 return f"{key}={value}"
-        return None
+        try:
+            digest = hashlib.blake2b(digest_size=16)
+            for value in (sample.cell, sample.pos, sample.atomic_numbers):
+                tensor = torch.as_tensor(value).detach().cpu().contiguous()
+                digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+                digest.update(str(tensor.dtype).encode("utf-8"))
+                digest.update(tensor.numpy().tobytes())
+            return f"content={digest.hexdigest()}"
+        except Exception:
+            return None
 
     def _warn_missing_conventional_chart(self, sample: ChemGraph, reason: str) -> None:
         print(
