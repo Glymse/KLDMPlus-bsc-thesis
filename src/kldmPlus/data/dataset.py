@@ -4,6 +4,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import socket
 import time
 import shutil
 from typing import Any
@@ -47,9 +48,11 @@ SPACE_GROUP_PROPERTY = "space_group"
 SPACE_GROUP_COLUMN = "spacegroup.number"
 CACHE_SCHEMA_VERSION = 2
 CACHE_META_FILENAME = "_kldm_cache_meta.json"
+CORE_CACHE_FILENAMES = ("cell.npy", "atomic_numbers.npy", "num_atoms.npy", "pos.npy")
 BUILD_LOCK_DIRNAME = ".kldm_build_lock"
 BUILD_LOCK_STALE_SECONDS = 6 * 60 * 60
 BUILD_LOCK_POLL_SECONDS = 5.0
+BUILD_LOCK_WAIT_LOG_SECONDS = 60.0
 
 
 def resolve_data_root(root: str | Path | None = None) -> Path:
@@ -79,6 +82,7 @@ class CrystalDatasetWrapper(Dataset):
         split: str = "train",
         transforms: list[Transform] | None = None,
         dataset_transforms: list[DatasetTransform] | None = None,
+        required_properties: list[str] | None = None,
         download: bool = False,
     ) -> None:
         if split not in {"train", "val", "test"}:
@@ -94,6 +98,10 @@ class CrystalDatasetWrapper(Dataset):
         self.split = split
         self.transforms = transforms or []
         self.dataset_transforms = dataset_transforms or []
+        requested_properties = list(required_properties or [SPACE_GROUP_PROPERTY])
+        if SPACE_GROUP_PROPERTY not in requested_properties:
+            requested_properties.append(SPACE_GROUP_PROPERTY)
+        self._required_properties = sorted(set(str(name) for name in requested_properties))
         self._space_group_number_map: dict[str, int] | None = None
 
         #Download raw CSV only when explicitly requested.
@@ -133,7 +141,7 @@ class CrystalDatasetWrapper(Dataset):
 
     @property
     def required_properties(self) -> list[str]:
-        return [SPACE_GROUP_PROPERTY]
+        return list(self._required_properties)
 
     @staticmethod
     def collate_fn(samples: list[ChemGraph]) -> Batch:
@@ -164,6 +172,12 @@ class CrystalDatasetWrapper(Dataset):
         }
 
     def _ensure_required_properties(self, builder: CrystalDatasetBuilder) -> None:
+        unsupported = sorted(set(self.required_properties) - {SPACE_GROUP_PROPERTY})
+        if unsupported:
+            raise RuntimeError(
+                f"Cannot backfill requested cache properties {unsupported}. "
+                f"Supported backfilled property: {SPACE_GROUP_PROPERTY!r}."
+            )
         if not self.raw_csv.exists():
             raise RuntimeError(
                 f"Raw split not found at {self.raw_csv}. Cannot backfill {SPACE_GROUP_PROPERTY!r}."
@@ -213,9 +227,32 @@ class CrystalDatasetWrapper(Dataset):
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
 
+    def _missing_cache_files(self) -> list[str]:
+        missing: list[str] = []
+        for filename in CORE_CACHE_FILENAMES:
+            path = self.processed_split_folder / filename
+            try:
+                usable = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                usable = False
+            if not usable:
+                missing.append(filename)
+        for property_name in self.required_properties:
+            path = self.processed_split_folder / f"{property_name}.json"
+            try:
+                usable = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                usable = False
+            if not usable:
+                missing.append(path.name)
+        return missing
+
     def _cache_status(self) -> tuple[bool, str]:
         if not self.processed_split_folder.exists():
             return False, "missing_processed_split"
+        missing_files = self._missing_cache_files()
+        if missing_files:
+            return False, f"missing_cache_files={','.join(missing_files)}"
 
         meta = self._read_cache_meta()
         if meta is None:
@@ -282,23 +319,48 @@ class CrystalDatasetWrapper(Dataset):
         )
         return builder
 
-    def _lock_is_stale(self) -> bool:
+    def _read_lock_owner(self) -> dict[str, str]:
+        owner_path = self.cache_lock_dir / "owner.txt"
+        try:
+            return dict(
+                line.strip().split("=", 1)
+                for line in owner_path.read_text(encoding="utf-8").splitlines()
+                if "=" in line
+            )
+        except OSError:
+            return {}
+
+    def _lock_is_stale(self) -> tuple[bool, str]:
         if not self.cache_lock_dir.exists():
-            return False
+            return False, "missing_lock"
         try:
             age_seconds = time.time() - self.cache_lock_dir.stat().st_mtime
         except OSError:
-            return False
-        return age_seconds > BUILD_LOCK_STALE_SECONDS
+            return False, "stat_failed"
+        owner = self._read_lock_owner()
+        owner_host = owner.get("host")
+        owner_pid = owner.get("pid")
+        current_host = socket.gethostname()
+        if owner_host == current_host and owner_pid is not None:
+            try:
+                os.kill(int(owner_pid), 0)
+            except ProcessLookupError:
+                return True, f"dead_owner_pid pid={owner_pid} host={owner_host}"
+            except (PermissionError, ValueError):
+                pass
+        if age_seconds > BUILD_LOCK_STALE_SECONDS:
+            return True, f"age_seconds={age_seconds:.0f}"
+        return False, f"age_seconds={age_seconds:.0f}"
 
     def _acquire_build_lock(self) -> bool:
         self.processed_folder.mkdir(parents=True, exist_ok=True)
+        last_wait_log = 0.0
         while True:
             try:
                 self.cache_lock_dir.mkdir(parents=False, exist_ok=False)
                 marker = self.cache_lock_dir / "owner.txt"
                 marker.write_text(
-                    f"pid={os.getpid()}\ntime={time.time():.0f}\n",
+                    f"pid={os.getpid()}\nhost={socket.gethostname()}\ntime={time.time():.0f}\n",
                     encoding="utf-8",
                 )
                 print(
@@ -316,19 +378,25 @@ class CrystalDatasetWrapper(Dataset):
                         flush=True,
                     )
                     return False
-                if self._lock_is_stale():
+                lock_stale, stale_reason = self._lock_is_stale()
+                if lock_stale:
                     print(
                         f"dataset_cache_lock action=remove_stale dataset={self.dataset_name} split={self.split} "
-                        f"path={self.cache_lock_dir}",
+                        f"reason={stale_reason} path={self.cache_lock_dir}",
                         flush=True,
                     )
                     shutil.rmtree(self.cache_lock_dir, ignore_errors=True)
                     continue
-                print(
-                    f"dataset_cache_lock action=wait dataset={self.dataset_name} split={self.split} "
-                    f"path={self.cache_lock_dir}",
-                    flush=True,
-                )
+                now = time.time()
+                if now - last_wait_log >= BUILD_LOCK_WAIT_LOG_SECONDS:
+                    owner = self._read_lock_owner()
+                    owner_text = " ".join(f"{key}={value}" for key, value in sorted(owner.items()))
+                    print(
+                        f"dataset_cache_lock action=wait dataset={self.dataset_name} split={self.split} "
+                        f"reason={stale_reason} owner='{owner_text}' path={self.cache_lock_dir}",
+                        flush=True,
+                    )
+                    last_wait_log = now
                 time.sleep(BUILD_LOCK_POLL_SECONDS)
 
     def _release_build_lock(self) -> None:
