@@ -341,11 +341,12 @@ class CrystalDatasetWrapper(Dataset):
         owner_host = owner.get("host")
         owner_pid = owner.get("pid")
         current_host = socket.gethostname()
-        if owner_host == current_host and owner_pid is not None:
+        if (owner_host == current_host or owner_host is None) and owner_pid is not None:
             try:
                 os.kill(int(owner_pid), 0)
             except ProcessLookupError:
-                return True, f"dead_owner_pid pid={owner_pid} host={owner_host}"
+                host_text = owner_host if owner_host is not None else "legacy_missing_host"
+                return True, f"dead_owner_pid pid={owner_pid} host={host_text}"
             except (PermissionError, ValueError):
                 pass
         if age_seconds > BUILD_LOCK_STALE_SECONDS:
