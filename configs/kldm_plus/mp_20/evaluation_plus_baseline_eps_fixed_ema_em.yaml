@@ -1,7 +1,7 @@
 experiment_name: eval_plus_baseline_eps_fixed_ema_em
 
 sampling:
-  checkpoint_path: https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/kldmplus_mp20_em_12000/artifacts/model/plus_mp20_baseline_eps_em_mc_fixed_ema_a100_latest/latest
+  checkpoint_path: https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/kldmplus_mp20_em_12000/artifacts/model/plus_mp20_baseline_eps_em_mc_fixed_ema_a100_validation/v56/files/plus_mp20_baseline_eps_em_mc_fixed_ema_a100_validation_epoch_11400.pt
   method: em
   sampling_algorithm: 3
   n_steps: 1000
