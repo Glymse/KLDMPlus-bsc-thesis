@@ -55,6 +55,8 @@ class CSPReconstructionResult:
     predicted_wyckoff_dimensionality: dict[str, int] | None = None
     target_wyckoff_dimensionality: dict[str, int] | None = None
     matcher_diagnostics: Any | None = None
+    relaxed_match: bool = False
+    relaxed_rmse: float | None = None
 
 
 @dataclass
@@ -689,6 +691,16 @@ def detect_space_group_number(
 ) -> int | None:
     if SpacegroupAnalyzer is None:
         return None
+    try:
+        return int(
+            SpacegroupAnalyzer(
+                structure,
+                symprec=symprec,
+                angle_tolerance=angle_tolerance,
+            ).get_space_group_number()
+        )
+    except Exception:
+        return None
 
 
 def _space_group_to_family(space_group_number: int | None) -> str | None:
@@ -710,16 +722,6 @@ def _space_group_to_family(space_group_number: int | None) -> str | None:
     if sg <= 194:
         return "hexagonal"
     return "cubic"
-    try:
-        return int(
-            SpacegroupAnalyzer(
-                structure,
-                symprec=symprec,
-                angle_tolerance=angle_tolerance,
-            ).get_space_group_number()
-        )
-    except Exception:
-        return None
 
 
 def _lattice_mae(predicted: Structure, target: Structure) -> tuple[float, float]:
@@ -794,6 +796,9 @@ def evaluate_csp_reconstruction(
     stol: float = 0.5,
     angle_tol: float = 10.0,
     ltol: float = 0.3,
+    relaxed_stol: float = 0.7,
+    relaxed_angle_tol: float = 15.0,
+    relaxed_ltol: float = 0.4,
     requested_space_group: int | None = None,
     sg_symprec: float = 1e-2,
     sg_angle_tolerance: float = 5.0,
@@ -860,6 +865,8 @@ def evaluate_csp_reconstruction(
     )
     matched = False
     rmse = None
+    relaxed_matched = False
+    relaxed_rmse = None
     composition_match = _atomic_multiset_match(
         np.asarray(predicted.atomic_numbers, dtype=int),
         decode_atom_types(a=target_a, species_vocab=species_vocab)[0],
@@ -909,6 +916,23 @@ def evaluate_csp_reconstruction(
             rmse = None if rms is None else float(rms[0])
         except Exception:
             pass
+        if matched:
+            relaxed_matched = True
+            relaxed_rmse = rmse
+        else:
+            try:
+                relaxed_rms = StructureMatcher(
+                    stol=relaxed_stol,
+                    angle_tol=relaxed_angle_tol,
+                    ltol=relaxed_ltol,
+                ).get_rms_dist(
+                    predicted,
+                    target,
+                )
+                relaxed_matched = relaxed_rms is not None
+                relaxed_rmse = None if relaxed_rms is None else float(relaxed_rms[0])
+            except Exception:
+                pass
         if not matched:
             try:
                 matcher_diagnostics = diagnose_structure_mismatch(
@@ -929,6 +953,8 @@ def evaluate_csp_reconstruction(
         rmse=rmse,
         predicted_structure=predicted,
         target_structure=target,
+        relaxed_match=relaxed_matched,
+        relaxed_rmse=relaxed_rmse,
         formula=predicted.composition.formula,
         num_atoms=num_atoms,
         composition_match=composition_match,
@@ -965,6 +991,8 @@ def aggregate_csp_reconstruction_metrics(
     valid = [float(result.valid) for result in results]
     match = [float(result.match) for result in results]
     rmse = [float(result.rmse) for result in results if result.rmse is not None]
+    relaxed_match = [float(result.relaxed_match) for result in results]
+    relaxed_rmse = [float(result.relaxed_rmse) for result in results if result.relaxed_rmse is not None]
     frac_rmse = [float(result.frac_rmse) for result in results if result.frac_rmse is not None]
     standardized_frac_rmse = [
         float(result.matcher_diagnostics.standardized_frac_rmse)
@@ -1029,6 +1057,10 @@ def aggregate_csp_reconstruction_metrics(
         "match_rate": float(sum(match) / len(match)),
         "rmse": None if not rmse else float(sum(rmse) / len(rmse)),
         "rmse_defined_count": len(rmse),
+        "relaxed_match_rate": float(sum(relaxed_match) / len(relaxed_match)),
+        "relaxed_rmse": None if not relaxed_rmse else float(sum(relaxed_rmse) / len(relaxed_rmse)),
+        "relaxed_rmse_defined_count": len(relaxed_rmse),
+        "relaxed_near_miss_rate": float(sum(relaxed_match) / len(relaxed_match)) - float(sum(match) / len(match)),
         "frac_rmse": None if not frac_rmse else float(sum(frac_rmse) / len(frac_rmse)),
         "frac_rmse_defined_count": len(frac_rmse),
         "standardized_frac_rmse": (

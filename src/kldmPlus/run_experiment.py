@@ -222,9 +222,9 @@ def _parse_wandb_artifact_url(reference: str) -> tuple[str, str, str, str, str, 
         return None
 
     parts = [unquote(part) for part in parsed.path.split("/") if part]
-    if len(parts) < 8:
+    if len(parts) < 6:
         return None
-    if parts[2] != "artifacts" or parts[6] != "files":
+    if parts[2] != "artifacts":
         return None
 
     entity = parts[0]
@@ -232,9 +232,11 @@ def _parse_wandb_artifact_url(reference: str) -> tuple[str, str, str, str, str, 
     artifact_type = parts[3]
     artifact_name = parts[4]
     artifact_version = parts[5]
-    file_path = "/".join(parts[7:])
-    if not file_path:
-        return None
+    file_path = ""
+    if len(parts) > 6:
+        if parts[6] != "files":
+            return None
+        file_path = "/".join(parts[7:])
     return entity, project, artifact_type, artifact_name, artifact_version, file_path
 
 
@@ -253,20 +255,20 @@ def resolve_checkpoint_reference(reference: str | Path, *, config_path: Path) ->
             / artifact_version
         )
         expected_path = download_root / file_path
-        if expected_path.exists():
+        if file_path and expected_path.exists():
             return expected_path.resolve()
 
         artifact = wandb.Api().artifact(artifact_spec, type=artifact_type)
         artifact_dir = Path(artifact.download(root=str(download_root)))
-        checkpoint_path = artifact_dir / file_path
-        if checkpoint_path.exists():
+        checkpoint_path = artifact_dir / file_path if file_path else None
+        if checkpoint_path is not None and checkpoint_path.exists():
             print(
                 f"checkpoint_downloaded=wandb artifact={artifact_spec} file={checkpoint_path}",
                 flush=True,
             )
             return checkpoint_path.resolve()
 
-        matches = sorted(artifact_dir.rglob(Path(file_path).name))
+        matches = sorted(artifact_dir.rglob(Path(file_path).name if file_path else "*.pt"))
         if len(matches) == 1:
             chosen = matches[0].resolve()
             print(

@@ -1,0 +1,73 @@
+experiment_name: eval_plus_conv_sg_k_x0_power_ema_pc
+
+sampling:
+  checkpoint_path: https://wandb.ai/xanderbaatz-danmarks-tekniske-universitet-dtu/kldmplus_mp20_em_12000/artifacts/model/plus_mp20_conv_sg_k_x0_em_quad_power_ema_a100_latest/latest
+  method: pc
+  sampling_algorithm: 4
+  n_steps: 1000
+  t_start: 1.0
+  t_final: 1.0e-3
+  tau: 0.15
+  n_correction_steps: 1
+  n_samples: 1
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: diffcsp_k
+  root: null
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+
+model:
+  lattice_debug: false
+  eps: 1.0e-6
+  lambda_l: 1.0
+  lattice_parameterization: x0
+  lattice_diffusion_type: VP
+  lattice_representation: diffcsp_k
+  lattice_sg_lambda: 0.0
+  lattice_sg_normalize: true
+  lattice_sg_time_weight: alpha_squared
+  conv_sg_aux:
+    enabled: true
+    mode: direct
+    lambda: 1.0
+    time_weight: alpha2
+    require_valid_transform: true
+  lattice_orbit_metric_max_candidates: 512
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: true
+  tdm_velocity_scale: 0.15915494309189535
+  tdm_sigma_norm_estimator: quadrature
+  tdm_sigma_norm_density_K: 40
+  tdm_sigma_norm_grid_points: 8193
+  tdm_sigma_norm_mc_samples: 20000
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+sampling_eval:
+  evaluation: true
+  split: test
+  batch_size: 128
+  num_targets: 7236
+  subset_seed: 123
+  validity_cutoff: 0.5
+  n_seeds: 20
+  from_seed: 0
+  wandb_project: kldmplus_mp20_at1_at20_facit_samplers
+  wandb_run_name: EVAL_plus_conv_sg_k_x0_power_ema_pc
+  wandb_resume_id: null
+  progress_dir: ../../../artifacts/HPC/sampling_eval

@@ -36,6 +36,19 @@ TEST_SPLIT = "test"
 AT_K = 20
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 SAMPLING_PROGRESS_ROOT = WORKSPACE_ROOT / "artifacts" / "HPC" / "sampling_eval"
+EVAL_EXTRA_METRICS = (
+    ("requested_space_group_match_rate", "space_group_agreement"),
+    ("detected_family_agreement", "family_agreement"),
+    ("frac_rmse", "frac_rmse"),
+    ("lattice_angles_rmse", "angles_rmse"),
+    ("lattice_lengths_rmse", "length_rmse"),
+    ("volume_rel_error", "volume_rel_error"),
+)
+EVAL_RELAXED_METRICS = (
+    ("relaxed_match_rate", "match_rate"),
+    ("relaxed_rmse", "rmse"),
+    ("relaxed_near_miss_rate", "near_miss_rate"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +100,51 @@ def _json_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _space_group_to_family(space_group_number: int | None) -> str | None:
+    if space_group_number is None:
+        return None
+    sg = int(space_group_number)
+    if not 1 <= sg <= 230:
+        return None
+    if sg <= 2:
+        return "triclinic"
+    if sg <= 15:
+        return "monoclinic"
+    if sg <= 74:
+        return "orthorhombic"
+    if sg <= 142:
+        return "tetragonal"
+    if sg <= 167:
+        return "trigonal"
+    if sg <= 194:
+        return "hexagonal"
+    return "cubic"
+
+
+def _mean_std(values: list[float]) -> tuple[float | None, float | None]:
+    if not values:
+        return None, None
+    array = np.asarray(values, dtype=float)
+    return float(np.mean(array)), float(np.std(array))
+
+
+def _result_metric_payload(result: Any) -> dict[str, float | None]:
+    requested_family = _space_group_to_family(getattr(result, "requested_space_group", None))
+    detected_family = _space_group_to_family(getattr(result, "detected_space_group", None))
+    family_agreement = (
+        None if requested_family is None or detected_family is None
+        else float(requested_family == detected_family)
+    )
+    return {
+        "requested_space_group_match_rate": _json_float(getattr(result, "requested_space_group_match", None)),
+        "detected_family_agreement": family_agreement,
+        "frac_rmse": _json_float(getattr(result, "frac_rmse", None)),
+        "lattice_angles_rmse": _json_float(getattr(result, "lattice_angles_rmse", None)),
+        "lattice_lengths_rmse": _json_float(getattr(result, "lattice_lengths_rmse", None)),
+        "volume_rel_error": _json_float(getattr(result, "volume_rel_error", None)),
+    }
 
 
 class SamplingRunner:
@@ -327,8 +385,12 @@ class SamplingRunner:
             "from_seed": self.eval_from_seed,
             "completed_seeds": [],
             "seed_summaries": [],
+            "target_valid_count": [0 for _ in range(target_count)],
             "target_hit_count": [0 for _ in range(target_count)],
             "target_best_rmse": [None for _ in range(target_count)],
+            "target_relaxed_hit_count": [0 for _ in range(target_count)],
+            "target_best_relaxed_rmse": [None for _ in range(target_count)],
+            "target_best_metrics": [None for _ in range(target_count)],
             "first_seed_matches": None,
         }
 
@@ -369,39 +431,72 @@ class SamplingRunner:
         if seed in completed:
             return
 
+        target_valid = list(state.get("target_valid_count") or [0 for _ in range(len(results))])
         target_hits = list(state.get("target_hit_count", []))
         target_best_rmse = list(state.get("target_best_rmse", []))
-        if len(target_hits) != len(results) or len(target_best_rmse) != len(results):
+        target_relaxed_hits = list(state.get("target_relaxed_hit_count") or [0 for _ in range(len(results))])
+        target_best_relaxed_rmse = list(state.get("target_best_relaxed_rmse") or [None for _ in range(len(results))])
+        target_best_metrics = list(state.get("target_best_metrics") or [None for _ in range(len(results))])
+        if (
+            len(target_valid) != len(results)
+            or len(target_relaxed_hits) != len(results)
+            or len(target_best_relaxed_rmse) != len(results)
+            or len(target_hits) != len(results)
+            or len(target_best_rmse) != len(results)
+            or len(target_best_metrics) != len(results)
+        ):
             raise ValueError(
                 "Evaluation state target count mismatch "
-                f"state_hits={len(target_hits)} state_rmse={len(target_best_rmse)} results={len(results)}"
+                f"state_valid={len(target_valid)} state_hits={len(target_hits)} "
+                f"state_rmse={len(target_best_rmse)} state_relaxed_hits={len(target_relaxed_hits)} "
+                f"state_relaxed_rmse={len(target_best_relaxed_rmse)} "
+                f"state_metrics={len(target_best_metrics)} results={len(results)}"
             )
 
         for target_idx, result in enumerate(results):
+            if result.valid:
+                target_valid[target_idx] = int(target_valid[target_idx]) + 1
+            if getattr(result, "relaxed_match", False) and getattr(result, "relaxed_rmse", None) is not None:
+                target_relaxed_hits[target_idx] = int(target_relaxed_hits[target_idx]) + 1
+                current_relaxed_rmse = float(result.relaxed_rmse)
+                best_relaxed_rmse = target_best_relaxed_rmse[target_idx]
+                target_best_relaxed_rmse[target_idx] = (
+                    current_relaxed_rmse
+                    if best_relaxed_rmse is None
+                    else min(float(best_relaxed_rmse), current_relaxed_rmse)
+                )
             if not result.match or result.rmse is None:
                 continue
             target_hits[target_idx] = int(target_hits[target_idx]) + 1
             best_rmse = target_best_rmse[target_idx]
             current_rmse = float(result.rmse)
-            target_best_rmse[target_idx] = current_rmse if best_rmse is None else min(float(best_rmse), current_rmse)
+            if best_rmse is None or current_rmse <= float(best_rmse):
+                target_best_rmse[target_idx] = current_rmse
+                target_best_metrics[target_idx] = _result_metric_payload(result)
 
         if state.get("first_seed_matches") is None:
             state["first_seed_matches"] = [int(result.match) for result in results]
 
+        state["target_valid_count"] = target_valid
         state["target_hit_count"] = target_hits
         state["target_best_rmse"] = target_best_rmse
+        state["target_relaxed_hit_count"] = target_relaxed_hits
+        state["target_best_relaxed_rmse"] = target_best_relaxed_rmse
+        state["target_best_metrics"] = target_best_metrics
         state["completed_seeds"] = sorted([*completed, seed])
         seed_summaries = [item for item in state.get("seed_summaries", []) if int(item["seed"]) != seed]
-        seed_summaries.append(
-            {
-                "seed": seed,
-                "valid": _json_float(summary.get("valid")),
-                "match_rate": _json_float(summary.get("match_rate")),
-                "rmse": _json_float(summary.get("rmse")),
-                "composition_match_rate": _json_float(summary.get("composition_match_rate")),
-                "requested_space_group_match_rate": _json_float(summary.get("requested_space_group_match_rate")),
-            }
-        )
+        seed_summary = {
+            "seed": seed,
+            "valid": _json_float(summary.get("valid")),
+            "match_rate": _json_float(summary.get("match_rate")),
+            "rmse": _json_float(summary.get("rmse")),
+            "composition_match_rate": _json_float(summary.get("composition_match_rate")),
+        }
+        for source_key, _display_key in EVAL_EXTRA_METRICS:
+            seed_summary[source_key] = _json_float(summary.get(source_key))
+        for source_key, _display_key in EVAL_RELAXED_METRICS:
+            seed_summary[source_key] = _json_float(summary.get(source_key))
+        seed_summaries.append(seed_summary)
         state["seed_summaries"] = sorted(seed_summaries, key=lambda item: int(item["seed"]))
 
     def _summary_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -409,24 +504,76 @@ class SamplingRunner:
         valid_values = [float(item["valid"]) for item in seed_summaries if item.get("valid") is not None]
         match_values = [float(item["match_rate"]) for item in seed_summaries if item.get("match_rate") is not None]
         rmse_values = [float(item["rmse"]) for item in seed_summaries if item.get("rmse") is not None]
+        target_valid = np.asarray(state.get("target_valid_count") or [], dtype=int)
         target_hits = np.asarray(state.get("target_hit_count", []), dtype=int)
+        target_relaxed_hits = np.asarray(state.get("target_relaxed_hit_count") or [], dtype=int)
         reached = target_hits > 0
+        valid_reached = target_valid > 0
+        relaxed_reached = target_relaxed_hits > 0
         best_rmse_values = [float(value) for value in state.get("target_best_rmse", []) if value is not None]
+        best_relaxed_rmse_values = [
+            float(value) for value in state.get("target_best_relaxed_rmse", []) if value is not None
+        ]
+        completed_seed_count = len(state.get("completed_seeds", []))
+        match_frequencies = (
+            target_hits.astype(float) / float(completed_seed_count)
+            if completed_seed_count > 0 and target_hits.size > 0
+            else np.asarray([], dtype=float)
+        )
+
+        at_1_summary = {
+            "valid_mean": None if not valid_values else float(np.mean(valid_values)),
+            "valid_std": None if not valid_values else float(np.std(valid_values)),
+            "match_rate_mean": None if not match_values else float(np.mean(match_values)),
+            "match_rate_std": None if not match_values else float(np.std(match_values)),
+            "rmse_mean": None if not rmse_values else float(np.mean(rmse_values)),
+            "rmse_std": None if not rmse_values else float(np.std(rmse_values)),
+        }
+        at_k_summary = {
+            "valid_rate": None if target_valid.size == 0 else float(np.mean(valid_reached)),
+            "match_rate": None if target_hits.size == 0 else float(np.mean(reached)),
+            "rmse": None if not best_rmse_values else float(np.mean(best_rmse_values)),
+            "relaxed_match_rate": None if target_relaxed_hits.size == 0 else float(np.mean(relaxed_reached)),
+            "relaxed_rmse": (
+                None if not best_relaxed_rmse_values else float(np.mean(best_relaxed_rmse_values))
+            ),
+            "material_stability_mean": None if match_frequencies.size == 0 else float(np.mean(match_frequencies)),
+            "material_stability_std": None if match_frequencies.size == 0 else float(np.std(match_frequencies)),
+            "matched_material_stability_mean": (
+                None if not reached.any() else float(np.mean(match_frequencies[reached]))
+            ),
+        }
+        if at_k_summary["relaxed_match_rate"] is None or at_k_summary["match_rate"] is None:
+            at_k_summary["relaxed_near_miss_rate"] = None
+        else:
+            at_k_summary["relaxed_near_miss_rate"] = (
+                float(at_k_summary["relaxed_match_rate"]) - float(at_k_summary["match_rate"])
+            )
+        target_best_metrics = [item for item in state.get("target_best_metrics", []) if isinstance(item, dict)]
+        for source_key, display_key in EVAL_EXTRA_METRICS:
+            seed_values = [float(item[source_key]) for item in seed_summaries if item.get(source_key) is not None]
+            mean_value, std_value = _mean_std(seed_values)
+            at_1_summary[f"{display_key}_mean"] = mean_value
+            at_1_summary[f"{display_key}_std"] = std_value
+
+            best_values = [
+                float(item[source_key])
+                for item in target_best_metrics
+                if item.get(source_key) is not None
+            ]
+            best_mean, best_std = _mean_std(best_values)
+            at_k_summary[f"{display_key}_mean"] = best_mean
+            at_k_summary[f"{display_key}_std"] = best_std
+        for source_key, display_key in EVAL_RELAXED_METRICS:
+            seed_values = [float(item[source_key]) for item in seed_summaries if item.get(source_key) is not None]
+            mean_value, std_value = _mean_std(seed_values)
+            at_1_summary[f"relaxed_{display_key}_mean"] = mean_value
+            at_1_summary[f"relaxed_{display_key}_std"] = std_value
 
         return {
             "completed_seeds": [int(seed) for seed in state.get("completed_seeds", [])],
-            "at_1_summary": {
-                "valid_mean": None if not valid_values else float(np.mean(valid_values)),
-                "valid_std": None if not valid_values else float(np.std(valid_values)),
-                "match_rate_mean": None if not match_values else float(np.mean(match_values)),
-                "match_rate_std": None if not match_values else float(np.std(match_values)),
-                "rmse_mean": None if not rmse_values else float(np.mean(rmse_values)),
-                "rmse_std": None if not rmse_values else float(np.std(rmse_values)),
-            },
-            "at_k_summary": {
-                "match_rate": None if target_hits.size == 0 else float(np.mean(reached)),
-                "rmse": None if not best_rmse_values else float(np.mean(best_rmse_values)),
-            },
+            "at_1_summary": at_1_summary,
+            "at_k_summary": at_k_summary,
             "at_1_matches": list(state.get("first_seed_matches") or []),
             "at_k_matches": reached.astype(int).tolist(),
             "at_1_rmses": rmse_values,
@@ -453,7 +600,14 @@ class SamplingRunner:
                 f"match_rate={format_metric(summary['match_rate'], '.4f')} "
                 f"rmse={format_metric(summary['rmse'], '.6f')} "
                 f"composition_match_rate={format_metric(summary.get('composition_match_rate'), '.4f')} "
-                f"requested_sg_match_rate={format_metric(summary.get('requested_space_group_match_rate'), '.4f')}",
+                f"requested_sg_match_rate={format_metric(summary.get('requested_space_group_match_rate'), '.4f')} "
+                f"family_agreement={format_metric(summary.get('detected_family_agreement'), '.4f')} "
+                f"frac_rmse={format_metric(summary.get('frac_rmse'), '.6f')} "
+                f"length_rmse={format_metric(summary.get('lattice_lengths_rmse'), '.6f')} "
+                f"angles_rmse={format_metric(summary.get('lattice_angles_rmse'), '.6f')} "
+                f"relaxed_match_rate={format_metric(summary.get('relaxed_match_rate'), '.4f')} "
+                f"relaxed_rmse={format_metric(summary.get('relaxed_rmse'), '.6f')} "
+                f"relaxed_near_miss_rate={format_metric(summary.get('relaxed_near_miss_rate'), '.4f')}",
                 flush=True,
             )
             self._update_eval_state(state, seed=seed, results=results, summary=summary)
@@ -463,7 +617,9 @@ class SamplingRunner:
                 (
                     f"seed={seed} valid={format_metric(summary['valid'], '.4f')} "
                     f"match_rate={format_metric(summary['match_rate'], '.4f')} "
-                    f"rmse={format_metric(summary['rmse'], '.6f')}"
+                    f"rmse={format_metric(summary['rmse'], '.6f')} "
+                    f"relaxed_match_rate={format_metric(summary.get('relaxed_match_rate'), '.4f')} "
+                    f"relaxed_rmse={format_metric(summary.get('relaxed_rmse'), '.6f')}"
                 ),
             )
             wandb.log(
@@ -473,6 +629,14 @@ class SamplingRunner:
                     "evaluation/latest_seed_valid": summary["valid"],
                     "evaluation/latest_seed_match_rate": summary["match_rate"],
                     "evaluation/latest_seed_rmse": summary["rmse"],
+                    "evaluation/latest_seed_space_group_agreement": summary.get("requested_space_group_match_rate"),
+                    "evaluation/latest_seed_family_agreement": summary.get("detected_family_agreement"),
+                    "evaluation/latest_seed_frac_rmse": summary.get("frac_rmse"),
+                    "evaluation/latest_seed_length_rmse": summary.get("lattice_lengths_rmse"),
+                    "evaluation/latest_seed_angles_rmse": summary.get("lattice_angles_rmse"),
+                    "evaluation/latest_seed_relaxed_match_rate": summary.get("relaxed_match_rate"),
+                    "evaluation/latest_seed_relaxed_rmse": summary.get("relaxed_rmse"),
+                    "evaluation/latest_seed_relaxed_near_miss_rate": summary.get("relaxed_near_miss_rate"),
                 }
             )
             completed = {int(value) for value in state.get("completed_seeds", [])}
@@ -608,21 +772,48 @@ class SamplingRunner:
                 at_1 = summary["at_1_summary"]
                 at_k = summary["at_k_summary"]
                 log_data = {
+                    "facit_core/@1_valid_mean": at_1["valid_mean"],
+                    "facit_core/@1_valid_std": at_1["valid_std"],
+                    "facit_core/@1_match_rate_mean": at_1["match_rate_mean"],
+                    "facit_core/@1_match_rate_std": at_1["match_rate_std"],
+                    "facit_core/@1_rmse_mean": at_1["rmse_mean"],
+                    "facit_core/@1_rmse_std": at_1["rmse_std"],
+                    "facit_core/@20_valid_rate": at_k["valid_rate"],
+                    "facit_core/@20_match_rate": at_k["match_rate"],
+                    "facit_core/@20_rmse": at_k["rmse"],
                     "@1/valid_mean": at_1["valid_mean"],
                     "@1/valid_std": at_1["valid_std"],
                     "@1/match_rate_mean": at_1["match_rate_mean"],
                     "@1/match_rate_std": at_1["match_rate_std"],
                     "@1/rmse_mean": at_1["rmse_mean"],
                     "@1/rmse_std": at_1["rmse_std"],
-                    "@1/match_hist": wandb.Histogram(summary["at_1_matches"]),
+                    "histograms/@1_match": wandb.Histogram(summary["at_1_matches"]),
+                    "@20/valid_rate": at_k["valid_rate"],
                     "@20/match_rate": at_k["match_rate"],
                     "@20/rmse": at_k["rmse"],
-                    "@20/match_hist": wandb.Histogram(summary["at_k_matches"]),
+                    "relaxed_gt/@1_match_rate_mean": at_1.get("relaxed_match_rate_mean"),
+                    "relaxed_gt/@1_match_rate_std": at_1.get("relaxed_match_rate_std"),
+                    "relaxed_gt/@1_rmse_mean": at_1.get("relaxed_rmse_mean"),
+                    "relaxed_gt/@1_rmse_std": at_1.get("relaxed_rmse_std"),
+                    "relaxed_gt/@1_near_miss_rate_mean": at_1.get("relaxed_near_miss_rate_mean"),
+                    "relaxed_gt/@1_near_miss_rate_std": at_1.get("relaxed_near_miss_rate_std"),
+                    "relaxed_gt/@20_match_rate": at_k.get("relaxed_match_rate"),
+                    "relaxed_gt/@20_rmse": at_k.get("relaxed_rmse"),
+                    "relaxed_gt/@20_near_miss_rate": at_k.get("relaxed_near_miss_rate"),
+                    "stability/@20_material_stability_mean": at_k["material_stability_mean"],
+                    "stability/@20_material_stability_std": at_k["material_stability_std"],
+                    "stability/@20_matched_material_stability_mean": at_k["matched_material_stability_mean"],
+                    "histograms/@20_match": wandb.Histogram(summary["at_k_matches"]),
                 }
+                for _source_key, display_key in EVAL_EXTRA_METRICS:
+                    log_data[f"diagnostics/@1_{display_key}_mean"] = at_1.get(f"{display_key}_mean")
+                    log_data[f"diagnostics/@1_{display_key}_std"] = at_1.get(f"{display_key}_std")
+                    log_data[f"diagnostics/@20_{display_key}_mean"] = at_k.get(f"{display_key}_mean")
+                    log_data[f"diagnostics/@20_{display_key}_std"] = at_k.get(f"{display_key}_std")
                 if summary["at_1_rmses"]:
-                    log_data["@1/rmse_hist"] = wandb.Histogram(summary["at_1_rmses"])
+                    log_data["histograms/@1_rmse"] = wandb.Histogram(summary["at_1_rmses"])
                 if summary["at_k_rmses"]:
-                    log_data["@20/rmse_hist"] = wandb.Histogram(summary["at_k_rmses"])
+                    log_data["histograms/@20_rmse"] = wandb.Histogram(summary["at_k_rmses"])
                 log_data["evaluation/completed_seed_count"] = len(summary["completed_seeds"])
                 log_data["evaluation/completed_seeds"] = ",".join(str(seed) for seed in summary["completed_seeds"])
                 log_data["evaluation/complete"] = int(bool(summary["complete"]))
@@ -633,12 +824,30 @@ class SamplingRunner:
                     f"match_rate_mean={format_metric(at_1['match_rate_mean'], '.4f')} "
                     f"match_rate_std={format_metric(at_1['match_rate_std'], '.4f')} "
                     f"rmse_mean={format_metric(at_1['rmse_mean'], '.6f')} "
-                    f"rmse_std={format_metric(at_1['rmse_std'], '.6f')}",
+                    f"rmse_std={format_metric(at_1['rmse_std'], '.6f')} "
+                    f"space_group_agreement={format_metric(at_1.get('space_group_agreement_mean'), '.4f')} "
+                    f"family_agreement={format_metric(at_1.get('family_agreement_mean'), '.4f')} "
+                    f"frac_rmse={format_metric(at_1.get('frac_rmse_mean'), '.6f')} "
+                    f"length_rmse={format_metric(at_1.get('length_rmse_mean'), '.6f')} "
+                    f"angles_rmse={format_metric(at_1.get('angles_rmse_mean'), '.6f')} "
+                    f"relaxed_match_rate={format_metric(at_1.get('relaxed_match_rate_mean'), '.4f')} "
+                    f"relaxed_rmse={format_metric(at_1.get('relaxed_rmse_mean'), '.6f')} "
+                    f"relaxed_near_miss_rate={format_metric(at_1.get('relaxed_near_miss_rate_mean'), '.4f')}",
                     flush=True,
                 )
                 print(
-                    f"@20 match_rate={format_metric(at_k['match_rate'], '.4f')} "
+                    f"@20 valid_rate={format_metric(at_k.get('valid_rate'), '.4f')} "
+                    f"match_rate={format_metric(at_k['match_rate'], '.4f')} "
                     f"rmse={format_metric(at_k['rmse'], '.6f')} "
+                    f"space_group_agreement={format_metric(at_k.get('space_group_agreement_mean'), '.4f')} "
+                    f"family_agreement={format_metric(at_k.get('family_agreement_mean'), '.4f')} "
+                    f"frac_rmse={format_metric(at_k.get('frac_rmse_mean'), '.6f')} "
+                    f"length_rmse={format_metric(at_k.get('length_rmse_mean'), '.6f')} "
+                    f"angles_rmse={format_metric(at_k.get('angles_rmse_mean'), '.6f')} "
+                    f"relaxed_match_rate={format_metric(at_k.get('relaxed_match_rate'), '.4f')} "
+                    f"relaxed_rmse={format_metric(at_k.get('relaxed_rmse'), '.6f')} "
+                    f"relaxed_near_miss_rate={format_metric(at_k.get('relaxed_near_miss_rate'), '.4f')} "
+                    f"material_stability={format_metric(at_k.get('material_stability_mean'), '.4f')} "
                     f"completed_seeds={summary['completed_seeds']} "
                     f"state_path={summary['state_path']} "
                     f"log_path={summary['log_path']}",

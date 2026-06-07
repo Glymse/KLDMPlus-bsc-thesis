@@ -9,7 +9,7 @@ dataset:
   batch_size: 32
   num_workers: 0
   pin_memory: false
-  train_subset_fraction: 0.5
+  train_subset_fraction: 0.01
   train_subset_seed: 2002
   train_subset_strategy: balanced_space_group
 
@@ -72,7 +72,7 @@ logging:
   wandb_checkpoints: true
 
 validation:
-  every_n_epochs: 10
+  every_n_epochs: 2
   sampling_seed: 0
   ema_val: false
   subset_size: 6
