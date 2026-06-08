@@ -871,7 +871,7 @@ class ExperimentRunner:
                 t_graph = sample_times(batch, lower_bound=TIME_LOWER_BOUND)
 
                 with torch.no_grad():
-                    _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
+                    _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=True)
 
                 total_loss_v += float(metrics["loss_v"]) * int(batch.pos.shape[0])
                 total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
@@ -1078,8 +1078,27 @@ class ExperimentRunner:
                 "num_samples": summary.get("num_samples"),
             }
 
-        single_seed = int(self.validation_cfg.get("sampling_seed", 0))
-        return collect_one_pass(seed=single_seed)
+        first_seed = int(self.validation_cfg.get("sampling_seed", 0))
+        num_sampling_seeds = int(self.validation_cfg.get("num_sampling_seeds", 1))
+        if num_sampling_seeds <= 1:
+            return collect_one_pass(seed=first_seed)
+
+        seed_metrics = [collect_one_pass(seed=first_seed + offset) for offset in range(num_sampling_seeds)]
+        merged: dict[str, Any] = {"num_sampling_seeds": num_sampling_seeds}
+        keys = sorted({key for metrics in seed_metrics for key in metrics})
+        for key in keys:
+            values = [metrics.get(key) for metrics in seed_metrics]
+            numeric_values = [
+                float(value)
+                for value in values
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and not np.isnan(float(value))
+            ]
+            if numeric_values:
+                merged[key] = float(np.mean(np.asarray(numeric_values, dtype=float)))
+                merged[f"{key}_std"] = float(np.std(np.asarray(numeric_values, dtype=float)))
+            else:
+                merged[key] = values[0] if values else None
+        return merged
 
     def save_checkpoint(
         self,
@@ -1300,6 +1319,22 @@ class ExperimentRunner:
             "val/lattice_angles_rmse": merged_metrics["lattice_angles_rmse"],
             "val/volume_rel_error": merged_metrics["volume_rel_error"],
         }
+        for metric_name in (
+            "valid",
+            "match_rate",
+            "rmse",
+            "frac_rmse",
+            "detected_family_agreement",
+            "detected_sg_agreement",
+            "lattice_lengths_rmse",
+            "lattice_angles_rmse",
+            "volume_rel_error",
+        ):
+            std_key = f"{metric_name}_std"
+            if std_key in val_sample_metrics:
+                log_data[f"val/{std_key}"] = val_sample_metrics.get(std_key)
+        if "num_sampling_seeds" in val_sample_metrics:
+            log_data["val/num_sampling_seeds"] = val_sample_metrics.get("num_sampling_seeds")
         self.add_lattice_log_data(log_data, merged_metrics, prefix="val")
         if self.lattice_debug_enabled():
             log_data.update(

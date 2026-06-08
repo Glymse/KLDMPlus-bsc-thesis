@@ -35,6 +35,9 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
     conv_sg_require_valid_transform = bool(
         conv_sg_aux.get("require_valid_transform", cfg.get("conv_sg_require_valid_transform", True))
     )
+    conv_sg_control_mode = str(
+        conv_sg_aux.get("control_mode", conv_sg_aux.get("control", cfg.get("conv_sg_control_mode", "none")))
+    )
 
     n_sigmas = cfg.get("tdm_n_sigmas")
     if n_sigmas is None:
@@ -61,6 +64,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         lambda_conv_sg=lambda_conv_sg,
         conv_sg_time_weight=conv_sg_time_weight,
         conv_sg_require_valid_transform=conv_sg_require_valid_transform,
+        conv_sg_control_mode=conv_sg_control_mode,
         lattice_debug=bool(cfg.get("lattice_debug", False)),
         lattice_orbit_metric_max_candidates=cfg.get("lattice_orbit_metric_max_candidates", 512),
         score_network_kwargs=score_network,

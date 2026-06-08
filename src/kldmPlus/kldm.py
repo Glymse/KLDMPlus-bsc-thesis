@@ -107,6 +107,7 @@ class ModelKLDM(nn.Module):
         lambda_conv_sg: float = 0.0,
         conv_sg_time_weight: str = "alpha_squared",
         conv_sg_require_valid_transform: bool = True,
+        conv_sg_control_mode: str = "none",
         lattice_debug: bool = False,
         lattice_orbit_metric_max_candidates: int | None = 512,
         *,
@@ -146,6 +147,7 @@ class ModelKLDM(nn.Module):
         self.lambda_conv_sg = float(lambda_conv_sg)
         self.conv_sg_time_weight = "alpha_squared" if str(conv_sg_time_weight) == "alpha2" else str(conv_sg_time_weight)
         self.conv_sg_require_valid_transform = bool(conv_sg_require_valid_transform)
+        self.conv_sg_control_mode = str(conv_sg_control_mode)
         self.lattice_debug = bool(lattice_debug)
         self.lattice_orbit_metric_max_candidates = lattice_orbit_metric_max_candidates
         self.lattice_symmetry = LatticeSymmetry(eps=eps)
@@ -162,6 +164,8 @@ class ModelKLDM(nn.Module):
             raise ValueError("lattice_sg_time_weight must be 'none', 'quadratic_late', or 'alpha_squared'.")
         if self.conv_sg_time_weight not in {"none", "quadratic_late", "alpha_squared"}:
             raise ValueError("conv_sg_time_weight must be 'none', 'quadratic_late', 'alpha2', or 'alpha_squared'.")
+        if self.conv_sg_control_mode not in {"none", "shuffle_batch"}:
+            raise ValueError("conv_sg_control_mode must be 'none' or 'shuffle_batch'.")
 
     def _lattice_sg_time_weight_values(self, t_lattice: torch.Tensor, mode: str | None = None) -> torch.Tensor:
         t_graph = t_lattice.reshape(-1).to(dtype=torch.get_default_dtype())
@@ -260,7 +264,6 @@ class ModelKLDM(nn.Module):
         Algorithm 2 in KLDM:
         network prediction + denoising score matching loss.
         """
-        del debug
         device = next(self.parameters()).device
         batch = batch.to(device)
         index = batch.batch
@@ -369,6 +372,15 @@ class ModelKLDM(nn.Module):
             if self.conv_sg_require_valid_transform and float(conv_weight_graph.detach().sum().item()) <= 0.0:
                 raise RuntimeError("Conventional SG auxiliary is enabled, but this batch has no valid conv_C transforms.")
             sg = space_group.to(device=out_l.device)
+            if self.conv_sg_control_mode == "shuffle_batch":
+                if num_graphs > 1:
+                    # Fake-control: preserve the SG/conv_C distribution but break graph correspondence.
+                    perm = torch.arange(num_graphs, device=out_l.device).roll(1)
+                    sg = sg.reshape(-1)[perm]
+                    conv_C = conv_C[perm]
+                    conv_weight_graph = conv_weight_graph[perm]
+                else:
+                    conv_weight_graph = torch.zeros_like(conv_weight_graph)
             loss_conv_sg_graph_raw, conv_residual_pred_raw = self.lattice_symmetry.conventional_sg_loss_and_residual_per_graph(
                 primitive_k0=out_l,
                 conv_C=conv_C,
@@ -387,6 +399,24 @@ class ModelKLDM(nn.Module):
                 )
                 conv_denom = conv_weight_graph.detach().sum().clamp_min(1.0)
                 conv_projection_error_pred = (conv_weight_graph.detach() * conv_residual_pred_raw.detach()).sum() / conv_denom
+                conv_projection_error_gt = (conv_weight_graph.detach() * conv_residual_gt).sum() / conv_denom
+        elif debug and self.lattice_representation == "diffcsp_k" and has_sg_labels and hasattr(batch, "conv_C") and hasattr(batch, "conv_weight"):
+            with torch.no_grad():
+                conv_C = batch.conv_C.to(device=out_l.device, dtype=out_l.dtype).reshape(num_graphs, 3, 3)
+                conv_weight_graph = batch.conv_weight.to(device=out_l.device, dtype=out_l.dtype).reshape(-1)
+                sg = space_group.to(device=out_l.device)
+                conv_residual_pred = self.lattice_symmetry.conventional_sg_residual_abs_mean(
+                    out_l.detach(),
+                    conv_C,
+                    sg,
+                )
+                conv_residual_gt = self.lattice_symmetry.conventional_sg_residual_abs_mean(
+                    target_l.detach(),
+                    conv_C,
+                    sg,
+                )
+                conv_denom = conv_weight_graph.detach().sum().clamp_min(1.0)
+                conv_projection_error_pred = (conv_weight_graph.detach() * conv_residual_pred).sum() / conv_denom
                 conv_projection_error_gt = (conv_weight_graph.detach() * conv_residual_gt).sum() / conv_denom
 
         loss_l_weighted_graph = self.lambda_l * loss_l_graph

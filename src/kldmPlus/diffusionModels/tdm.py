@@ -271,8 +271,7 @@ class TrivialisedDiffusion(nn.Module):
 
 
         #As suspected, this is indeed a error in the KLDM paper appendix.
-        #This will break the [-0.5, 0.5] space. Instead they meant to
-        #Center the target position instead.
+        #This will break the [-0.5, 0.5] space.
         #f_t = scatter_center(f_t, index=index)
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
