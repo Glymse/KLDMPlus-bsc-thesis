@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-config", default=str(DEFAULT_BASE_CONFIG), help="Base YAML config to clone.")
     parser.add_argument("--project", default="kldm_plus_ablation", help="WandB project for all ablation runs.")
     parser.add_argument("--max-epochs", type=int, default=2000, help="Epochs per ablation run.")
-    parser.add_argument("--val-seeds", type=int, default=3, help="Number of validation sampling seeds at final validation.")
+    parser.add_argument("--val-seeds", type=int, default=10, help="Number of validation sampling seeds at final validation.")
     parser.add_argument("--sampling-max-graphs", type=int, default=1024, help="Max graphs for final seeded sampling validation.")
     parser.add_argument("--sym-lambdas", type=float, nargs="*", default=[1.0, 3.0], help="Real conventional-SG lambda values.")
     parser.add_argument("--fake-control-lambda", type=float, default=1.0, help="lambda_conv_sg for shuffled fake-control.")

@@ -57,7 +57,7 @@ echo "base_config=$BASE_CONFIG"
 echo "project=kldm_plus_ablation"
 echo "variants=lambda1 lambda3"
 echo "max_epochs=2000"
-echo "val_seeds=3"
+echo "val_seeds=10"
 echo "sampling_max_graphs=1024"
 echo "ema=fixed"
 echo "tmpdir=$TMPDIR"
@@ -68,7 +68,7 @@ CMD=(
   --base-config "$BASE_CONFIG"
   --project kldm_plus_ablation
   --max-epochs 2000
-  --val-seeds 3
+  --val-seeds 10
   --sampling-max-graphs 1024
   --skip-no-sym
   --skip-fake-control
