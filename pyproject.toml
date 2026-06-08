@@ -25,7 +25,7 @@ dependencies = [
   "mattergen==1.0.3",
   "numpy<2.0",
   "omegaconf>=2.3,<2.4",
-  "pandas==2.2.3",
+  "pandas==2.3.3",
   "pytorch-lightning==2.0.6",
   "pymatgen>=2024.1.0",
   "requests",
