@@ -73,6 +73,14 @@ signal.signal(signal.SIGTERM, _request_stop)
 signal.signal(signal.SIGINT, _request_stop)
 
 
+def model_gradients_are_finite(model: torch.nn.Module) -> bool:
+    # Protect long runs from a single unstable batch poisoning all parameters.
+    for parameter in model.parameters():
+        if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+            return False
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a KLDM experiment from a YAML config.")
     parser.add_argument("--config", required=True, help="Path to the experiment YAML file.")
@@ -441,6 +449,8 @@ class ExperimentRunner:
         self.validate_every_epochs = int(self.validation_cfg["every_n_epochs"])
         self.max_epochs = self.training_cfg.get("max_epochs")
         self.max_epochs = None if self.max_epochs is None else int(self.max_epochs)
+        self.max_grad_norm = self.training_cfg.get("max_grad_norm")
+        self.max_grad_norm = None if self.max_grad_norm is None else float(self.max_grad_norm)
 
         # -------------------------------------------------
         # Runtime objects: device, data, model, optimizer, EMA
@@ -715,6 +725,8 @@ class ExperimentRunner:
         total_to_device_seconds = 0.0
         total_step_seconds = 0.0
         total_ema_seconds = 0.0
+        skipped_nonfinite_loss_batches = 0
+        skipped_nonfinite_grad_batches = 0
         epoch_start = time.perf_counter()
         batch_fetch_start = time.perf_counter()
 
@@ -741,7 +753,36 @@ class ExperimentRunner:
                 time_weight=sampled_weights,
                 debug=False,
             )
+            if not torch.isfinite(loss.detach()).all():
+                skipped_nonfinite_loss_batches += 1
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                total_step_seconds += time.perf_counter() - step_start
+                print(
+                    f"train_batch_skipped epoch={epoch:04d} batch={batch_idx} reason=nonfinite_loss "
+                    f"loss={float(loss.detach().cpu()) if loss.detach().numel() == 1 else 'non_scalar'}",
+                    flush=True,
+                )
+                batch_fetch_start = time.perf_counter()
+                continue
+
             loss.backward()
+            if self.max_grad_norm is not None and self.max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.max_grad_norm))
+            if not model_gradients_are_finite(self.model):
+                skipped_nonfinite_grad_batches += 1
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                total_step_seconds += time.perf_counter() - step_start
+                print(
+                    f"train_batch_skipped epoch={epoch:04d} batch={batch_idx} reason=nonfinite_grad",
+                    flush=True,
+                )
+                batch_fetch_start = time.perf_counter()
+                continue
+
             self.optimizer.step()
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -842,6 +883,9 @@ class ExperimentRunner:
             "to_device_seconds": total_to_device_seconds,
             "step_seconds": total_step_seconds,
             "ema_seconds": total_ema_seconds,
+            "skipped_nonfinite_batches": skipped_nonfinite_loss_batches + skipped_nonfinite_grad_batches,
+            "skipped_nonfinite_loss_batches": skipped_nonfinite_loss_batches,
+            "skipped_nonfinite_grad_batches": skipped_nonfinite_grad_batches,
         }
         return metrics
 
@@ -1449,6 +1493,9 @@ class ExperimentRunner:
                         "train/to_device_seconds": train_metrics["to_device_seconds"],
                         "train/step_seconds": train_metrics["step_seconds"],
                         "train/ema_seconds": train_metrics["ema_seconds"],
+                        "train/skipped_nonfinite_batches": train_metrics["skipped_nonfinite_batches"],
+                        "train/skipped_nonfinite_loss_batches": train_metrics["skipped_nonfinite_loss_batches"],
+                        "train/skipped_nonfinite_grad_batches": train_metrics["skipped_nonfinite_grad_batches"],
                     }
                     self.add_lattice_log_data(log_data, train_metrics, prefix="train")
                     for key, value in train_metrics.items():
@@ -1466,7 +1513,8 @@ class ExperimentRunner:
                         f"data_wait_s={train_metrics['data_wait_seconds']:.1f}, "
                         f"to_device_s={train_metrics['to_device_seconds']:.1f}, "
                         f"step_s={train_metrics['step_seconds']:.1f}, "
-                        f"ema_s={train_metrics['ema_seconds']:.1f})",
+                        f"ema_s={train_metrics['ema_seconds']:.1f}, "
+                        f"skipped_nonfinite={int(train_metrics['skipped_nonfinite_batches'])})",
                         flush=True,
                     )
 
