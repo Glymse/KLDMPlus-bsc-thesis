@@ -13,6 +13,7 @@ from torch_geometric.utils import dense_to_sparse
 # Atomic vocabulary used when atom types are represented by indices.
 # Here the vocabulary is simply all elements with atomic number 1 to 118.
 DEFAULT_ATOMIC_VOCAB: list[int] = list(range(1, 119))
+DEFAULT_X0_ANGLE_STATS: tuple[float, float] = (0.0, 0.35)
 
 
 """
@@ -56,6 +57,12 @@ feature vector to `sample.l`. During sampling or evaluation, the transform is
 inverted back to physical lengths and angles with the matching x0 statistics
 for the current number of atoms.
 """
+
+# Segments marked with
+# `#code segment is from original kldm code. data/transforms.py`
+# follow the original x0 preprocessing pattern closely.
+# Reference:
+# /Users/glymov/DTU/6 Semester/Bachelor/Github/Main/kldm/src/facitKLDM/kldm-main-git/src_kldm/data/transforms.py
 
 def cell_lengths_and_angles(cell: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert a 3x3 lattice matrix to lengths and angles.
@@ -249,11 +256,15 @@ class ContinuousIntervalLattice(Transform):
     Forward transform:
         cell matrix -> 6D lattice vector
 
-    standardization is x0:
-        l_standardized = (l - loc) / scale
+    eps mode:
+        use the transformed 6D lattice vector directly
+
+    x0 mode:
+        standardize log-lengths with graph-size-specific stats
+        standardize angle features with one shared loc/scale pair
 
     Inverse transform:
-        l -> unstandardize -> lengths and angles
+        l -> physical lengths and angles
 
     Input ChemGraph:
         Must contain:
@@ -287,7 +298,9 @@ class ContinuousIntervalLattice(Transform):
         self.lengths_loc_scale: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
         self.angles_loc_scale: tuple[torch.Tensor, torch.Tensor] | None = None
 
-        if self.standardize and self.cache_file is not None and self.cache_file.exists():
+        if self.standardize:
+            if self.cache_file is None or not self.cache_file.exists():
+                raise ValueError("x0 lattice mode requires an existing stats cache.")
             with self.cache_file.open("r", encoding="utf-8") as handle:
                 stats = json.load(handle)
 
@@ -306,7 +319,6 @@ class ContinuousIntervalLattice(Transform):
         while loc.ndim < value.ndim:
             loc = loc.unsqueeze(0)
             scale = scale.unsqueeze(0)
-
         return loc, scale
 
     def standardize_value(self, value: torch.Tensor) -> torch.Tensor:
@@ -375,8 +387,7 @@ class ContinuousIntervalLattice(Transform):
         if not self.standardize or self.loc is None or self.scale is None:
             return value
 
-        loc, scale = self._move_stats_to(value)
-        return value * scale + loc
+        return log_lengths, angle_features
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         """Encode a sample's cell matrix into `sample.l`.

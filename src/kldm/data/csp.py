@@ -223,6 +223,8 @@ class CSPTask:
         num_workers: int = 2,
         pin_memory: bool = False,
         download: bool = False,
+        generator=None,
+        worker_init_fn=None,
     ) -> DataLoader:
         """Create a PyTorch dataloader for CSP.
 
@@ -247,6 +249,12 @@ class CSPTask:
 
             download:
                 If True, download raw CSV if missing.
+
+            generator:
+                Optional torch generator controlling shuffle order.
+
+            worker_init_fn:
+                Optional per-worker seed initializer.
 
         Output:
             DataLoader yielding PyG Batch objects.
@@ -280,4 +288,6 @@ class CSPTask:
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=dataset.collate_fn,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
         )

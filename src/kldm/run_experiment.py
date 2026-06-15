@@ -3,15 +3,19 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from datetime import datetime
+import random
+import re
 import signal
 from pathlib import Path
 import sys
 import tempfile
 from typing import Any, Mapping
+from urllib.parse import unquote
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 import yaml
@@ -31,6 +35,7 @@ TIME_LOWER_BOUND = 1e-3
 STOP_REQUESTED = False
 TRAIN_SPLIT = "train"
 VAL_SPLIT = "val"
+TRAIN_SEED = 2002
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -89,6 +94,28 @@ def build_run_name() -> str:
     return f"trial_{now.strftime('%Y%m%d')}"
 
 
+def set_global_training_seed(seed: int = TRAIN_SEED) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def _seed_worker_factory(base_seed: int):
+    def _seed_worker(worker_id: int) -> None:
+        worker_seed = int(base_seed) + int(worker_id)
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    return _seed_worker
+
+
 def format_metric(value: float | int | None, fmt: str) -> str:
     if value is None:
         return "na"
@@ -142,6 +169,84 @@ def save_wandb_checkpoint(path: Path) -> None:
         wandb.save(str(path), policy="now")
 
 
+WANDB_ARTIFACT_URL_RE = re.compile(
+    r"^https?://wandb\.ai/"
+    r"(?P<entity>[^/]+)/"
+    r"(?P<project>[^/]+)/"
+    r"artifacts/"
+    r"(?P<artifact_type>[^/]+)/"
+    r"(?P<artifact_name>[^/]+)/"
+    r"(?P<version>v[^/]+)"
+    r"(?:/files/(?P<file_path>.+))?$"
+)
+
+
+def _artifact_cache_dir(experiment_name: str, entity: str, project: str, artifact_name: str, version: str) -> Path:
+    safe_name = "__".join((entity, project, artifact_name, version))
+    return CHECKPOINTS_ROOT / experiment_name / "resume_artifacts" / safe_name
+
+
+def _parse_wandb_artifact_url(resume_from: str) -> dict[str, str] | None:
+    match = WANDB_ARTIFACT_URL_RE.match(str(resume_from).strip())
+    if match is None:
+        return None
+    parsed = match.groupdict()
+    parsed["file_path"] = unquote(parsed.get("file_path") or "")
+    return parsed
+
+
+def resolve_resume_checkpoint(
+    *,
+    resume_from: str,
+    config_path: Path,
+    experiment_name: str,
+) -> Path:
+    artifact_info = _parse_wandb_artifact_url(resume_from)
+    if artifact_info is None:
+        return (config_path.parent / str(resume_from)).expanduser().resolve()
+
+    artifact_cache_dir = _artifact_cache_dir(
+        experiment_name=experiment_name,
+        entity=artifact_info["entity"],
+        project=artifact_info["project"],
+        artifact_name=artifact_info["artifact_name"],
+        version=artifact_info["version"],
+    )
+    requested_file = artifact_info["file_path"]
+    if not requested_file:
+        raise ValueError(
+            "W&B artifact resume link must point to a specific checkpoint file under /files/..."
+        )
+
+    resolved_path = artifact_cache_dir / requested_file
+    if resolved_path.exists():
+        print(f"resume_checkpoint_cached={resolved_path}", flush=True)
+        return resolved_path
+
+    artifact_ref = (
+        f"{artifact_info['entity']}/"
+        f"{artifact_info['project']}/"
+        f"{artifact_info['artifact_name']}:"
+        f"{artifact_info['version']}"
+    )
+
+    artifact_cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f"resume_checkpoint_download=wandb artifact={artifact_ref}", flush=True)
+    artifact = wandb.Api().artifact(
+        artifact_ref,
+        type=artifact_info["artifact_type"],
+    )
+    artifact.download(root=str(artifact_cache_dir))
+
+    if not resolved_path.exists():
+        raise FileNotFoundError(
+            f"Downloaded W&B artifact but could not find requested file: {resolved_path}"
+        )
+
+    print(f"resume_checkpoint_downloaded={resolved_path}", flush=True)
+    return resolved_path
+
+
 class ExperimentRunner:
     def __init__(self, config_path: str | Path) -> None:
         from kldm.utils.model_loader import build_training_components, load_checkpoint
@@ -163,6 +268,7 @@ class ExperimentRunner:
         # -------------------------------------------------
         # Runtime objects: device, data, model, optimizer, EMA
         # -------------------------------------------------
+        set_global_training_seed(TRAIN_SEED)
         self.device = get_default_device()
         self.train_loader, self.val_loader, self.lattice_transform = self.create_loaders()
 
@@ -178,8 +284,13 @@ class ExperimentRunner:
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
         if resume_from:
+            checkpoint_path = resolve_resume_checkpoint(
+                resume_from=str(resume_from),
+                config_path=self.config_path,
+                experiment_name=self.experiment_name,
+            )
             checkpoint = load_checkpoint(
-                checkpoint_path=(self.config_path.parent / str(resume_from)).expanduser().resolve(),
+                checkpoint_path=checkpoint_path,
                 model=self.model,
                 optimizer=self.optimizer,
                 ema=self.ema,
@@ -203,6 +314,8 @@ class ExperimentRunner:
         batch_size = int(dataset_cfg["batch_size"])
         num_workers = int(dataset_cfg["num_workers"])
         pin_memory = bool(dataset_cfg["pin_memory"])
+        train_generator = torch.Generator().manual_seed(TRAIN_SEED)
+        worker_init_fn = _seed_worker_factory(TRAIN_SEED)
 
         # Keep training/validation splits fixed so experiment metrics are always
         # comparable across runs.
@@ -214,6 +327,8 @@ class ExperimentRunner:
             num_workers=num_workers,
             pin_memory=pin_memory,
             download=True,
+            generator=train_generator,
+            worker_init_fn=worker_init_fn,
         )
 
         # Validation always uses the validation split, optionally with a fixed
@@ -231,6 +346,7 @@ class ExperimentRunner:
             num_workers=num_workers,
             pin_memory=pin_memory,
             collate_fn=val_dataset_full.collate_fn,
+            worker_init_fn=worker_init_fn,
         )
 
         return train_loader, val_loader, task.make_lattice_transform(root=root, download=True)
