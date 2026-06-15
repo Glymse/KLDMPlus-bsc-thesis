@@ -24,6 +24,7 @@ class LatticeSymmetry(nn.Module):
         self.register_buffer("unimodular_basis_candidates", unimodular_basis_candidates)
 
     def _make_basis(self) -> torch.Tensor:
+        # This code is from DiffCSP++ repo.
         basis = torch.tensor(
             [
                 [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
@@ -38,6 +39,7 @@ class LatticeSymmetry(nn.Module):
         return basis / basis.norm(dim=(-1, -2), keepdim=True).clamp_min(self.eps)
 
     def _constraint_for_spacegroup(self, sg: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # This code is from DiffCSP++ repo.
         mask = torch.ones(6, dtype=torch.get_default_dtype())
         bias = torch.zeros(6, dtype=torch.get_default_dtype())
 
@@ -80,20 +82,24 @@ class LatticeSymmetry(nn.Module):
         return spacegroup.reshape(-1).long().clamp(min=0, max=230)
 
     def de_so3(self, lattices: torch.Tensor) -> torch.Tensor:
+        # This code is from DiffCSP++ repo.
         gram = lattices @ lattices.transpose(-1, -2)
         return self.sqrtm_spd(gram)
 
     def m2v(self, mats: torch.Tensor) -> torch.Tensor:
+        # This code is from DiffCSP++ repo.
         log_mat = self.logm_spd(mats)
         basis = self.basis.to(device=mats.device, dtype=mats.dtype)
         return torch.einsum("bij,kij->bk", log_mat, basis)
 
     def v2m(self, vecs: torch.Tensor) -> torch.Tensor:
+        # This code is from DiffCSP++ repo.
         basis = self.basis.to(device=vecs.device, dtype=vecs.dtype)
         log_mat = torch.einsum("bk,kij->bij", vecs, basis)
         return torch.matrix_exp(log_mat)
 
     def proj_k_to_spacegroup(self, vecs: torch.Tensor, spacegroup: torch.Tensor) -> torch.Tensor:
+        # This code is from DiffCSP++ repo.
         mask, bias = self.mask_bias(spacegroup, vecs)
         return vecs * mask + bias
 
