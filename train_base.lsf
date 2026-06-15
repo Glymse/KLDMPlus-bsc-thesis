@@ -1,0 +1,96 @@
+#!/bin/bash
+set -euo pipefail
+
+# Base KLDM training script.
+# Submit with e.g.:
+#   bsub -J mp20_lattice_eps_em < train_base.lsf
+#   bsub -J mp20_lattice_x0_pc < train_base.lsf
+# Or override explicitly:
+#   KLDM_CONFIG_NAME=mp20_lattice_x0_em bsub < train_base.lsf
+
+#BSUB -J mp20_lattice_eps_em
+#BSUB -q gpuv100
+#BSUB -n 4
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=8GB]"
+#BSUB -W 12:00
+#BSUB -o logs/train_%J.out
+#BSUB -e logs/train_%J.err
+
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$(pwd)}}"
+cd "$REPO_ROOT"
+
+mkdir -p \
+  logs \
+  artifacts/HPC \
+  artifacts/HPC/checkpoints \
+  artifacts/HPC/checkpoints/experiments
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+export TMPDIR="${TMPDIR:-/tmp/$USER/${LSB_JOBID:-kldm_train}}"
+mkdir -p "$TMPDIR"
+
+export XDG_CACHE_HOME="$TMPDIR/.cache"
+export XDG_DATA_HOME="$TMPDIR/.local/share"
+export UV_CACHE_DIR="$TMPDIR/uv_cache"
+export WANDB_CACHE_DIR="$TMPDIR/wandb_cache"
+export WANDB_DATA_DIR="$TMPDIR/wandb_data"
+export WANDB_ARTIFACT_DIR="$TMPDIR/wandb_artifacts"
+export WANDB_DIR="$TMPDIR/wandb_runs"
+
+cleanup_job_cache() {
+  rm -rf \
+    "$UV_CACHE_DIR" \
+    "$WANDB_CACHE_DIR" \
+    "$WANDB_DATA_DIR" \
+    "$WANDB_ARTIFACT_DIR" \
+    "$WANDB_DIR" \
+    "$XDG_CACHE_HOME" \
+    "$XDG_DATA_HOME"
+}
+trap cleanup_job_cache EXIT
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+ENTRYPOINT="src/kldm/run_experiment.py"
+CONFIG_NAME="${LSB_JOBNAME:-${KLDM_CONFIG_NAME:-mp20_lattice_eps_em}}"
+CONFIG_PATH="configs/mp20/${CONFIG_NAME}.yaml"
+
+if [ ! -f "$CONFIG_PATH" ]; then
+  echo "error: config file not found: $CONFIG_PATH" >&2
+  exit 1
+fi
+
+date
+hostname
+pwd
+echo "entrypoint=$ENTRYPOINT"
+echo "config_name=$CONFIG_NAME"
+echo "config=$CONFIG_PATH"
+echo "tmpdir=$TMPDIR"
+echo "config_preview:"
+grep -E '^(experiment_name:|sampler_config:|  lattice_parameterization:|  wrapped_normal_K:|  tdm_velocity_scale:|  batch_size:)' "$CONFIG_PATH" || true
+nvidia-smi || true
+
+CMD=(
+  uv run --locked --python 3.11 python "$ENTRYPOINT"
+  --config "$CONFIG_PATH"
+)
+
+printf 'command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+
+"${CMD[@]}"

@@ -63,16 +63,61 @@ if [ -f "$HOME/.wandb_env" ]; then
   source "$HOME/.wandb_env"
 fi
 
-ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_experiment.py}"
 # Follow the submitted LSF job name by default so one submit flag controls both
 # the queue label and the selected config file.
 CONFIG_NAME="${LSB_JOBNAME:-${KLDM_CONFIG_NAME:-mp20_lattice_eps_em}}"
-CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/${CONFIG_NAME}.yaml}"
+CONFIG_DIR="${KLDM_CONFIG_DIR:-configs/mp20}"
+CONFIG_PATH="${KLDM_CONFIG:-${CONFIG_DIR}/${CONFIG_NAME}.yaml}"
+BASE_CONFIG_PATH="configs/mp20/${CONFIG_NAME}.yaml"
+PLUS_CONFIG_PATH="configs/kldm_plus/mp_20/${CONFIG_NAME}.yaml"
+
+if [ -z "${KLDM_CONFIG:-}" ] && [ -z "${KLDM_CONFIG_DIR:-}" ]; then
+  if [ -f "$BASE_CONFIG_PATH" ] && [ -f "$PLUS_CONFIG_PATH" ]; then
+    echo "error: ambiguous config selection for job name '$CONFIG_NAME'." >&2
+    echo "Both of these exist:" >&2
+    echo "  $BASE_CONFIG_PATH" >&2
+    echo "  $PLUS_CONFIG_PATH" >&2
+    echo "Pass one explicitly with KLDM_CONFIG=... or KLDM_CONFIG_DIR=..." >&2
+    exit 1
+  fi
+fi
 
 if [ ! -f "$CONFIG_PATH" ]; then
   echo "error: config file not found: $CONFIG_PATH" >&2
   exit 1
 fi
+
+if [ -z "${KLDM_ENTRYPOINT:-}" ]; then
+  case "$CONFIG_PATH" in
+    configs/kldm_plus/*)
+      ENTRYPOINT="src/kldmPlus/run_experiment.py"
+      ;;
+    *)
+      ENTRYPOINT="src/kldm/run_experiment.py"
+      ;;
+  esac
+else
+  ENTRYPOINT="$KLDM_ENTRYPOINT"
+fi
+
+case "$CONFIG_PATH" in
+  configs/kldm_plus/*)
+    if [ "$ENTRYPOINT" != "src/kldmPlus/run_experiment.py" ]; then
+      echo "error: KLDM+ config requires KLDM+ entrypoint." >&2
+      echo "config=$CONFIG_PATH" >&2
+      echo "entrypoint=$ENTRYPOINT" >&2
+      exit 1
+    fi
+    ;;
+  configs/mp20/*)
+    if [ "$ENTRYPOINT" != "src/kldm/run_experiment.py" ]; then
+      echo "error: base KLDM config requires base KLDM entrypoint." >&2
+      echo "config=$CONFIG_PATH" >&2
+      echo "entrypoint=$ENTRYPOINT" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 date
 hostname
@@ -80,9 +125,11 @@ pwd
 echo "entrypoint=$ENTRYPOINT"
 echo "config_name=$CONFIG_NAME"
 echo "config=$CONFIG_PATH"
+echo "env_KLDM_CONFIG=${KLDM_CONFIG:-<unset>}"
+echo "env_KLDM_CONFIG_DIR=${KLDM_CONFIG_DIR:-<unset>}"
 echo "tmpdir=$TMPDIR"
 echo "config_preview:"
-grep -E '^(experiment_name:|sampler_config:|  lattice_parameterization:|  wrapped_normal_K:|  tdm_velocity_scale:|  batch_size:)' "$CONFIG_PATH" || true
+grep -E '^(experiment_name:|sampler_config:|  lattice_parameterization:|  wrapped_normal_K:|  tdm_velocity_scale:|  tdm_sigma_norm_estimator:|  tdm_centered_sigma_norm_correction:|  batch_size:)' "$CONFIG_PATH" || true
 nvidia-smi || true
 
 CMD=(

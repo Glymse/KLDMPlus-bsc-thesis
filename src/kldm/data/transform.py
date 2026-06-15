@@ -16,15 +16,46 @@ DEFAULT_ATOMIC_VOCAB: list[int] = list(range(1, 119))
 DEFAULT_X0_ANGLE_STATS: tuple[float, float] = (0.0, 0.35)
 
 
-"""Lattice preprocessing for the KLDM CSP pipeline.
+"""
+Lattice preprocessing for the KLDM CSP pipeline.
 
-Each cell becomes a 6D feature vector:
+Each crystal cell is converted from a 3x3 basis matrix to a 6D feature vector:
+
     [log(a), log(b), log(c), tan(alpha - pi/2), tan(beta - pi/2), tan(gamma - pi/2)]
 
-`eps` mode uses those features directly.
-`x0` mode standardizes:
-    - log-lengths with stats keyed by number of atoms
-    - angle features with one shared loc/scale pair
+where:
+    - a, b, c are lattice lengths
+    - alpha is the angle between b and c
+    - beta  is the angle between a and c
+    - gamma is the angle between a and b
+
+Two lattice modes are supported:
+
+1. eps lattice mode
+   The 6D feature vector is used directly.
+
+2. x0 lattice mode
+   The same 6D feature vector is split into:
+     - transformed lengths
+     - transformed angles
+
+   The x0 branch stores train-set statistics in a JSON cache with:
+
+       {
+         "lengths_loc_scale": {
+           "<num_atoms>": [[loc_a, loc_b, loc_c], [scale_a, scale_b, scale_c]],
+           ...
+         },
+         "angles_loc_scale": [loc, scale]
+       }
+
+   Lengths are standardized separately for each atom count, while the angle
+   features share one fixed loc/scale pair.
+
+At dataset time, ContinuousIntervalLattice.__call__() writes the transformed
+feature vector to `sample.l`. During sampling or evaluation, the transform is
+inverted back to physical lengths and angles with the matching x0 statistics
+for the current number of atoms.
 """
 
 # Segments marked with
@@ -67,6 +98,27 @@ def cell_lengths_and_angles(cell: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return lengths, torch.stack([alpha, beta, gamma])
 
 
+def lattice_feature_vector(cell: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+
+    Output:
+        Tensor of shape (6,):
+
+            [
+                log(a),
+                log(b),
+                log(c),
+                tan(alpha - pi/2),
+                tan(beta  - pi/2),
+                tan(gamma - pi/2),
+            ]
+
+    """
+    log_lengths, angle_features = lattice_feature_components(cell, eps=eps)
+
+    return torch.cat([log_lengths, angle_features], dim=0)
+
+
 def lattice_feature_components(
     cell: torch.Tensor,
     eps: float = 1e-8,
@@ -85,6 +137,43 @@ def _has_x0_lattice_stats(payload: dict) -> bool:
         and isinstance(payload.get("angles_loc_scale"), list)
         and len(payload["angles_loc_scale"]) == 2
     )
+
+
+def _pack_x0_stats(
+    lengths_by_num_atoms: dict[int, list[torch.Tensor]],
+    *,
+    eps: float,
+) -> dict[str, object]:
+    stats_by_size: dict[str, list[list[float]]] = {}
+    for num_atoms, values in sorted(lengths_by_num_atoms.items()):
+        stacked = torch.stack(values, dim=0)
+        center = stacked.mean(dim=0)
+        spread = stacked.std(dim=0, unbiased=False).clamp_min(eps)
+        stats_by_size[str(num_atoms)] = [center.tolist(), spread.tolist()]
+
+    return {
+        "lengths_loc_scale": stats_by_size,
+        "angles_loc_scale": [0.0, 0.35],
+    }
+
+
+def _restore_x0_stats(
+    payload: dict,
+) -> tuple[dict[int, tuple[torch.Tensor, torch.Tensor]], tuple[torch.Tensor, torch.Tensor]]:
+    ######## Code segment is from original KLDM preprocessing code. ######
+    lengths_loc_scale = {
+        int(num_atoms): (
+            torch.tensor(center, dtype=torch.get_default_dtype()),
+            torch.tensor(spread, dtype=torch.get_default_dtype()),
+        )
+        for num_atoms, (center, spread) in payload["lengths_loc_scale"].items()
+    }
+    angle_center, angle_spread = payload["angles_loc_scale"]
+    angles_loc_scale = (
+        torch.tensor(angle_center, dtype=torch.get_default_dtype()),
+        torch.tensor(angle_spread, dtype=torch.get_default_dtype()),
+    )
+    return lengths_loc_scale, angles_loc_scale
 
 
 def ensure_lattice_standardization_cache(
@@ -107,9 +196,9 @@ def ensure_lattice_standardization_cache(
     cell_path = Path(processed_dir) / "cell.npy"
     num_atoms_path = Path(processed_dir) / "num_atoms.npy"
     cells = np.load(cell_path, allow_pickle=True)
-    num_atoms = np.load(num_atoms_path, allow_pickle=True)
+    num_atoms: Any = np.load(num_atoms_path, allow_pickle=True)
 
-    #code segment is from original kldm code. data/transforms.py
+    ######## Code segment is from original KLDM preprocessing code. ######
     lengths_by_num_atoms: dict[int, list[torch.Tensor]] = {}
     for cell, n_atoms in zip(cells, num_atoms):
         cell = torch.as_tensor(cell, dtype=torch.get_default_dtype())
@@ -122,23 +211,9 @@ def ensure_lattice_standardization_cache(
         log_lengths, _ = lattice_feature_components(cell, eps=eps)
         lengths_by_num_atoms.setdefault(int(n_atoms), []).append(log_lengths)
 
-    stats_by_size: dict[str, list[list[float]]] = {}
-    for num_atoms, values in sorted(lengths_by_num_atoms.items()):
-        stacked = torch.stack(values, dim=0)
-        center = stacked.mean(dim=0)
-        spread = stacked.std(dim=0, unbiased=False).clamp_min(eps)
-        stats_by_size[str(num_atoms)] = [center.tolist(), spread.tolist()]
-
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with cache_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "lengths_loc_scale": stats_by_size,
-                "angles_loc_scale": list(DEFAULT_X0_ANGLE_STATS),
-            },
-            handle,
-            indent=2,
-        )
+        json.dump(_pack_x0_stats(lengths_by_num_atoms, eps=eps), handle, indent=2)
 
     return cache_path
 
@@ -218,6 +293,8 @@ class ContinuousIntervalLattice(Transform):
         self.cache_file = Path(cache_file) if cache_file is not None else None
         self.eps = eps
 
+        self.loc: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
         self.lengths_loc_scale: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
         self.angles_loc_scale: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -227,30 +304,46 @@ class ContinuousIntervalLattice(Transform):
             with self.cache_file.open("r", encoding="utf-8") as handle:
                 stats = json.load(handle)
 
-            if not _has_x0_lattice_stats(stats):
-                raise ValueError("x0 lattice stats cache has an unsupported format.")
+            if _has_x0_lattice_stats(stats):
+                self.lengths_loc_scale, self.angles_loc_scale = _restore_x0_stats(stats)
+            else:
+                self.loc = torch.tensor(stats["loc"], dtype=torch.get_default_dtype())
+                self.scale = torch.tensor(stats["scale"], dtype=torch.get_default_dtype())
 
-            #code segment is from original kldm code. data/transforms.py
-            self.lengths_loc_scale = {
-                int(num_atoms): (
-                    torch.tensor(center, dtype=torch.get_default_dtype()),
-                    torch.tensor(spread, dtype=torch.get_default_dtype()),
-                )
-                for num_atoms, (center, spread) in stats["lengths_loc_scale"].items()
-            }
-            angle_center, angle_spread = stats["angles_loc_scale"]
-            self.angles_loc_scale = (
-                torch.tensor(angle_center, dtype=torch.get_default_dtype()),
-                torch.tensor(angle_spread, dtype=torch.get_default_dtype()),
-            )
+    def _move_stats_to(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
-    def _broadcast_feature_stats(
+        loc = self.loc.to(device=value.device, dtype=value.dtype)
+        scale = self.scale.to(device=value.device, dtype=value.dtype).clamp_min(self.eps)
+
+        # Make loc and scale broadcastable to value.
+        while loc.ndim < value.ndim:
+            loc = loc.unsqueeze(0)
+            scale = scale.unsqueeze(0)
+        return loc, scale
+
+    def standardize_value(self, value: torch.Tensor) -> torch.Tensor:
+        """
+        Standardize lattice features.
+
+        Output:
+            If standardization is enabled:
+                (value - loc) / scale
+
+            Otherwise:
+                value unchanged.
+        """
+        if not self.standardize or self.loc is None or self.scale is None:
+            return value
+
+        loc, scale = self._move_stats_to(value)
+        return (value - loc) / scale
+
+    def _move_scalar_stats_to(
         self,
         loc: torch.Tensor,
         scale: torch.Tensor,
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Broadcast per-feature stats across batched lattice tensors.
         loc = loc.to(device=value.device, dtype=value.dtype)
         scale = scale.to(device=value.device, dtype=value.dtype).clamp_min(self.eps)
         while loc.ndim < value.ndim:
@@ -263,11 +356,10 @@ class ContinuousIntervalLattice(Transform):
         num_atoms: int,
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Pick the x0 length statistics that match this crystal size.
         if self.lengths_loc_scale is None or num_atoms not in self.lengths_loc_scale:
             raise KeyError(f"Missing x0 length statistics for num_atoms={num_atoms}.")
         loc, scale = self.lengths_loc_scale[num_atoms]
-        return self._broadcast_feature_stats(loc, scale, value)
+        return self._move_scalar_stats_to(loc, scale, value)
 
     def _encode_x0_parts(
         self,
@@ -276,15 +368,24 @@ class ContinuousIntervalLattice(Transform):
         angle_features: torch.Tensor,
         num_atoms: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Apply the x0 normalization used during training.
-        #code segment is from original kldm code. data/transforms.py
+        ######## Code segment is from original KLDM preprocessing code. ######
         loc_lengths, scale_lengths = self._length_stats_for_num_atoms(num_atoms, log_lengths)
         log_lengths = (log_lengths - loc_lengths) / scale_lengths
 
         if self.angles_loc_scale is not None:
             angle_loc, angle_scale = self.angles_loc_scale
-            angle_loc, angle_scale = self._broadcast_feature_stats(angle_loc, angle_scale, angle_features)
+            angle_loc, angle_scale = self._move_scalar_stats_to(angle_loc, angle_scale, angle_features)
             angle_features = (angle_features - angle_loc) / angle_scale
+
+        return log_lengths, angle_features
+
+    def unstandardize(self, value: torch.Tensor) -> torch.Tensor:
+        """Undo lattice standardization.
+
+        Code is heavily inspired by original KLDM.
+        """
+        if not self.standardize or self.loc is None or self.scale is None:
+            return value
 
         return log_lengths, angle_features
 
@@ -301,15 +402,18 @@ class ContinuousIntervalLattice(Transform):
         """
         cell = sample.cell.squeeze(0)
 
-        # Always build the same 6D lattice representation before optional x0 scaling.
         log_lengths, angle_features = lattice_feature_components(cell, eps=self.eps)
-        if self.standardize:
+        if self.standardize and self.lengths_loc_scale is not None:
+            ######## Code segment is from original KLDM preprocessing code. ######
             log_lengths, angle_features = self._encode_x0_parts(
                 log_lengths=log_lengths,
                 angle_features=angle_features,
                 num_atoms=int(len(sample.pos)),
             )
-        features = torch.cat([log_lengths, angle_features], dim=0)
+            features = torch.cat([log_lengths, angle_features], dim=0)
+        else:
+            features = torch.cat([log_lengths, angle_features], dim=0)
+            features = self.standardize_value(features)
 
         return sample.replace(**{self.out_key: features.view(1, 6)})
 
@@ -335,12 +439,11 @@ class ContinuousIntervalLattice(Transform):
             lengths = exp(l[..., :3])
             angles  = atan(l[..., 3:]) + pi/2
         """
-        if self.standardize:
+        if self.standardize and self.lengths_loc_scale is not None:
             if num_atoms is None:
                 raise ValueError("num_atoms is required to invert x0-standardized lattice features.")
 
-            # Undo the x0 normalization with the same stats used on encode.
-            #code segment is from original kldm code. data/transforms.py
+            ######## Code segment is from original KLDM preprocessing code. ######
             flat_features = l.reshape(-1, 6)
             if isinstance(num_atoms, torch.Tensor):
                 flat_num_atoms = num_atoms.reshape(-1).detach().cpu().tolist()
@@ -363,14 +466,15 @@ class ContinuousIntervalLattice(Transform):
 
             if self.angles_loc_scale is not None:
                 angle_loc, angle_scale = self.angles_loc_scale
-                angle_loc, angle_scale = self._broadcast_feature_stats(angle_loc, angle_scale, angle_features)
+                angle_loc, angle_scale = self._move_scalar_stats_to(angle_loc, angle_scale, angle_features)
                 angle_features = angle_features * angle_scale + angle_loc
 
             log_lengths = log_lengths.reshape(*l.shape[:-1], 3)
             angle_features = angle_features.reshape(*l.shape[:-1], 3)
         else:
-            log_lengths = l[..., :3]
-            angle_features = l[..., 3:]
+            features = self.unstandardize(l)
+            log_lengths = features[..., :3]
+            angle_features = features[..., 3:]
 
         lengths = torch.exp(log_lengths)
         angles = torch.atan(angle_features) + torch.pi / 2.0

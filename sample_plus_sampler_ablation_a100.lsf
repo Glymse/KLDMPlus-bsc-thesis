@@ -1,0 +1,92 @@
+#!/bin/bash
+set -euo pipefail
+
+#BSUB -J plus_sampler_ablation_a100
+#BSUB -q gpua100
+#BSUB -n 8
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=16GB]"
+#BSUB -W 24:00
+#BSUB -o logs/plus_sampler_ablation_a100_%J.out
+#BSUB -e logs/plus_sampler_ablation_a100_%J.err
+
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$(pwd)}}"
+cd "$REPO_ROOT"
+
+if [ -z "${CHECKPOINT_URL:-}" ]; then
+  echo "ERROR: submit with CHECKPOINT_URL='<wandb artifact url or local checkpoint>' bsub < sample_plus_sampler_ablation_a100.lsf" >&2
+  exit 2
+fi
+
+mkdir -p logs artifacts/HPC artifacts/HPC/sampler_ablation
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+export TMPDIR="${TMPDIR:-/tmp/$USER/${LSB_JOBID:-kldm_plus_sampler_ablation_a100}}"
+mkdir -p "$TMPDIR"
+
+export XDG_CACHE_HOME="$TMPDIR/.cache"
+export XDG_DATA_HOME="$TMPDIR/.local/share"
+export UV_CACHE_DIR="$TMPDIR/uv_cache"
+export WANDB_CACHE_DIR="$TMPDIR/wandb_cache"
+export WANDB_DATA_DIR="$TMPDIR/wandb_data"
+export WANDB_ARTIFACT_DIR="$TMPDIR/wandb_artifacts"
+export WANDB_DIR="$TMPDIR/wandb_runs"
+
+cleanup_job_cache() {
+  rm -rf "$UV_CACHE_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_DIR" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
+}
+trap cleanup_job_cache EXIT
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+NUM_TARGETS="${NUM_TARGETS:-256}"
+N_SEEDS="${N_SEEDS:-5}"
+FROM_SEED="${FROM_SEED:-0}"
+SUBSET_SEED="${SUBSET_SEED:-123}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
+WANDB_PROJECT="${WANDB_PROJECT:-kldmplus_sampler_ablation}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-plus_sampler_ablation_a100}"
+PROGRESS_DIR="${PROGRESS_DIR:-artifacts/HPC/sampler_ablation}"
+RUN_NAME="${RUN_NAME:-}"
+
+date
+hostname
+pwd
+echo "checkpoint_url=$CHECKPOINT_URL"
+echo "num_targets=$NUM_TARGETS n_seeds=$N_SEEDS from_seed=$FROM_SEED subset_seed=$SUBSET_SEED batch_size=$BATCH_SIZE"
+echo "wandb_project=$WANDB_PROJECT wandb_run_name=$WANDB_RUN_NAME progress_dir=$PROGRESS_DIR"
+nvidia-smi || true
+
+CMD=(
+  uv run --locked --python 3.11 python src/kldmPlus/run_sampler_ablation.py
+  --checkpoint-path "$CHECKPOINT_URL"
+  --num-targets "$NUM_TARGETS"
+  --n-seeds "$N_SEEDS"
+  --from-seed "$FROM_SEED"
+  --subset-seed "$SUBSET_SEED"
+  --batch-size "$BATCH_SIZE"
+  --wandb-project "$WANDB_PROJECT"
+  --wandb-run-name "$WANDB_RUN_NAME"
+  --progress-dir "$PROGRESS_DIR"
+)
+
+if [ -n "$RUN_NAME" ]; then
+  CMD+=(--run-name "$RUN_NAME")
+fi
+
+printf 'command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+"${CMD[@]}"

@@ -6,15 +6,20 @@ import requests
 from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
 from mattergen.common.data.transform import Transform
+from pymatgen.symmetry.groups import SpaceGroup
+import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch
 from tqdm.auto import tqdm
+import csv
 
 
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_ROOT = WORKSPACE_ROOT / "data"
+SPACE_GROUP_PROPERTY = "space_group"
+SPACE_GROUP_COLUMN = "spacegroup.number"
 
 
 def resolve_data_root(root: str | Path | None = None) -> Path:
@@ -54,6 +59,7 @@ class CrystalDatasetWrapper(Dataset):
         self.split = split
         self.transforms = transforms or []
         self.dataset_transforms = dataset_transforms or []
+        self._space_group_number_map: dict[str, int] | None = None
 
         #Download raw CSV only when explicitly requested.
         if download:
@@ -82,6 +88,39 @@ class CrystalDatasetWrapper(Dataset):
         #Processed cache path for the selected split.
         return self.processed_folder / self.split
 
+    def _load_space_group_number_map(self) -> dict[str, int]:
+        mapping: dict[str, int] = {}
+        with self.raw_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                material_id = str(row["material_id"])
+                value = row.get(SPACE_GROUP_COLUMN)
+                if value is None or value == "":
+                    continue
+                mapping[material_id] = int(float(value))
+        return mapping
+
+    @staticmethod
+    def _space_group_symbol(number: int) -> str:
+        return str(SpaceGroup.from_int_number(int(number)).symbol)
+
+    def _load_space_group_symbol_map(self) -> dict[str, str]:
+        number_map = self._load_space_group_number_map()
+        return {
+            material_id: self._space_group_symbol(number)
+            for material_id, number in number_map.items()
+        }
+
+    def _ensure_required_properties(self, builder: CrystalDatasetBuilder) -> None:
+        if not self.raw_csv.exists():
+            raise RuntimeError(
+                f"Raw split not found at {self.raw_csv}. Cannot backfill {SPACE_GROUP_PROPERTY!r}."
+            )
+        builder.add_property_to_cache(
+            SPACE_GROUP_PROPERTY,
+            data=self._load_space_group_symbol_map(),
+        )
+
     @staticmethod
     def collate_fn(samples: list[ChemGraph]) -> Batch:
         #Convert a list of ChemGraph samples into one PyG Batch.
@@ -99,17 +138,29 @@ class CrystalDatasetWrapper(Dataset):
                 cache_path=str(self.processed_split_folder),
                 transforms=self.transforms,
             )
+            self._ensure_required_properties(builder)
         else:
             # Slow path: parse raw CSV and create processed cache.
             if not self.raw_csv.exists():
                 raise RuntimeError(
                     f"Raw split not found at {self.raw_csv}. Pass download=True to fetch it first."
                 )
+            # Code segment inspired from mattergen
+            # (mattergen/common/data/dataset.py:528-556,
+            #  mattergen/common/data/dataset.py:354-360).
+            #
+            # Important preprocessing note:
+            # CrystalDatasetBuilder.from_csv(...) already parses CIFs, converts
+            # them to primitive structures, and applies `get_reduced_structure()`
+            # before writing the processed cache. We intentionally rely on that
+            # upstream full-structure reduction here instead of trying to reduce
+            # only the lattice matrix later in a transform.
             builder = CrystalDatasetBuilder.from_csv(
                 csv_path=str(self.raw_csv),
                 cache_path=str(self.processed_split_folder),
                 transforms=self.transforms,
             )
+            self._ensure_required_properties(builder)
 
         return builder.build(
             dataset_class=CrystalDataset,
@@ -161,7 +212,16 @@ class CrystalDatasetWrapper(Dataset):
             ChemGraph containing fields such as:
                 pos, cell, atomic_numbers, num_atoms, etc.
         """
-        return self.data[index]
+        sample = self.data[index]
+        structure_id = str(self.data.structure_id[index])
+        if self._space_group_number_map is None:
+            self._space_group_number_map = self._load_space_group_number_map()
+        return sample.replace(
+            space_group=torch.tensor(
+                int(self._space_group_number_map[structure_id]),
+                dtype=torch.long,
+            ),
+        )
 
     def __len__(self) -> int:
         """Return number of structures in the selected split."""

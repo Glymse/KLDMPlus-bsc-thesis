@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euo pipefail
+
+#BSUB -J eval_eps_fixed_em
+#BSUB -q gpua100
+#BSUB -n 4
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=12GB]"
+#BSUB -W 24:00
+#BSUB -o logs/eval_eps_fixed_em_%J.out
+#BSUB -e logs/eval_eps_fixed_em_%J.err
+
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$(pwd)}}"
+cd "$REPO_ROOT"
+mkdir -p logs artifacts/HPC/sampling_eval
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+export TMPDIR="${TMPDIR:-/tmp/$USER/${LSB_JOBID:-eval_eps_fixed_em}}"
+mkdir -p "$TMPDIR"
+export XDG_CACHE_HOME="$TMPDIR/.cache"
+export XDG_DATA_HOME="$TMPDIR/.local/share"
+export UV_CACHE_DIR="$TMPDIR/uv_cache"
+export WANDB_CACHE_DIR="$TMPDIR/wandb_cache"
+export WANDB_DATA_DIR="$TMPDIR/wandb_data"
+export WANDB_ARTIFACT_DIR="$TMPDIR/wandb_artifacts"
+export WANDB_DIR="$TMPDIR/wandb_runs"
+
+cleanup_job_cache() {
+  rm -rf "$UV_CACHE_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_DIR" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
+}
+trap cleanup_job_cache EXIT
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+ENTRYPOINT="src/kldmPlus/run_sampling.py"
+CONFIG_PATH="configs/kldm_plus/mp_20/evaluation_plus_baseline_eps_fixed_ema_em.yaml"
+
+date
+hostname
+echo "entrypoint=$ENTRYPOINT"
+echo "config=$CONFIG_PATH"
+grep -E '^(experiment_name:|  checkpoint_path:|  method:|  sampling_algorithm:|  n_steps:|  tau:|  num_targets:|  n_seeds:|  wandb_project:|  wandb_run_name:)' "$CONFIG_PATH" || true
+nvidia-smi || true
+
+uv run --locked --python 3.11 python "$ENTRYPOINT" --config "$CONFIG_PATH"

@@ -28,6 +28,8 @@ dependencies = [
   "pandas==2.2.3",
   "pytorch-lightning==2.0.6",
   "pymatgen>=2024.1.0",
+  "pypdf>=6.0,<7.0",
+  "pyxtal>=0.6.0",
   "requests",
   "setuptools>=70,<82",
   "torch==2.2.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -38,6 +40,10 @@ dependencies = [
   "smact>=3.2.0",
   "matminer>=0.9.3",
   "mattersim>=1.1.2",
+  "jax>=0.6.2",
+  "dm-haiku>=0.0.16",
+  "optax>=0.2.8",
+  "gdown>=6.1.0",
 ]
 
 [project.scripts]

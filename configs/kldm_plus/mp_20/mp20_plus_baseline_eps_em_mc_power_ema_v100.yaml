@@ -1,0 +1,84 @@
+experiment_name: plus_mp20_baseline_eps_em_mc_power_ema_v100
+sampler_config: ../../samplers/euler_maruyama.yaml
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: kldm
+  root: null
+  batch_size: 256
+  num_workers: 4
+  pin_memory: true
+  train_subset_seed: 2002
+
+time_sampler:
+  type: uniform
+
+model:
+  eps: 1.0e-6
+  lambda_l: 1.0
+  lattice_parameterization: eps
+  lattice_diffusion_type: VP
+  lattice_representation: kldm
+  lattice_debug: false
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: true
+  tdm_velocity_scale: 0.15915494309189535
+  tdm_sigma_norm_estimator: mc
+  tdm_sigma_norm_density_K: 40
+  tdm_sigma_norm_grid_points: 8193
+  tdm_sigma_norm_mc_samples: 20000
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+optimizer:
+  lr: 1.0e-3
+  weight_decay: 1.0e-12
+  amsgrad: true
+  foreach: true
+
+ema:
+  enabled: true
+  type: power
+  gamma: 6.94
+
+training:
+  max_epochs: 12000
+
+logging:
+  train_every_epochs: 1
+  wandb_checkpoints: true
+  wandb_project: kldmplus_mp20_em_12000
+  wandb_run_name: plus_mp20_baseline_eps_em_mc_power_ema_v100
+
+validation:
+  every_n_epochs: 200
+  sampling_seed: 0
+  loss_seed: 2019
+  ema_val: true
+  subset_size: null
+  subset_seed: 123
+  sampling_max_graphs: 1024
+
+checkpoint:
+  resume_from: null
+  wandb_resume_id: null
+  prune_wandb_artifact_cache: true
+
+sampling_eval:
+  split: test
+  batch_size: 128
+  num_targets: 1024
+  subset_seed: 123
+  samples_per_target: 20

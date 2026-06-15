@@ -11,13 +11,26 @@ møde.txt
 /workspace/src/kldm/diffusionModels/trivialized_diffusion.py
 # test cache
 manual_test/
-
+src/CSPML
+src/PPR
+src/cascal
+src/CrystaLFormer
 src/torsional
 src/TDM
-
-
+src/mattergen
+src/adapative
+src/papers/*
+!src/papers/readpdf.py
+src/DPnP
+src/diffCSPpp
+src/papers
 # other local dev info
 .vscode/
+
+
+
+notebooks/*
+!notebooks/*.ipynb
 
 # Mac OS-specific storage files
 .DS_Store
@@ -192,3 +205,5 @@ cython_debug/
 src/kldm/diffusionModels/TDMdev.py
 src/kldm/utils/pdf_reader.py
 tests/test_run_experiment.py
+src/kldmPlus/todo.txt
+src/kldm/diffusionModels/TDMdev.py

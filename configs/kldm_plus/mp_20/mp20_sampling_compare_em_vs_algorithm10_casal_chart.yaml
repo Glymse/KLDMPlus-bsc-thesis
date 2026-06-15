@@ -1,0 +1,130 @@
+experiment_name: mp20_sampling_compare_facit_pc_vs_algorithm10_casal_chart
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: kldm
+  num_workers: 0
+
+model:
+  lattice_debug: false
+  lambda_l: 2.0
+  lattice_parameterization: eps
+  lattice_diffusion_type: VP
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: false
+  tdm_velocity_scale: 0.15915494309189535
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+sampling_compare:
+  checkpoint_path: ../../../artifacts/HPC/checkpoints/epoch_8900.pt
+  split: test
+  batch_size: 3
+  num_targets: 3
+  subset_seed: 1222
+  sample_seed: 2026
+  validity_cutoff: 1.0
+  debug_diagnostics: true
+  debug_matcher: true
+
+  samplers:
+    - name: FacitKLDM_PC
+      method: facit_pc
+      sampling_algorithm: 4
+      n_steps: 1000
+      t_start: 1.0
+      t_final: 1.0e-3
+      tau: 0.15
+      n_correction_steps: 1
+
+    - name: Algorithm10_CASAL_chart
+      method: casal
+      sampling_algorithm: 10
+      n_steps: 1000
+      t_start: 1.0
+      t_final: 1.0e-3
+      algorithm10:
+        max_templates: 64
+        template_eval_limit: 32
+        template_prior_mode: cspml
+        template_prior_weight: 1.0
+
+        casal_rho_start: 0.25
+        casal_rho_end: 1.5
+        casal_tau_scale: 0.25
+        casal_mu_eta: 1.0
+        casal_mu_clip: 0.35
+        casal_noise_scale: 0.0
+        casal_coupling_mode: velocity_pd
+        casal_velocity_alpha: 1.0e-4
+        casal_velocity_sign: 1.0
+        casal_velocity_controller_mode: impulse
+        casal_force_rho_scale: 1.0
+        casal_velocity_mean_free: true
+        casal_beta_f: 0.01
+        casal_beta_z: 0.025
+        casal_velocity_damping: 0.05
+        casal_velocity_damping_mode: residual_parallel
+        casal_damping_metric: fractional
+        casal_max_delta_v: 0.25
+        casal_velocity_placement: corrector
+        casal_coord_weight: 1.0
+        casal_lattice_weight: 0.0
+        casal_projection_lattice_weight: 0.0
+        casal_dual_enabled: false
+        casal_dual_update_policy: projection_success_only
+        casal_residual_mode: wrap_plus_mu
+        casal_damping_residual: geom
+        casal_gauge_mode: locked_after_initial_projection
+        casal_inner_projection_mode: metric_only
+        casal_final_projection_mode: full
+        casal_require_feasible_initial_projection: true
+        casal_require_feasible_projection: true
+        projection_start_mode: dynamic_projectable
+        projection_interval: 1
+        projection_start_fraction: 0.9
+        projection_min_volume: 1.0
+        projection_min_lattice_length: 0.5
+        oracle_wyckoff_debug: true
+
+        projection_coord_weight: 1.0
+        projection_lattice_weight: 1.0
+        projection_physical_lattice_weight: 2.0
+        projection_steric_weight: 1.0
+        projection_min_pair_weight: 1.0
+        projection_min_pair_target: 1.0
+        projection_volume_weight: 1.0
+        origin_shift_mode: axis_grid
+        origin_shift_values: [0.0, 0.125, 0.875, 0.25, 0.75, 0.5]
+
+        ssvd_max_steps: 20
+        ssvd_damping: 1.0e-3
+        ssvd_rank_tol: 1.0e-6
+        ssvd_max_delta_norm: 0.5
+        ssvd_energy_tol: 1.0e-8
+        ssvd_random_restarts: 1
+        ssvd_line_search_alphas: [1.0, 0.5, 0.25, 0.1, 0.05]
+
+        optimization_steps: 60
+        learning_rate: 5.0e-2
+        template_init_restarts: 4
+        symprec: 1.0e-2
+        angle_tolerance: 5.0
+        hard_min_distance: 1.0
+        hard_volume_ratio_min: 0.25
+        hard_volume_ratio_max: 4.0
+        debug_projection_failures: true
+        debug_projection_examples: 1
+        debug: true

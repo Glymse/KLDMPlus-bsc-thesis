@@ -1,0 +1,76 @@
+experiment_name: plus_mp20_lattice_x0_em
+sampler_config: ../../samplers/euler_maruyama.yaml
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: kldm # fixed KLDMPlus lattice representation
+  root: null
+  batch_size: 256
+  num_workers: 1
+  pin_memory: true
+
+time_sampler:
+  type: uniform
+
+model:
+  lattice_debug: false
+  eps: 1.0e-6
+  lambda_l: 1.0
+  lattice_parameterization: x0 # alternatives: eps, x0
+  lattice_diffusion_type: VP # fixed KLDMPlus lattice diffusion
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: true
+  tdm_velocity_scale: 0.15915494309189535
+  tdm_sigma_norm_estimator: mc
+  tdm_sigma_norm_density_K: 40
+  tdm_sigma_norm_grid_points: 8193
+  tdm_sigma_norm_mc_samples: 20000
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+optimizer:
+  lr: 1.0e-3
+  weight_decay: 1.0e-12
+  amsgrad: true
+  foreach: true
+
+ema:
+  enabled: true
+  type: fixed
+  decay: 0.999
+  start_epoch: 500
+
+logging:
+  train_every_epochs: 1
+  wandb_checkpoints: true
+
+validation:
+  every_n_epochs: 100
+  sampling_seed: 0
+  ema_val: false
+  subset_size: 1024
+  subset_seed: 123
+  sampling_max_graphs: 1024
+
+checkpoint:
+  resume_from: null
+  wandb_resume_id: null # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
+
+sampling_eval:
+  split: test
+  batch_size: 128
+  num_targets: 1024
+  subset_seed: 123
+  samples_per_target: 20

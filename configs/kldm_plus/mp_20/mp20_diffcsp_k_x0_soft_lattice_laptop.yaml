@@ -1,0 +1,92 @@
+experiment_name: plus_mp20_diffcsp_k_x0_conv_sg_lattice_laptop
+sampler_config: ../../samplers/predictor_corrector.yaml
+
+dataset:
+  task: csp
+  name: mp20
+  lattice_representation: diffcsp_k
+  root: null
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  train_subset_fraction: 0.01
+  train_subset_seed: 2002
+  train_subset_strategy: balanced_space_group
+
+time_sampler:
+  type: uniform
+
+
+model:
+  eps: 1.0e-6
+  lambda_l: 1.0
+  lattice_parameterization: x0
+  lattice_diffusion_type: VP
+  lattice_representation: diffcsp_k
+  lattice_debug: false
+  lattice_sg_lambda: 0.0
+  lattice_sg_normalize: true
+  lattice_sg_time_weight: alpha_squared
+  conv_sg_aux:
+    enabled: true
+    mode: direct
+    lambda: 20
+    time_weight: alpha2
+    require_valid_transform: true
+  lattice_orbit_metric_max_candidates: 512
+  wrapped_normal_K: 3
+  tdm_n_sigmas: 512
+  tdm_compute_sigma_norm: true
+  tdm_velocity_scale: 0.15915494309189535
+  tdm_sigma_norm_estimator: quadrature
+  tdm_sigma_norm_density_K: 20
+  tdm_sigma_norm_grid_points: 1025
+  tdm_sigma_norm_mc_samples: 2000
+  score_network:
+    hidden_dim: 128
+    time_dim: 128
+    num_layers: 4
+    num_freqs: 32
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-12
+  amsgrad: true
+  foreach: false
+
+ema:
+  enabled: false
+
+training:
+  max_epochs: 500
+
+logging:
+  train_every_epochs: 1
+  wandb_checkpoints: true
+
+validation:
+  every_n_epochs: 2
+  sampling_seed: 0
+  ema_val: false
+  subset_size: 6
+  subset_seed: 123
+  subset_strategy: balanced_family
+  sampling_max_graphs: 12
+
+checkpoint:
+  resume_from: null
+  wandb_resume_id: null
+
+sampling_eval:
+  split: test
+  batch_size: 6
+  num_targets: 6
+  subset_seed: 123
+  samples_per_target: 1
