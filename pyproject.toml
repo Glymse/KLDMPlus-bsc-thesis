@@ -32,7 +32,7 @@ dependencies = [
   "pyxtal>=0.6.0",
   "requests",
   "setuptools>=70,<82",
-  "torch==2.2.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "torch==2.11.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-geometric==2.5.3",
   "torch-scatter==2.1.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "tqdm",
